@@ -10,7 +10,7 @@ Rust + ratatui terminal client for iMessage on macOS.
 - `src/theme.rs` — named color slots (mockup palette), overridable per slot from config
 - `src/keymap.rs` — focus-sensitive key → `Action`; `BINDINGS` also feeds the help modal and shortcuts bar
 - `src/db/` — read-only access to `chat.db` (rusqlite + `imessage-database` for typedstream parsing)
-- `src/ui/` — ratatui widgets: chat list, conversation, composer, palette, help, reactions, `db_error` (the first-run surface), `status` (the line and its toasts); `ui::compute`, `chat_list::Shape`, `conversation::Scroll`, and `ui::message::block` are pure layout functions with tests, and `ui::format` holds the string helpers (relative times, previews, wrapping, truncation)
+- `src/ui/` — ratatui widgets: chat list, conversation, composer, palette, help, reactions, `db_error` (the first-run surface), `status` (the line and its toasts); `ui::compute`, `chat_list::Shape`, `conversation::Scroll`, `conversation::thumb`, and `ui::message::block` are pure layout functions with tests, and `ui::format` holds the string helpers (relative times, previews, wrapping, truncation)
 - `src/media.rs` — attachments as pictures: `fit` (pure cell arithmetic), `Images` (the measure/encode cache, `ratatui-image` under it), HEIC through `sips` into `~/Library/Caches/msgs/attachments`, and `s` copying a file to `~/Downloads`
 - `src/shell.rs` — the clipboard (`pbcopy`, then OSC 52), the browser, and `open` for an attachment; the only things msgs asks the rest of the machine to do
 - `src/send.rs` — outbound messages via `osascript` → Messages.app; `Presence`, the `pgrep` probe behind the status line's Messages.app segment; tapbacks via `imsg` (`tapback` by message GUID first, `react` by chat rowid as the SIP-on fallback), plus `Pending` / `PendingTapback`, the optimistic echoes
@@ -21,6 +21,7 @@ Rust + ratatui terminal client for iMessage on macOS.
 - `src/jump.rs` — what the `Ctrl+K` palette matches and shows: the filter, fuzzy chat/people matching (`nucleo-matcher`), and the result rows with their highlight ranges
 - `docs/mockups.html` — the design target; match it
 - `docs/screenshot.txt` — the frame the README embeds, written by `tests/screenshot.rs` from the synthetic fixture (`TZ=UTC UPDATE_SCREENSHOT=1 cargo test --test screenshot` regenerates it, and it also checks the block embedded in the README); never a frame of a real `chat.db`
+- `tests/docs.rs` — the README's key tables against `keymap::BINDINGS`, in both directions, so a binding cannot be added to one and not the other
 - `tests/perf.rs` — the budgets, against `fixtures::perf_database` (200k invented messages): cold start under 300ms, a keystroke-to-frame under 16.6ms, a page under 25ms, under 150MB resident. Stated for `--release`; a debug run gets `SLACK`× the number
 - `packaging/msgs.rb` — Homebrew formula stub; URL and sha256 are placeholders until a `v*` tag is pushed
 - `.github/workflows/` — `ci.yml` (fmt, clippy, build, test, `--check` on macOS) and `release.yml` (both targets, `lipo` into a universal binary, tarball plus checksum on a `v*` tag)
@@ -37,4 +38,6 @@ Rust + ratatui terminal client for iMessage on macOS.
 - `Focus::DbError` is never assigned to `App::focus`. `App::key_focus` reports it while `db_error` is set and no overlay is up, which is how the first-run surface gets its own keys without disturbing the pane focus the app goes back to.
 - `--check` prints paths and counts only. No name, number, or message body may reach it.
 - An optimistic chip is drawn over the loaded page, never written into it: `App::pending_tapbacks` reaches the blocks through `ui::message::Ctx::tapbacks`, so `App::message_rows` stays exactly what `chat.db` handed over and reconciling is a comparison rather than an undo.
+- Chrome never covers a message. The day band is `Panes::day`, a row `ui::compute` takes off the top of the conversation, and the scrollbar lives in the column `ui::message::MARGIN_RIGHT` keeps clear; neither is painted over a block.
+- The `?` modal opens a heading every time `BINDINGS` changes scope, so the table is grouped by scope and each scope appears exactly once. `tests/docs.rs` holds the README's key tables to that same table, so a new binding is added in one place and lands in three.
 - A block's height and its drawing must come from one number. `ui::message::block` reserves rows for a picture from `Images::cells`, and `Images::render` draws into exactly those rows; never let the two compute a size separately.

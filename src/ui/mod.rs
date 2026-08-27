@@ -43,6 +43,10 @@ pub struct Panes {
     pub chat_list_rows: Option<Rect>,
     /// Chat name, service, and counts, above the messages.
     pub header: Rect,
+    /// The one row the day of the topmost message is held on, between the
+    /// header and the messages. `None` when there is nothing to label or no
+    /// row to spare — the mockup's `.day.sticky` band.
+    pub day: Option<Rect>,
     /// The scrolling message area.
     pub conversation: Rect,
     /// The bordered send box.
@@ -73,13 +77,14 @@ pub fn compute(area: Rect, app: &App) -> Panes {
     let rule = take_bottom(&mut rest, 1, area.height >= MIN_HEIGHT_FOR_RULE);
 
     let (chat_list, chat_list_rows, convo) = split_chat_list(rest, app);
-    let (header, conversation, composer, info_row) =
+    let (header, day, conversation, composer, info_row) =
         split_conversation(convo, app, area.height >= MIN_HEIGHT_FOR_INFO_ROW);
 
     Panes {
         chat_list,
         chat_list_rows,
         header,
+        day,
         conversation,
         composer,
         info_row,
@@ -113,7 +118,7 @@ fn split_conversation(
     area: Rect,
     app: &App,
     show_info_row: bool,
-) -> (Rect, Rect, Rect, Option<Rect>) {
+) -> (Rect, Option<Rect>, Rect, Rect, Option<Rect>) {
     let mut rest = area;
     // Header text plus the rule under it.
     let header_height = if area.height >= 6 { 2 } else { 1 };
@@ -125,7 +130,13 @@ fn split_conversation(
     let composer_height = wanted.min(rest.height.saturating_sub(1)).max(1);
     let composer = take_bottom(&mut rest, composer_height, true).unwrap_or(empty_at(area));
 
-    (header, rest, composer, info_row)
+    // The day band is a row of its own rather than a label painted over the
+    // top message, so nothing a message says is ever hidden under it. It is
+    // only worth a row once there are messages to label and a row to spare.
+    let room_for_a_band = !app.message_rows.is_empty() && rest.height >= 3;
+    let day = take_top(&mut rest, 1, room_for_a_band);
+
+    (header, day, rest, composer, info_row)
 }
 
 fn take_top(rest: &mut Rect, rows: u16, when: bool) -> Option<Rect> {
@@ -193,6 +204,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         chat_list::render(frame, app, list, rows);
     }
     conversation::render_header(frame, app, panes.header);
+    if let Some(day) = panes.day {
+        conversation::render_day_band(frame, app, day);
+    }
     let hits = conversation::render(frame, app, panes.conversation);
     app.hits = hits;
     composer::render(frame, app, panes.composer);
@@ -262,6 +276,7 @@ mod tests {
             panes.status,
         ];
         rects.extend(panes.chat_list);
+        rects.extend(panes.day);
         rects.extend(panes.info_row);
         rects.extend(panes.shortcuts);
         rects.retain(|rect| rect.width > 0 && rect.height > 0);

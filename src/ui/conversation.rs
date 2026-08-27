@@ -13,7 +13,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block as BlockWidget, Clear, Paragraph};
+use ratatui::widgets::{Block as BlockWidget, Paragraph};
 
 use std::collections::HashMap;
 
@@ -533,9 +533,113 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
         }
     }
 
-    render_sticky_day(frame, app, area, &visible, now);
+    render_scrollbar(frame, app, area, heights);
     hits.pill = render_new_pill(frame, app, area);
     hits
+}
+
+/// The mockup's `.scroll .bar`: a one-column track down the right edge with a
+/// thumb whose length and position say how much of the thread is on screen.
+///
+/// It lives in the column [`message::MARGIN_RIGHT`] keeps clear, so nothing
+/// gives up a cell of words for it, and it is only drawn when there is more
+/// thread than pane.
+fn render_scrollbar(frame: &mut Frame, app: &App, area: Rect, heights: &[u16]) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let above: u32 = heights
+        .iter()
+        .take(app.convo.top)
+        .map(|height| u32::from(*height))
+        .sum::<u32>()
+        + u32::from(app.convo.skip);
+    let total: u32 = heights.iter().map(|height| u32::from(*height)).sum();
+    let Some((start, length)) = thumb(total, area.height, above) else {
+        return;
+    };
+    let x = area.x + area.width - 1;
+    let theme = &app.theme;
+    // One cell per row, written straight into the buffer: a widget apiece
+    // would be a hundred allocations a frame for a hundred single characters.
+    let buffer = frame.buffer_mut();
+    for row in 0..area.height {
+        let inside = row >= start && row < start + length;
+        let (glyph, color) = if inside {
+            (SCROLL_THUMB, theme.gray)
+        } else {
+            (SCROLL_TRACK, theme.border)
+        };
+        if let Some(cell) = buffer.cell_mut((x, area.y + row)) {
+            cell.set_symbol(glyph).set_fg(color);
+        }
+    }
+}
+
+/// The glyph the scrollbar's empty track is drawn with.
+const SCROLL_TRACK: &str = "│";
+/// The glyph the scrollbar's thumb is drawn with.
+const SCROLL_THUMB: &str = "┃";
+
+/// Where the scrollbar thumb starts and how long it is, as `(row, rows)`.
+///
+/// `None` when the whole thread fits, because a bar that fills its own track
+/// says nothing. Pure arithmetic, so the geometry is testable on its own.
+#[must_use]
+fn thumb(total: u32, viewport: u16, above: u32) -> Option<(u16, u16)> {
+    let height = u32::from(viewport);
+    if height == 0 || total <= height {
+        return None;
+    }
+    let length = (height * height / total).clamp(1, height);
+    let travel = height - length;
+    let scrolled = above.min(total - height);
+    let start = travel * scrolled / (total - height);
+    Some((
+        u16::try_from(start).unwrap_or(viewport),
+        u16::try_from(length).unwrap_or(viewport),
+    ))
+}
+
+/// The day of the topmost message on screen, held on a row of its own between
+/// the header and the messages — the mockup's `.day.sticky`.
+///
+/// A day the topmost block is already announcing with its own separator is not
+/// announced twice: the band stays blank and the separator underneath it is
+/// the label.
+pub fn render_day_band(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let theme = &app.theme;
+    frame.render_widget(
+        BlockWidget::new().style(Style::new().bg(theme.bg_light)),
+        area,
+    );
+    let Some(first) = app
+        .convo
+        .visible(&app.measured.heights, app.panes.conversation.height.max(1))
+        .first()
+        .copied()
+    else {
+        return;
+    };
+    if first.skip == 0 && message::opens_a_day(&app.message_rows, first.index) {
+        return;
+    }
+    let Some(when) = app.message_rows.get(first.index).and_then(Message::sent_at) else {
+        return;
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                day_label(Local::now(), when),
+                Style::new().fg(theme.text_secondary),
+            ),
+        ])),
+        area,
+    );
 }
 
 /// The label on the pill: `↓ 3 new`, padded so it reads as a chip.
@@ -577,36 +681,6 @@ fn render_new_pill(frame: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
         rect,
     );
     Some(rect)
-}
-
-/// The day of the topmost message, held at the top edge while it scrolls.
-fn render_sticky_day(
-    frame: &mut Frame,
-    app: &App,
-    area: Rect,
-    visible: &[Visible],
-    now: chrono::DateTime<Local>,
-) {
-    let Some(first) = visible.first() else {
-        return;
-    };
-    let Some(when) = app.message_rows.get(first.index).and_then(Message::sent_at) else {
-        return;
-    };
-    let theme = &app.theme;
-    let rect = Rect { height: 1, ..area };
-    // The row underneath usually holds a message, and can hold the separator
-    // this label is standing in for; a paragraph only paints the cells its own
-    // text reaches, so the row is cleared before the label goes onto it.
-    frame.render_widget(Clear, rect);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(day_label(now, when), Style::new().fg(theme.text_secondary)),
-        ]))
-        .style(Style::new().bg(theme.bg_light)),
-        rect,
-    );
 }
 
 #[cfg(test)]
@@ -707,6 +781,25 @@ mod tests {
         assert_eq!(scroll, Scroll::default());
         assert!(scroll.visible(&[], 10).is_empty());
         assert!(scroll.at_start());
+    }
+
+    #[test]
+    fn the_scrollbar_thumb_says_where_in_the_thread_the_view_is() {
+        // Everything fits: no bar at all.
+        assert_eq!(thumb(10, 20, 0), None);
+        assert_eq!(thumb(20, 20, 0), None);
+
+        // Four screens of thread: a quarter-height thumb that walks the track.
+        let (start, length) = thumb(80, 20, 0).expect("a bar");
+        assert_eq!((start, length), (0, 5));
+        assert_eq!(thumb(80, 20, 60), Some((15, 5)), "at the newest message");
+        assert_eq!(thumb(80, 20, 30), Some((7, 5)), "and halfway up");
+
+        // A very long thread still gets a thumb you can see, and it never
+        // walks off the end of the track.
+        let (start, length) = thumb(100_000, 20, 99_999).expect("a bar");
+        assert_eq!(length, 1);
+        assert_eq!(start, 19);
     }
 
     #[test]

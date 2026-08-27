@@ -333,27 +333,66 @@ fn startup_warnings_are_listed_in_the_help_modal() {
     assert!(contains(&buffer, "config: "), "and the warning itself");
 }
 
+/// The scope headings the help modal draws, in the order the table lists them.
+fn help_headings() -> Vec<String> {
+    let mut headings: Vec<String> = Vec::new();
+    for binding in keymap::BINDINGS {
+        let heading = binding.scope.to_uppercase();
+        if !headings.contains(&heading) {
+            headings.push(heading);
+        }
+    }
+    headings
+}
+
+/// How many scope headings share `row`.
+///
+/// Longest first, blanking each one as it is found, so `CHAT LIST` is not also
+/// counted as `LIST`.
+fn headings_on(row: &str, headings: &[String]) -> usize {
+    let mut ordered: Vec<&String> = headings.iter().collect();
+    ordered.sort_by_key(|heading| std::cmp::Reverse(heading.len()));
+    let mut rest = row.to_string();
+    let mut found = 0;
+    for heading in ordered {
+        if let Some(at) = rest.find(heading.as_str()) {
+            rest.replace_range(at..at + heading.len(), &" ".repeat(heading.len()));
+            found += 1;
+        }
+    }
+    found
+}
+
 #[test]
 fn a_wide_terminal_puts_the_help_modal_into_two_columns() {
     let mut app = app();
     app.update(Action::OpenHelp);
+    let headings = help_headings();
 
     // Two scopes on one row is what a second column means.
-    let wide = frame(&mut app, 200, 44);
-    let wide_rows = rows(&wide);
+    let wide = rows(&frame(&mut app, 200, 44));
     assert!(
-        wide_rows
-            .iter()
-            .any(|row| row.contains("GLOBAL") && row.contains("CONVERSATION")),
+        wide.iter().any(|row| headings_on(row, &headings) >= 2),
         "two headings share a row"
     );
 
     // Narrow, they stack, and every binding is still reachable by scrolling.
     let narrow = rows(&frame(&mut app, 90, 44));
-    assert!(
-        !narrow
-            .iter()
-            .any(|row| row.contains("GLOBAL") && row.contains("CONVERSATION"))
+    assert!(narrow.iter().all(|row| headings_on(row, &headings) <= 1));
+}
+
+#[test]
+fn the_help_modal_names_each_scope_once() {
+    let mut app = app();
+    app.update(Action::OpenHelp);
+    let headings = help_headings();
+    let lines = rows(&frame(&mut app, 90, 60));
+    let total: usize = lines.iter().map(|row| headings_on(row, &headings)).sum();
+    assert_eq!(
+        total,
+        headings.len(),
+        "one heading per scope, not {total} for {} scopes",
+        headings.len()
     );
 }
 
@@ -695,16 +734,64 @@ fn a_conversation_draws_blocks_a_day_header_and_meta_lines() {
 }
 
 #[test]
-fn the_day_header_sits_on_the_top_row_and_keeps_its_band() {
+fn the_day_band_takes_a_row_of_its_own_rather_than_covering_a_message() {
     let mut app = with_conversation(false, 1, vec![message(1, false, 1, "hello", 5)]);
     let buffer = frame(&mut app, 120, 34);
-    let area = app.panes.conversation;
+    let band = app.panes.day.expect("a day band");
+    let convo = app.panes.conversation;
 
-    let row: String = (0..area.width)
-        .map(|x| buffer[(x + area.x, area.y)].symbol().to_string())
+    // One row, directly above the messages, on the lighter band the mockup
+    // gives it.
+    assert_eq!(band.height, 1);
+    assert_eq!(band.y + 1, convo.y);
+    assert_eq!(buffer[(band.x, band.y)].bg, app.theme.bg_light);
+
+    // The day is said, and nothing the message says is hidden under the band.
+    assert!(contains(&buffer, "Today"));
+    assert!(contains(&buffer, "hello"));
+}
+
+/// Forty messages of one day, which is more rows than any pane these tests
+/// draw at.
+fn a_long_day() -> Vec<Message> {
+    (1..=40)
+        .map(|n| message(n, n % 2 == 0, 1, "a line of a long day", 5))
+        .collect()
+}
+
+#[test]
+fn the_day_band_names_the_day_once_the_separator_has_scrolled_off() {
+    let mut app = with_conversation(false, 1, a_long_day());
+    let buffer = frame(&mut app, 120, 34);
+    let band = app.panes.day.expect("a day band");
+
+    let row: String = (0..band.width)
+        .map(|x| buffer[(x + band.x, band.y)].symbol().to_string())
         .collect();
-    assert!(row.contains("Today"), "sticky header row: {row:?}");
-    assert_eq!(buffer[(area.x, area.y)].bg, app.theme.bg_light);
+    assert!(row.contains("Today"), "day band row: {row:?}");
+}
+
+#[test]
+fn a_thread_longer_than_the_pane_gets_the_mockups_scrollbar() {
+    let mut app = with_conversation(false, 1, a_long_day());
+    let buffer = frame(&mut app, 120, 34);
+    let convo = app.panes.conversation;
+    let x = convo.x + convo.width - 1;
+
+    let bar: Vec<String> = (0..convo.height)
+        .map(|y| buffer[(x, convo.y + y)].symbol().to_string())
+        .collect();
+    assert!(bar.iter().any(|cell| cell == "┃"), "a thumb: {bar:?}");
+    assert!(bar.iter().any(|cell| cell == "│"), "a track: {bar:?}");
+    // Scrolled to the newest message, the thumb sits at the bottom.
+    assert_eq!(bar.last().map(String::as_str), Some("┃"), "{bar:?}");
+
+    // A thread that fits leaves the column alone.
+    let mut short = with_conversation(false, 1, vec![message(1, false, 1, "hi", 5)]);
+    let buffer = frame(&mut short, 120, 34);
+    let convo = short.panes.conversation;
+    let x = convo.x + convo.width - 1;
+    assert_eq!(buffer[(x, convo.y)].symbol(), " ");
 }
 
 #[test]

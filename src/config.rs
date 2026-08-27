@@ -25,7 +25,8 @@ pub struct Config {
     pub show_chat_list: bool,
     /// Width of the chat list pane in columns.
     pub chat_list_width: u16,
-    /// Rows moved by `PageUp` / `PageDown` and by one wheel notch × 3.
+    /// Rows `PageUp` / `PageDown` move a list by. The conversation pages by
+    /// its own height instead, and the wheel is always three rows.
     pub page_step: u16,
     /// Capture the mouse. `--no-mouse` overrides this to `false`.
     pub mouse: bool,

@@ -463,14 +463,24 @@ pub fn system_text(ctx: &Ctx<'_>, message: &Message) -> String {
 /// The day separator above `index`, when the day changes there.
 fn day_separator(ctx: &Ctx<'_>, index: usize) -> Option<String> {
     let when = ctx.messages.get(index)?.sent_at()?;
+    opens_a_day(ctx.messages, index).then(|| day_label(ctx.now, when))
+}
+
+/// Whether the message at `index` is the first of its day on this page, which
+/// is what earns it a separator row.
+///
+/// The day band above the pane asks the same question, so that a day the
+/// separator is already announcing is not announced twice.
+#[must_use]
+pub fn opens_a_day(messages: &[Message], index: usize) -> bool {
+    let Some(when) = messages.get(index).and_then(Message::sent_at) else {
+        return false;
+    };
     let previous = index
         .checked_sub(1)
-        .and_then(|before| ctx.messages.get(before))
+        .and_then(|before| messages.get(before))
         .and_then(Message::sent_at);
-    match previous {
-        Some(before) if before.date_naive() == when.date_naive() => None,
-        _ => Some(day_label(ctx.now, when)),
-    }
+    !matches!(previous, Some(before) if before.date_naive() == when.date_naive())
 }
 
 /// `▏↳ Dev: who's in for the draft?`, the first line of what is being answered.
@@ -587,24 +597,29 @@ fn meta_lines(
     lines
 }
 
-/// `18:02`, `18:06 · Delivered`, `18:02 · Read 18:05`.
+/// `18:02`, `18:06 · Delivered`, `18:02 · Read 18:05`, and `· Edited` on the
+/// end of any of them.
 ///
 /// `stamp` says whether this message is the one the receipt belongs under —
 /// [`Ctx::is_latest_mine`] — so an older message of yours is just its clock,
-/// the way Messages.app draws it.
+/// the way Messages.app draws it. The edit mark is not a receipt and goes on
+/// every edited message, whoever sent it: msgs cannot edit, but `chat.db`
+/// records what another device did and saying so is cheaper than surprising
+/// somebody with a body that changed under them.
 #[must_use]
 pub fn meta_text(message: &Message, stamp: bool) -> String {
     let sent = message.sent_at().map(clock).unwrap_or_default();
+    let edited = if message.is_edited { " · Edited" } else { "" };
     if !message.is_from_me || !stamp {
-        return sent;
+        return format!("{sent}{edited}");
     }
     if let Some(read) = message.read_at() {
-        return format!("{sent} · Read {}", clock(read));
+        return format!("{sent} · Read {}{edited}", clock(read));
     }
     if message.delivered_at().is_some() {
-        return format!("{sent} · Delivered");
+        return format!("{sent} · Delivered{edited}");
     }
-    sent
+    format!("{sent}{edited}")
 }
 
 /// The reactions standing on a message, as chip labels.
@@ -911,6 +926,22 @@ mod tests {
         theirs.date_delivered = stamp(9);
         theirs.date_read = stamp(8);
         assert_eq!(meta_text(&theirs, true), "18:20");
+    }
+
+    #[test]
+    fn an_edited_message_says_so_whoever_sent_it() {
+        let mut mine = message(1, true, "sent");
+        mine.date_edited = stamp(5);
+        mine.is_edited = true;
+        assert_eq!(meta_text(&mine, true), "18:20 · Edited");
+        mine.date_delivered = stamp(9);
+        assert_eq!(meta_text(&mine, true), "18:20 · Delivered · Edited");
+        mine.date_read = stamp(8);
+        assert_eq!(meta_text(&mine, true), "18:20 · Read 18:22 · Edited");
+
+        let mut theirs = message(2, false, "got it");
+        theirs.is_edited = true;
+        assert_eq!(meta_text(&theirs, true), "18:20 · Edited");
     }
 
     #[test]

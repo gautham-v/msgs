@@ -20,6 +20,10 @@ pub struct Binding {
 }
 
 /// Every binding, in the order the help modal lists them.
+///
+/// Rows are grouped by scope and each scope appears exactly once, because the
+/// help modal opens a heading every time the scope changes: a table that
+/// interleaved them would print `GLOBAL` four times.
 pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: "Tab",
@@ -27,24 +31,9 @@ pub const BINDINGS: &[Binding] = &[
         scope: "global",
     },
     Binding {
-        keys: "↑ ↓ / k j",
-        description: "select chat or message",
-        scope: "list",
-    },
-    Binding {
         keys: "Enter",
         description: "open chat / send message",
         scope: "global",
-    },
-    Binding {
-        keys: "PgUp PgDn",
-        description: "page through the conversation",
-        scope: "list",
-    },
-    Binding {
-        keys: "g / G",
-        description: "jump to top / bottom",
-        scope: "list",
     },
     Binding {
         keys: "Ctrl+K",
@@ -55,6 +44,36 @@ pub const BINDINGS: &[Binding] = &[
         keys: "Ctrl+B",
         description: "toggle the chat list",
         scope: "global",
+    },
+    Binding {
+        keys: "Esc",
+        description: "close the overlay / leave the composer",
+        scope: "global",
+    },
+    Binding {
+        keys: "?",
+        description: "this help",
+        scope: "global",
+    },
+    Binding {
+        keys: "q / Ctrl+C",
+        description: "quit",
+        scope: "global",
+    },
+    Binding {
+        keys: "↑ ↓ / k j",
+        description: "select chat or message",
+        scope: "list",
+    },
+    Binding {
+        keys: "PgUp PgDn",
+        description: "page through the conversation",
+        scope: "list",
+    },
+    Binding {
+        keys: "g / G",
+        description: "jump to top / bottom",
+        scope: "list",
     },
     Binding {
         keys: "Ctrl+U",
@@ -72,14 +91,9 @@ pub const BINDINGS: &[Binding] = &[
         scope: "conversation",
     },
     Binding {
-        keys: "Tab",
-        description: "cycle the filter: all / chats / messages / photos",
-        scope: "palette",
-    },
-    Binding {
-        keys: "Ctrl+N",
-        description: "new message to a typed number or address",
-        scope: "palette",
+        keys: "i",
+        description: "start typing in the composer",
+        scope: "conversation",
     },
     Binding {
         keys: "o",
@@ -112,6 +126,36 @@ pub const BINDINGS: &[Binding] = &[
         scope: "conversation",
     },
     Binding {
+        keys: "Ctrl+A",
+        description: "attach a file",
+        scope: "composer",
+    },
+    Binding {
+        keys: "Alt+Enter",
+        description: "newline without sending (Shift+Enter where supported)",
+        scope: "composer",
+    },
+    Binding {
+        keys: "Ctrl+W",
+        description: "delete the word before the cursor",
+        scope: "text field",
+    },
+    Binding {
+        keys: "Ctrl+U",
+        description: "clear the whole field",
+        scope: "text field",
+    },
+    Binding {
+        keys: "Tab",
+        description: "cycle the filter: all / chats / messages / photos",
+        scope: "palette",
+    },
+    Binding {
+        keys: "Ctrl+N",
+        description: "new message to a typed number or address",
+        scope: "palette",
+    },
+    Binding {
         keys: "← →",
         description: "choose a reaction",
         scope: "react picker",
@@ -125,31 +169,6 @@ pub const BINDINGS: &[Binding] = &[
         keys: "Enter",
         description: "send it, or take back one of yours",
         scope: "react picker",
-    },
-    Binding {
-        keys: "Ctrl+A",
-        description: "attach a file",
-        scope: "composer",
-    },
-    Binding {
-        keys: "Alt+Enter",
-        description: "newline without sending (Shift+Enter where supported)",
-        scope: "composer",
-    },
-    Binding {
-        keys: "Esc",
-        description: "close the overlay / leave the composer",
-        scope: "global",
-    },
-    Binding {
-        keys: "?",
-        description: "this help",
-        scope: "global",
-    },
-    Binding {
-        keys: "q / Ctrl+C",
-        description: "quit",
-        scope: "global",
     },
     Binding {
         keys: "r / Enter",
@@ -178,15 +197,20 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
-    // Bindings that win everywhere, including while typing.
+    // Bindings that win everywhere, including while typing. The first-run
+    // surface is the exception: there is no conversation behind it to attach
+    // to, react to, or open a link from, so only the two keys that still mean
+    // something over it get through and the rest stay dead.
     if ctrl {
         match key.code {
             KeyCode::Char('c') => return Some(Action::Quit),
             KeyCode::Char('k') => return Some(Action::OpenPalette),
-            KeyCode::Char('b') => return Some(Action::ToggleChatList),
-            KeyCode::Char('a') => return Some(Action::Attach),
-            KeyCode::Char('r') => return Some(Action::React),
-            KeyCode::Char('l') => return Some(Action::OpenLink),
+            KeyCode::Char('b') if focus != Focus::DbError => {
+                return Some(Action::ToggleChatList);
+            }
+            KeyCode::Char('a') if focus != Focus::DbError => return Some(Action::Attach),
+            KeyCode::Char('r') if focus != Focus::DbError => return Some(Action::React),
+            KeyCode::Char('l') if focus != Focus::DbError => return Some(Action::OpenLink),
             _ => {}
         }
     }
@@ -493,6 +517,25 @@ mod tests {
         // Nothing to select and nothing to type into.
         assert_eq!(resolve(key(KeyCode::Down), Focus::DbError), None);
         assert_eq!(resolve(key(KeyCode::Char('x')), Focus::DbError), None);
+        // And nothing behind it to attach to, react to, or open a link from.
+        for code in ['a', 'l'] {
+            assert_eq!(
+                resolve(
+                    with(KeyCode::Char(code), KeyModifiers::CONTROL),
+                    Focus::DbError
+                ),
+                None,
+                "Ctrl+{code} should be dead on the first-run surface"
+            );
+        }
+        // The palette still opens over it, which is what draws it a surface.
+        assert_eq!(
+            resolve(
+                with(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                Focus::DbError
+            ),
+            Some(Action::OpenPalette)
+        );
     }
 
     #[test]
@@ -503,5 +546,25 @@ mod tests {
             assert!(!binding.scope.is_empty());
         }
         assert!(!SHORTCUT_BAR.is_empty());
+    }
+
+    /// The help modal opens a heading every time the scope changes, so a scope
+    /// that appears in two runs prints its heading twice.
+    #[test]
+    fn each_scope_is_one_contiguous_run() {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut current = "";
+        for binding in BINDINGS {
+            if binding.scope == current {
+                continue;
+            }
+            assert!(
+                !seen.contains(&binding.scope),
+                "scope {:?} appears in more than one run",
+                binding.scope
+            );
+            seen.push(binding.scope);
+            current = binding.scope;
+        }
     }
 }
