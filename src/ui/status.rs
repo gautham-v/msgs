@@ -75,14 +75,16 @@ pub fn segments(app: &App) -> Vec<String> {
         DbStatus::Unreadable(reason) => format!("chat.db unreadable: {reason}"),
     });
 
-    segments.push(
-        match app.status.watcher {
-            WatcherStatus::Off => "watcher off",
-            WatcherStatus::Watching => "watching chat.db",
-            WatcherStatus::Polling => "polling chat.db",
-        }
-        .to_string(),
-    );
+    let how = match app.status.watcher {
+        WatcherStatus::Off => "watcher off",
+        WatcherStatus::Watching => "watching chat.db",
+        WatcherStatus::Polling => "polling chat.db",
+    };
+    // How fresh the screen is, once there has been something to be fresh about.
+    segments.push(match app.status.last_update {
+        Some(when) => format!("{how} · {}", super::format::age(when.elapsed())),
+        None => how.to_string(),
+    });
 
     segments
 }

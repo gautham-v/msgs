@@ -13,6 +13,7 @@ Rust + ratatui terminal client for iMessage on macOS.
 - `src/ui/` — ratatui widgets: chat list, conversation, composer, palette, help; `ui::compute`, `chat_list::Shape`, `conversation::Scroll`, and `ui::message::block` are pure layout functions with tests, and `ui::format` holds the string helpers (relative times, previews, wrapping, truncation)
 - `src/shell.rs` — the clipboard (`pbcopy`, then OSC 52) and the browser (`open`); the only two things msgs asks the rest of the machine to do
 - `src/send.rs` — outbound messages via `osascript` → Messages.app; tapbacks via `imsg`
+- `src/watch.rs` — live updates: `notify` on the directory `chat.db` lives in, debounced, with a 2s timer as the fallback; `App::on_db_change` does the re-reading
 - `src/search.rs` — FTS5 index kept next to the app (not inside chat.db)
 - `docs/mockups.html` — the design target; match it
 

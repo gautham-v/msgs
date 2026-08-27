@@ -10,7 +10,7 @@
 
 use chrono::Local;
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as BlockWidget, Paragraph};
@@ -39,6 +39,9 @@ pub struct Measured {
     pub heights: Vec<u16>,
     /// `message.guid` to its index on the loaded page.
     pub by_guid: HashMap<String, usize>,
+    /// Set when a loaded row changed without the page changing shape — an edit
+    /// or a tapback — which nothing else about the page would reveal.
+    pub stale: bool,
 }
 
 /// Where the conversation is scrolled to.
@@ -225,6 +228,8 @@ pub struct Hits {
     pub rows: Vec<Option<usize>>,
     /// Links drawn on the pane.
     pub links: Vec<LinkHit>,
+    /// Where the `↓ N new` pill was drawn, when one was.
+    pub pill: Option<Rect>,
 }
 
 impl Hits {
@@ -235,6 +240,13 @@ impl Hits {
             return None;
         }
         self.rows.get(usize::from(row - area.y)).copied().flatten()
+    }
+
+    /// Whether an absolute terminal cell is inside the `↓ N new` pill.
+    #[must_use]
+    pub fn pill_at(&self, column: u16, row: u16) -> bool {
+        self.pill
+            .is_some_and(|rect| rect.contains(Position::new(column, row)))
     }
 
     /// The link under an absolute terminal cell.
@@ -486,7 +498,49 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
     }
 
     render_sticky_day(frame, app, area, &visible, now);
+    hits.pill = render_new_pill(frame, app, area);
     hits
+}
+
+/// The label on the pill: `↓ 3 new`, padded so it reads as a chip.
+#[must_use]
+pub fn new_pill_label(count: usize) -> String {
+    format!(" ↓ {count} new ")
+}
+
+/// The `↓ N new` pill, sitting on the bottom edge of the pane while messages
+/// have arrived below what the reader is looking at.
+///
+/// It carries a count and nothing else — never a name and never a line of the
+/// message it is counting.
+fn render_new_pill(frame: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
+    if app.new_below == 0 || area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let label = new_pill_label(app.new_below);
+    let width = u16::try_from(crate::ui::format::width(&label))
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    if width == 0 {
+        return None;
+    }
+    let rect = Rect {
+        x: area.x + area.width - width,
+        y: area.y + area.height - 1,
+        width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            Style::new()
+                .bg(app.theme.accent_me)
+                .fg(app.theme.bg_base)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        rect,
+    );
+    Some(rect)
 }
 
 /// The day of the topmost message, held at the top edge while it scrolls.

@@ -13,12 +13,13 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
 use crate::config::Config;
-use crate::db::{Chat, Db, DbError, Message, PAGE};
+use crate::db::{Chat, Db, DbError, MAX_PAGE, Message, PAGE, Source};
 use crate::send::{self, Delivery, Outbox, Outgoing, Pending, SendError, Target};
 use crate::theme::Theme;
 use crate::ui::Panes;
 use crate::ui::conversation::{Hits, Measured, Scroll};
 use crate::ui::message::{self, Ctx};
+use crate::watch::Watcher;
 
 /// How long a toast stays on the status line.
 const TOAST_TTL: Duration = Duration::from_secs(2);
@@ -36,6 +37,12 @@ const RECONCILE_FOR: Duration = Duration::from_secs(20);
 const RECONCILE_SLACK: i64 = 120;
 /// Longest quoted line `r` puts in the composer.
 const QUOTE_LIMIT: usize = 80;
+/// How often a locked database's scratch copy is taken again.
+///
+/// A copy never changes on its own, so keeping up with a database that had to
+/// be read that way means copying it again — which is far too expensive to do
+/// on every write.
+const SNAPSHOT_EVERY: Duration = Duration::from_secs(2);
 
 /// Which pane or overlay currently receives keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +190,8 @@ pub struct Status {
     pub unread_chats: usize,
     /// Startup warnings (bad config keys, and so on).
     pub warnings: Vec<String>,
+    /// When the database was last re-read because it changed.
+    pub last_update: Option<Instant>,
     toast: Option<Toast>,
 }
 
@@ -520,6 +529,16 @@ pub struct App {
     pub panes: Panes,
     /// Last known mouse position, for the hover tint.
     pub hover: Option<Position>,
+    /// Live updates: what tells the app that `chat.db` moved.
+    ///
+    /// Public so a test can leave it [`Watcher::off`] and drive
+    /// [`App::on_db_change`] by hand instead of waiting on a filesystem.
+    pub watcher: Watcher,
+    /// Messages that arrived below the viewport since the reader last saw the
+    /// bottom, which is what the `↓ N new` pill counts.
+    pub new_below: usize,
+    /// When the scratch copy of a locked database was last re-taken.
+    last_snapshot: Option<Instant>,
 }
 
 impl App {
@@ -573,6 +592,9 @@ impl App {
             status,
             panes: Panes::default(),
             hover: None,
+            watcher: Watcher::off(),
+            new_below: 0,
+            last_snapshot: None,
         }
     }
 
@@ -589,6 +611,7 @@ impl App {
                 self.db_error = None;
                 self.db = Some(db);
                 self.reload_chats();
+                self.start_watching();
             }
             Err(err) => {
                 self.status.db = DbStatus::Unreadable(err.summary());
@@ -596,13 +619,40 @@ impl App {
                 self.db_error = Some(err);
                 self.chat_rows.clear();
                 self.message_rows.clear();
+                self.watcher = Watcher::off();
+                self.status.watcher = WatcherStatus::Off;
                 self.refresh_chat_view();
             }
         }
     }
 
+    /// Start live updates for the database that is open.
+    ///
+    /// Never fatal: a watcher that will not start is replaced by a two-second
+    /// timer, said once in the startup warnings and then permanently on the
+    /// status line as `polling chat.db`.
+    pub fn start_watching(&mut self) {
+        let Some(path) = self.db_path.clone() else {
+            self.watcher = Watcher::off();
+            self.status.watcher = WatcherStatus::Off;
+            return;
+        };
+        self.watcher = Watcher::start(&path);
+        self.status.watcher = self.watcher.status();
+        if self.status.watcher == WatcherStatus::Polling {
+            self.status.warnings.push(
+                "live updates: the file watcher could not start — polling instead".to_string(),
+            );
+        }
+    }
+
     /// Re-read the chat list and the unread totals on the status line.
+    ///
+    /// The list is ordered by recency, so a message arriving anywhere moves
+    /// rows around. The selection is kept on the conversation it was on rather
+    /// than on the row number it was at.
     pub fn reload_chats(&mut self) {
+        let anchor = self.selected_chat().map(|chat| chat.rowid);
         let Some(db) = self.db.as_ref() else {
             return;
         };
@@ -619,7 +669,7 @@ impl App {
                 self.status.error(format!("chat list: {}", err.summary()));
             }
         }
-        self.refresh_chat_view();
+        self.refresh_anchored(true, anchor);
     }
 
     /// Re-apply the filter, keep the selection on the chat it was on, and open
@@ -636,6 +686,14 @@ impl App {
     /// wheel notch, which moves the viewport on purpose and must not be dragged
     /// back to the selection.
     fn refresh(&mut self, follow_selection: bool) {
+        let anchor = self.selected_chat().map(|chat| chat.rowid);
+        self.refresh_anchored(follow_selection, anchor);
+    }
+
+    /// [`App::refresh`] against a conversation the selection should land on,
+    /// which is what a reordered list needs: the row the selection was at no
+    /// longer holds the chat it was on.
+    fn refresh_anchored(&mut self, follow_selection: bool, anchor: Option<i64>) {
         let needle = self
             .chat_filter
             .as_ref()
@@ -651,19 +709,18 @@ impl App {
             .collect();
 
         if visible != self.visible_chats {
-            // Narrowing the list must not drag the selection onto a different
-            // conversation, so it follows the chat it was on where it can.
-            let anchor = self.selected_chat().map(|chat| chat.rowid);
             self.visible_chats = visible;
             self.chats.set_len(self.visible_chats.len());
-            if let Some(rowid) = anchor
-                && let Some(position) = self
-                    .visible_chats
-                    .iter()
-                    .position(|index| self.chat_rows[*index].rowid == rowid)
-            {
-                self.chats.selected = position;
-            }
+        }
+        // Narrowing or reordering the list must not drag the selection onto a
+        // different conversation, so it follows the chat it was on where it can.
+        if let Some(rowid) = anchor
+            && let Some(position) = self
+                .visible_chats
+                .iter()
+                .position(|index| self.chat_rows[*index].rowid == rowid)
+        {
+            self.chats.selected = position;
         }
         self.pinned_visible = self
             .visible_chats
@@ -748,6 +805,9 @@ impl App {
         self.messages.to_bottom();
         self.measured = Measured::default();
         self.convo = Scroll::default();
+        // A fresh conversation opens at its newest message, so nothing is
+        // below the viewport for the pill to count.
+        self.new_below = 0;
         // Echoes for this chat go back on the end of the page they belong to.
         self.sync_pending_rows();
         // The newest message goes to the bottom edge, which needs a pane
@@ -798,6 +858,24 @@ impl App {
         } else {
             self.convo.clamp(&self.measured.heights, viewport);
         }
+        // Back at the newest message: the pill has been read, so it goes away.
+        if self.new_below > 0 && self.at_bottom() {
+            self.new_below = 0;
+        }
+    }
+
+    /// Whether the conversation is scrolled to its newest message.
+    ///
+    /// This is what decides between following a message that just arrived and
+    /// offering the `↓ N new` pill instead.
+    #[must_use]
+    pub fn at_bottom(&self) -> bool {
+        if self.pending_bottom {
+            return true;
+        }
+        let mut end = self.convo;
+        end.to_bottom(&self.measured.heights, self.conversation_height());
+        self.convo == end
     }
 
     /// Re-measure the loaded page if the page or the pane width has changed.
@@ -809,7 +887,8 @@ impl App {
         let len = self.message_rows.len();
         let first = self.message_rows.first().map_or(0, |message| message.rowid);
         let last = self.message_rows.last().map_or(0, |message| message.rowid);
-        if self.measured.width == width
+        if !self.measured.stale
+            && self.measured.width == width
             && self.measured.first == first
             && self.measured.last == last
             && self.measured.heights.len() == len
@@ -859,6 +938,7 @@ impl App {
             last,
             heights,
             by_guid,
+            stale: false,
         };
     }
 
@@ -1087,30 +1167,94 @@ impl App {
     }
 
     /// Read whatever `chat.db` has gained at the end of the open conversation,
-    /// and retire the echoes it accounts for.
+    /// retire the echoes it accounts for, and follow it if the reader was
+    /// already at the newest message.
+    ///
+    /// Returns `true` if anything changed on screen.
     fn pull_new_messages(&mut self) -> bool {
-        let Some(chat_rowid) = self.open_chat else {
+        // Asked before the rows land, because appending to the page is what
+        // moves the bottom out from under the viewport.
+        let was_at_bottom = self.at_bottom();
+        let Some(refreshed) = self.refresh_open_conversation() else {
             return false;
         };
-        let Some(db) = self.db.as_ref() else {
-            return false;
-        };
-        let newest = self
-            .message_rows
-            .iter()
-            .filter(|message| !message.guid.starts_with(send::PENDING_PREFIX))
-            .map(|message| message.rowid)
-            .max()
-            .unwrap_or(0);
-        let Ok(arrived) = db.messages_after(chat_rowid, newest, PAGE) else {
-            return false;
-        };
-        if arrived.is_empty() {
+        if refreshed.is_quiet() {
             return false;
         }
+        if refreshed.appended > 0 {
+            if was_at_bottom {
+                self.messages.to_bottom();
+                self.pending_bottom = true;
+                self.new_below = 0;
+            } else {
+                // A row that replaced one of your own echoes is already on
+                // screen; only what someone else added is news.
+                self.new_below += refreshed.appended.saturating_sub(refreshed.claimed);
+            }
+            // The chat list's preview line and ordering moved with it.
+            self.reload_chats();
+        }
+        true
+    }
 
+    /// Re-read the loaded page of the open conversation.
+    ///
+    /// Rows that are already loaded are replaced where they stand, which is
+    /// how an edit or a tapback lands in the block it belongs to instead of at
+    /// the end of the thread; anything the database has beyond them goes on
+    /// the end. Only the newest page of a long scrollback is re-read, so a
+    /// thread scrolled a long way back does not re-query thousands of rows
+    /// every time somebody types.
+    ///
+    /// `None` means there was nothing to read: no open chat, no database, or a
+    /// query that failed.
+    fn refresh_open_conversation(&mut self) -> Option<Refreshed> {
+        let chat_rowid = self.open_chat?;
+        // The echoes are ours, not the database's; they go back on at the end.
+        self.message_rows
+            .retain(|message| !message.guid.starts_with(send::PENDING_PREFIX));
+
+        let loaded = self.message_rows.len();
+        let window = loaded.min(PAGE);
+        let after = self
+            .message_rows
+            .get(loaded - window)
+            .map_or(0, |message| message.rowid - 1);
+        let limit = (window + PAGE).min(MAX_PAGE);
+
+        let db = self.db.as_ref()?;
+        let fresh = match db.messages_after(chat_rowid, after, limit) {
+            Ok(fresh) => fresh,
+            Err(err) => {
+                self.status.error(format!("messages: {}", err.summary()));
+                self.sync_pending_rows();
+                return None;
+            }
+        };
+
+        let mut at: HashMap<String, usize> = self
+            .message_rows
+            .iter()
+            .enumerate()
+            .map(|(index, message)| (message.guid.clone(), index))
+            .collect();
+        let mut refreshed = Refreshed::default();
+        let mut appended: Vec<Message> = Vec::new();
+        for message in fresh {
+            if let Some(index) = at.get(&message.guid).copied() {
+                if self.message_rows[index] != message {
+                    self.message_rows[index] = message;
+                    refreshed.merged = true;
+                }
+            } else {
+                at.insert(message.guid.clone(), loaded + appended.len());
+                appended.push(message);
+            }
+        }
+
+        // Echoes whose real row has now arrived have nothing left to stand for.
         let mut claimed: Vec<u64> = Vec::new();
-        for message in &arrived {
+        for message in &appended {
             let sent = message.date;
             let Some(pending) = self.pending.iter().find(|pending| {
                 pending.chat_rowid == chat_rowid
@@ -1129,16 +1273,65 @@ impl App {
             self.reconcile_since = None;
         }
 
-        // Insert the real rows before the echoes that are still standing.
-        self.message_rows
-            .retain(|message| !message.guid.starts_with(send::PENDING_PREFIX));
-        self.message_rows.extend(arrived);
+        refreshed.appended = appended.len();
+        refreshed.claimed = claimed.len();
+        self.message_rows.extend(appended);
+        if refreshed.merged {
+            // A block that changed in place keeps its `ROWID`, so nothing else
+            // would tell the measuring pass that its height moved.
+            self.measured.stale = true;
+        }
         self.sync_pending_rows();
-        self.messages.to_bottom();
-        self.pending_bottom = true;
-        // The chat list's preview line and ordering moved with it.
-        self.reload_chats();
+        Some(refreshed)
+    }
+
+    /// `chat.db` changed: re-read what is on screen.
+    ///
+    /// Driven by [`App::tick`] when the watcher fires, and called directly by
+    /// tests, which is why it does not touch the watcher itself.
+    pub fn on_db_change(&mut self) -> bool {
+        if self.db.is_none() {
+            return false;
+        }
+        self.refresh_snapshot();
+        if !self.pull_new_messages() {
+            // Nothing for the open thread, but another conversation may have
+            // gained a message: its row moves to the top of the list and its
+            // preview and unread badge change with it.
+            self.reload_chats();
+        }
+        self.status.last_update = Some(Instant::now());
         true
+    }
+
+    /// Take the scratch copy of a locked database again.
+    ///
+    /// A copy is a still photograph: nothing new ever appears in it, so a
+    /// database that had to be read that way only keeps up if the picture is
+    /// taken again. That is expensive, so it is rate-limited, and a database
+    /// being read in place — the normal case, with Messages.app closed — does
+    /// none of this.
+    fn refresh_snapshot(&mut self) {
+        if self
+            .db
+            .as_ref()
+            .is_none_or(|db| db.source() == Source::Live)
+        {
+            return;
+        }
+        if self
+            .last_snapshot
+            .is_some_and(|when| when.elapsed() < SNAPSHOT_EVERY)
+        {
+            return;
+        }
+        self.last_snapshot = Some(Instant::now());
+        let Some(path) = self.db_path.clone() else {
+            return;
+        };
+        if let Ok(db) = Db::open(&path) {
+            self.db = Some(db);
+        }
     }
 
     /// The focus `keymap` should resolve against.
@@ -1580,6 +1773,13 @@ impl App {
                 self.refresh_chat_view();
             }
         } else if pane == Focus::Conversation {
+            // The pill is a button: clicking it goes to what it is counting.
+            if self.hits.pill_at(position.x, position.y) {
+                self.messages.to_bottom();
+                self.pending_bottom = true;
+                self.new_below = 0;
+                return;
+            }
             // A click on a link opens it; anywhere else it selects the block
             // that was drawn on that row.
             if let Some(url) = self
@@ -1613,6 +1813,12 @@ impl App {
         let mut dirty = self.status.tick();
         dirty |= self.absorb_replies();
         dirty |= self.reconcile_pending();
+        if self.watcher.ready() {
+            dirty |= self.on_db_change();
+        }
+        // The watcher can lose its backend at any point and fall back to the
+        // timer, so the status line reads it rather than remembering it.
+        self.status.watcher = self.watcher.status();
         dirty
     }
 
@@ -1622,6 +1828,24 @@ impl App {
         self.attach_prompt
             .as_ref()
             .map_or_else(|| self.composer.line_count(), TextField::line_count)
+    }
+}
+
+/// What one re-read of the open conversation did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Refreshed {
+    /// Messages added at the end of the loaded page.
+    appended: usize,
+    /// How many of those were the real rows behind echoes on screen.
+    claimed: usize,
+    /// Whether a row that was already loaded changed — an edit, or a tapback.
+    merged: bool,
+}
+
+impl Refreshed {
+    /// Whether the database had nothing new to say.
+    const fn is_quiet(self) -> bool {
+        self.appended == 0 && !self.merged
     }
 }
 
@@ -1870,6 +2094,7 @@ mod tests {
             last: count as i64,
             heights: vec![2; count],
             by_guid: HashMap::new(),
+            stale: false,
         };
         app.conversation_start_loaded = true;
         app
@@ -1905,6 +2130,7 @@ mod tests {
         app.hits = Hits {
             rows: (0..20).map(|row| Some(row / 2)).collect(),
             links: Vec::new(),
+            pill: None,
         };
 
         app.on_mouse(MouseEvent {

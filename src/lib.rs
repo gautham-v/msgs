@@ -14,6 +14,7 @@
 //!   the rest of the machine to do
 //! - [`theme`] — named color slots
 //! - [`ui`] — layout and drawing
+//! - [`watch`] — noticing that `chat.db` changed, so the screen keeps up
 //!
 //! Reading `chat.db` is strictly read-only; nothing in this crate opens it for
 //! writing.
@@ -26,6 +27,7 @@ pub mod send;
 pub mod shell;
 pub mod theme;
 pub mod ui;
+pub mod watch;
 
 use std::path::PathBuf;
 

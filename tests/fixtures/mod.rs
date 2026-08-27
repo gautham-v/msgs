@@ -40,9 +40,9 @@ pub const MSG_GROUP_RENAME: i64 = 12;
 pub const ATTRIBUTED_BODY: &str = "recovered from the typedstream";
 
 /// Nanoseconds per second, for readable timestamps.
-const SECOND: i64 = 1_000_000_000;
+pub const SECOND: i64 = 1_000_000_000;
 /// An arbitrary but fixed instant in the Messages epoch: 2022-05-17 22:29:42Z.
-const BASE: i64 = 674_526_582 * SECOND;
+pub const BASE: i64 = 674_526_582 * SECOND;
 
 /// Path to the fixture database, building it if it is not there yet.
 ///

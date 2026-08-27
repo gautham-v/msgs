@@ -40,6 +40,31 @@ pub fn relative_time(now: DateTime<Local>, when: DateTime<Local>) -> String {
     when.format("%-m/%-d/%y").to_string()
 }
 
+/// How long ago something happened, for the status line: `just now`, `12s
+/// ago`, `4m ago`, `2h ago`.
+///
+/// Coarser than [`relative_time`] on purpose: the status line is saying how
+/// fresh what is on screen is, not when a message was sent.
+#[must_use]
+pub fn age(elapsed: std::time::Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 5 {
+        return "just now".to_string();
+    }
+    if seconds < 60 {
+        return format!("{seconds}s ago");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m ago");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+    format!("{}d ago", hours / 24)
+}
+
 /// The label on a day separator: `Today`, `Yesterday`, `Tuesday`, `August 12`.
 ///
 /// The scale coarsens the same way [`relative_time`] does, but written out in

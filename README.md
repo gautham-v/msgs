@@ -30,7 +30,7 @@ Flags:
 | `--db <PATH>` | read this database instead of `~/Library/Messages/chat.db` |
 | `--config <PATH>` | read this config file instead of the default |
 | `--no-mouse` | do not capture the mouse |
-| `--check` | print a readiness report (database, row counts, Messages.app, `osascript`, `imsg`) and exit |
+| `--check` | print a readiness report (database, row counts, live updates, Messages.app, `osascript`, `imsg`) and exit |
 | `--version` | print the version |
 
 ## Keys
@@ -78,6 +78,25 @@ leaves) are dim italic lines without a rail, and days are separated by a header
 that sticks to the top edge as it scrolls. Because block heights are measured
 once per page rather than once per frame, only the blocks actually on screen are
 laid out, and a 25,000-message thread scrolls at the same speed as a short one.
+
+## Live updates
+
+msgs keeps up with `chat.db` without Messages.app open. A `notify` watcher sits
+on the directory the database lives in — the directory rather than the file,
+because `chat.db-wal` is deleted and recreated around every checkpoint — and a
+burst of writes is debounced into one re-read three tenths of a second after it
+goes quiet. If no platform watcher will start, a two-second timer takes over;
+the status line says `watching chat.db` or `polling chat.db`, followed by how
+long ago the screen was last refreshed.
+
+A re-read asks the open conversation for its newest page. Rows already on
+screen are replaced where they stand, so an edit or a tapback lands in the block
+it belongs to; anything past them goes on the end. If you were at the newest
+message the view follows it; if you were reading further back it stays where it
+is and a `↓ 3 new` pill appears on the bottom edge, which you can click or clear
+by pressing `G`. A message in some other thread moves that chat to the top of
+the list and updates its preview and unread badge, and the chat-list selection
+follows the conversation you were in rather than the row number it was at.
 
 Pinned conversations are shown as their own section when the database records
 pinning. macOS keeps that in Messages.app's preferences rather than in

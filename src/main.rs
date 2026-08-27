@@ -23,7 +23,7 @@ use crossterm::{cursor, event, execute};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use msgs::app::App;
+use msgs::app::{App, WatcherStatus};
 use msgs::config::Config;
 use msgs::db::{Db, Source};
 use msgs::{config, default_db_path, keymap, ui};
@@ -196,6 +196,19 @@ fn check(cli: &Cli, warnings: &[String]) -> Result<()> {
             }
         }
     }
+
+    // Read-only: this starts a filesystem watcher on the directory and asks it
+    // nothing about the contents.
+    let watcher = msgs::watch::Watcher::start(&path);
+    row(
+        "live updates",
+        match watcher.status() {
+            WatcherStatus::Watching => "watching chat.db and its WAL",
+            WatcherStatus::Polling => "no file watcher — polling every 2s instead",
+            WatcherStatus::Off => "off",
+        },
+    );
+    drop(watcher);
 
     let messages_app = [
         "/System/Applications/Messages.app",
