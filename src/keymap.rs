@@ -87,6 +87,11 @@ pub const BINDINGS: &[Binding] = &[
         scope: "conversation",
     },
     Binding {
+        keys: "Ctrl+L",
+        description: "open the first link in the selected message",
+        scope: "conversation",
+    },
+    Binding {
         keys: "Ctrl+A",
         description: "attach a file",
         scope: "composer",
@@ -141,6 +146,7 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
             KeyCode::Char('b') => return Some(Action::ToggleChatList),
             KeyCode::Char('a') => return Some(Action::Attach),
             KeyCode::Char('r') => return Some(Action::React),
+            KeyCode::Char('l') => return Some(Action::OpenLink),
             _ => {}
         }
     }

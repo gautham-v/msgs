@@ -575,6 +575,31 @@ impl Db {
             })?)
     }
 
+    /// How many files, and how many of those are pictures, a chat holds.
+    ///
+    /// One aggregate query, so the conversation header can say `38 photos`
+    /// without walking the thread. Sticker and hidden rows are left out, the
+    /// same way the transcript leaves them out.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the attachment tables cannot be read.
+    pub fn attachment_counts(&self, chat_rowid: i64) -> Result<(i64, i64), DbError> {
+        let sql = "SELECT COUNT(*), \
+                          COALESCE(SUM(CASE WHEN a.mime_type LIKE 'image/%' \
+                                              OR a.uti LIKE '%image%' \
+                                            THEN 1 ELSE 0 END), 0) \
+                   FROM chat_message_join j \
+                   JOIN message_attachment_join k ON k.message_id = j.message_id \
+                   JOIN attachment a ON a.ROWID = k.attachment_id \
+                   WHERE j.chat_id = ?1 \
+                     AND COALESCE(a.is_sticker, 0) = 0 \
+                     AND COALESCE(a.hide_attachment, 0) = 0";
+        Ok(self
+            .conn()
+            .query_row(sql, [chat_rowid], |row| Ok((row.get(0)?, row.get(1)?)))?)
+    }
+
     /// Hang attachments and tapbacks off a page of messages.
     fn decorate(&self, chat_rowid: i64, page: &mut [Message]) -> Result<(), DbError> {
         if page.is_empty() {

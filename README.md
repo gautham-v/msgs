@@ -48,6 +48,7 @@ Flags:
 | `r` | quote the selected message in a reply |
 | `Ctrl+R` | react to selected message |
 | `y` | copy selected message |
+| `Ctrl+L` | open the first link in the selected message |
 | `Ctrl+A` | attach a file |
 | `Alt+Enter` | newline in the composer (`Shift+Enter` where the terminal supports it) |
 | `Esc` | close an overlay / leave the composer |
@@ -63,8 +64,20 @@ file, msgs copies `chat.db` and its `-wal` / `-shm` sidecars to a scratch
 directory, reads the copy, and deletes the copy on exit.
 
 Conversations load a page at a time from the newest end, so opening a thread
-with 25,000 messages in it costs the same as opening a short one. The chat list
-costs four queries however long it is, and only the rows on screen are drawn.
+with 25,000 messages in it costs the same as opening a short one. Scrolling past
+the top of a page fetches the one above it and keeps the view on the message it
+was on. The chat list costs four queries however long it is, and only the rows
+on screen are drawn.
+
+A conversation is drawn as blocks: a colored rail per sender — blue for you,
+green for the other person, and a color per participant in a group, assigned in
+`handle.ROWID` order so it follows a person for the life of the thread — a body
+wrapped to the pane, and a meta line with the time, `Delivered` / `Read`, and
+any tapbacks. Replies quote what they answer, group events (renames, joins,
+leaves) are dim italic lines without a rail, and days are separated by a header
+that sticks to the top edge as it scrolls. Because block heights are measured
+once per page rather than once per frame, only the blocks actually on screen are
+laid out, and a 25,000-message thread scrolls at the same speed as a short one.
 
 Pinned conversations are shown as their own section when the database records
 pinning. macOS keeps that in Messages.app's preferences rather than in

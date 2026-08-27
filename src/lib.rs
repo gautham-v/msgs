@@ -9,6 +9,8 @@
 //! - [`config`] — the optional `~/.config/msgs/config.toml`
 //! - [`db`] — read-only queries against `chat.db`
 //! - [`keymap`] — keys to actions, and the table the help modal renders
+//! - [`shell`] — the clipboard and the browser, the only two things msgs asks
+//!   the rest of the machine to do
 //! - [`theme`] — named color slots
 //! - [`ui`] — layout and drawing
 //!
@@ -19,6 +21,7 @@ pub mod app;
 pub mod config;
 pub mod db;
 pub mod keymap;
+pub mod shell;
 pub mod theme;
 pub mod ui;
 

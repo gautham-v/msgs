@@ -450,3 +450,54 @@ fn filtering_the_list_narrows_it_and_opens_what_is_left() {
     app.update(Action::Cancel);
     assert_eq!(app.visible_chats.len(), 3);
 }
+
+#[test]
+fn a_chat_can_say_how_many_files_and_how_many_pictures_it_holds() {
+    let db = db();
+    assert_eq!(
+        db.attachment_counts(fixtures::CHAT_DIRECT).expect("counts"),
+        (1, 1),
+        "one attachment, and it is a picture"
+    );
+    assert_eq!(
+        db.attachment_counts(fixtures::CHAT_GROUP).expect("counts"),
+        (0, 0)
+    );
+    assert_eq!(db.attachment_counts(999_999).expect("counts"), (0, 0));
+}
+
+#[test]
+fn opening_a_chat_measures_it_and_pins_it_to_its_newest_message() {
+    let mut app = App::new(Config::default(), Vec::new());
+    app.open_db(fixtures::database());
+    // The group opens first; give it a pane to be measured against.
+    app.prepare_conversation(ratatui::layout::Rect::new(30, 2, 60, 20));
+
+    assert_eq!(app.measured.heights.len(), app.message_rows.len());
+    assert!(app.measured.heights.iter().all(|height| *height >= 1));
+    assert_eq!(app.measured.by_guid.len(), app.message_rows.len());
+    assert_eq!(app.open_chat_photos, 0, "no pictures in the group");
+
+    // A conversation shorter than a page has nothing above it, so scrolling up
+    // settles rather than asking the database again and again.
+    assert!(app.conversation_start_loaded);
+    assert_eq!(app.load_older(), 0);
+
+    // The one-to-one chat carries the fixture's only picture.
+    app.update(Action::SelectNext);
+    assert_eq!(app.open_chat, Some(fixtures::CHAT_DIRECT));
+    assert_eq!(app.open_chat_photos, 1);
+}
+
+#[test]
+fn a_selected_message_can_be_read_back_for_copying() {
+    let mut app = App::new(Config::default(), Vec::new());
+    app.open_db(fixtures::database());
+    app.update(Action::SelectNext);
+    assert_eq!(app.open_chat, Some(fixtures::CHAT_DIRECT));
+
+    let selected = app.selected_message().expect("the newest message");
+    assert_eq!(selected.rowid, fixtures::MSG_UNREAD);
+    assert!(!selected.is_from_me);
+    assert!(selected.text.is_some());
+}

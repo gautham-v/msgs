@@ -40,6 +40,71 @@ pub fn relative_time(now: DateTime<Local>, when: DateTime<Local>) -> String {
     when.format("%-m/%-d/%y").to_string()
 }
 
+/// The label on a day separator: `Today`, `Yesterday`, `Tuesday`, `August 12`.
+///
+/// The scale coarsens the same way [`relative_time`] does, but written out in
+/// full, because a separator has a whole row to itself.
+#[must_use]
+pub fn day_label(now: DateTime<Local>, when: DateTime<Local>) -> String {
+    let today = now.date_naive();
+    let day = when.date_naive();
+    if day == today {
+        return "Today".to_string();
+    }
+    if today.pred_opt() == Some(day) {
+        return "Yesterday".to_string();
+    }
+    let age = (today - day).num_days();
+    if (0..7).contains(&age) {
+        return when.format("%A").to_string();
+    }
+    if day.year() == today.year() {
+        return when.format("%B %-d").to_string();
+    }
+    when.format("%B %-d, %Y").to_string()
+}
+
+/// The wall-clock time on a meta line, `18:02`.
+#[must_use]
+pub fn clock(when: DateTime<Local>) -> String {
+    when.format("%H:%M").to_string()
+}
+
+/// A count with thousands separators, as the header writes it: `1,204`.
+#[must_use]
+pub fn thousands(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if n < 0 {
+        out.push('-');
+    }
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// A file size for a chip: `840 B`, `84 KB`, `2.1 MB`.
+#[must_use]
+pub fn bytes(size: i64) -> String {
+    const KB: f64 = 1024.0;
+    let size = size.max(0) as f64;
+    if size < KB {
+        return format!("{size:.0} B");
+    }
+    for (limit, suffix) in [(KB * KB, "KB"), (KB * KB * KB, "MB")] {
+        if size < limit {
+            let scaled = size / (limit / KB);
+            let places = usize::from(scaled < 10.0);
+            return format!("{scaled:.places$} {suffix}");
+        }
+    }
+    format!("{:.1} GB", size / (KB * KB * KB))
+}
+
 /// The unread badge, capped so a runaway group cannot widen the column.
 #[must_use]
 pub fn unread_badge(count: i64) -> String {
@@ -183,6 +248,154 @@ pub fn truncate(text: &str, columns: usize) -> String {
     cut
 }
 
+/// Wrap `text` to `rest` cells a line, giving the first line `first` cells.
+///
+/// Newlines in the body are kept as hard breaks, words are broken only when a
+/// single word is wider than the column, and the result always holds at least
+/// one line so an empty body still occupies a row.
+///
+/// The shorter first line is what lets a group message carry the sender's name
+/// in front of its opening words without the rest of the paragraph indenting.
+#[must_use]
+pub fn wrap(text: &str, first: usize, rest: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for paragraph in text.split('\n') {
+        let start = if out.is_empty() { first } else { rest };
+        wrap_paragraph(paragraph, start.max(1), rest.max(1), &mut out);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Wrap one newline-free run, appending its lines to `out`.
+fn wrap_paragraph(text: &str, first: usize, rest: usize, out: &mut Vec<String>) {
+    let before = out.len();
+    let mut budget = first;
+    let mut line = String::new();
+    let mut used = 0usize;
+
+    for word in text.split_whitespace() {
+        let cells = width(word);
+        if used > 0 && used + 1 + cells > budget {
+            out.push(std::mem::take(&mut line));
+            used = 0;
+            budget = rest;
+        }
+        if cells > budget {
+            // A single word wider than the column is cut across rows rather
+            // than pushed off the edge.
+            if used > 0 {
+                out.push(std::mem::take(&mut line));
+                budget = rest;
+            }
+            for chunk in split_cells(word, budget) {
+                out.push(chunk);
+                budget = rest;
+            }
+            // The last chunk becomes the line still being filled.
+            line = out.pop().unwrap_or_default();
+            used = width(&line);
+            continue;
+        }
+        if used > 0 {
+            line.push(' ');
+            used += 1;
+        }
+        line.push_str(word);
+        used += cells;
+    }
+
+    if !line.is_empty() || out.len() == before {
+        out.push(line);
+    }
+}
+
+/// Cut `word` into pieces at most `cells` terminal cells wide.
+fn split_cells(word: &str, cells: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut chunk = String::new();
+    let mut used = 0;
+    for c in word.chars() {
+        let cell = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + cell > cells && !chunk.is_empty() {
+            chunks.push(std::mem::take(&mut chunk));
+            used = 0;
+        }
+        chunk.push(c);
+        used += cell;
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+/// Byte ranges of the links in `text`.
+///
+/// Deliberately narrow: `http://`, `https://`, and a bare `www.` host. Trailing
+/// punctuation is left out so a link at the end of a sentence still opens.
+#[must_use]
+pub fn find_links(text: &str) -> Vec<(usize, usize)> {
+    const SCHEMES: [&str; 3] = ["https://", "http://", "www."];
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    for (index, _) in text.char_indices() {
+        if found.last().is_some_and(|(_, end)| index < *end) {
+            continue;
+        }
+        // A scheme only starts a link at a word boundary.
+        if index > 0 && !text[..index].ends_with(char::is_whitespace) {
+            continue;
+        }
+        let rest = &text[index..];
+        if !SCHEMES
+            .iter()
+            .any(|scheme| starts_with_ignore_case(rest, scheme))
+        {
+            continue;
+        }
+        let mut end = index + rest.find(char::is_whitespace).unwrap_or(rest.len());
+        while end > index {
+            let tail = text[index..end].chars().next_back().unwrap_or(' ');
+            if matches!(
+                tail,
+                '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\''
+            ) {
+                end -= tail.len_utf8();
+            } else {
+                break;
+            }
+        }
+        // `www.` alone is not a link; there has to be something after the dot.
+        if text[index..end].len() > "www.".len() {
+            found.push((index, end));
+        }
+    }
+    found
+}
+
+/// Whether `haystack` opens with `needle`, ignoring ASCII case.
+///
+/// Compared as bytes: `needle` is always ASCII, and slicing the string itself
+/// would panic the moment a message opens with a multi-byte character.
+fn starts_with_ignore_case(haystack: &str, needle: &str) -> bool {
+    haystack.len() >= needle.len()
+        && haystack.as_bytes()[..needle.len()].eq_ignore_ascii_case(needle.as_bytes())
+}
+
+/// The link a message opens with `Ctrl+L`: the first one in its body.
+#[must_use]
+pub fn first_link(text: &str) -> Option<String> {
+    let (start, end) = find_links(text).first().copied()?;
+    let raw = &text[start..end];
+    Some(if starts_with_ignore_case(raw, "www.") {
+        format!("https://{raw}")
+    } else {
+        raw.to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +446,122 @@ mod tests {
         assert_eq!(truncate("hello", 5), "hello");
         assert_eq!(truncate("hello", 4), "hel…");
         assert_eq!(truncate("hello", 0), "");
+    }
+
+    #[test]
+    fn day_labels_name_the_near_days_and_date_the_far_ones() {
+        let now = at(2025, 8, 27, 18, 30);
+        assert_eq!(day_label(now, at(2025, 8, 27, 0, 1)), "Today");
+        assert_eq!(day_label(now, at(2025, 8, 26, 23, 59)), "Yesterday");
+        // 2025-08-22 was a Friday, five days back.
+        assert_eq!(day_label(now, at(2025, 8, 22, 9, 0)), "Friday");
+        assert_eq!(day_label(now, at(2025, 8, 12, 9, 0)), "August 12");
+        assert_eq!(day_label(now, at(2024, 8, 12, 9, 0)), "August 12, 2024");
+    }
+
+    #[test]
+    fn the_clock_is_twenty_four_hour() {
+        assert_eq!(clock(at(2025, 8, 27, 18, 2)), "18:02");
+        assert_eq!(clock(at(2025, 8, 27, 6, 5)), "06:05");
+    }
+
+    #[test]
+    fn counts_get_separators_and_sizes_get_units() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1204), "1,204");
+        assert_eq!(thousands(1_234_567), "1,234,567");
+        assert_eq!(thousands(-1204), "-1,204");
+
+        assert_eq!(bytes(0), "0 B");
+        assert_eq!(bytes(840), "840 B");
+        assert_eq!(bytes(86_016), "84 KB");
+        assert_eq!(bytes(2_202_010), "2.1 MB");
+    }
+
+    #[test]
+    fn wrapping_breaks_on_spaces_and_keeps_hard_newlines() {
+        assert_eq!(wrap("one two three", 20, 20), vec!["one two three"]);
+        assert_eq!(
+            wrap("one two three four", 8, 8),
+            vec!["one two", "three", "four"]
+        );
+        assert_eq!(
+            wrap(
+                "a
+b", 10, 10
+            ),
+            vec!["a", "b"]
+        );
+        assert_eq!(wrap("", 10, 10), vec![""]);
+        assert_eq!(wrap("   ", 10, 10), vec![""]);
+    }
+
+    #[test]
+    fn the_first_line_can_be_shorter_than_the_rest() {
+        // A sender name eats into the first line only.
+        assert_eq!(wrap("aaa bbb ccc", 4, 8), vec!["aaa", "bbb ccc"]);
+    }
+
+    #[test]
+    fn a_word_wider_than_the_column_is_cut_rather_than_lost() {
+        let lines = wrap("abcdefghij", 4, 4);
+        assert_eq!(lines, vec!["abcd", "efgh", "ij"]);
+        for line in &lines {
+            assert!(width(line) <= 4);
+        }
+    }
+
+    #[test]
+    fn wrapping_never_overflows_the_column_it_was_given() {
+        let text = "a short line, a rather longer one with 🌊 in it, and https://example.invalid/x";
+        for columns in 4..40 {
+            for line in wrap(text, columns, columns) {
+                assert!(width(&line) <= columns, "{columns}: {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn links_are_found_without_their_trailing_punctuation() {
+        let text = "see https://example.invalid/menu, and www.example.invalid too.";
+        let found = find_links(text);
+        assert_eq!(found.len(), 2);
+        assert_eq!(
+            &text[found[0].0..found[0].1],
+            "https://example.invalid/menu"
+        );
+        assert_eq!(&text[found[1].0..found[1].1], "www.example.invalid");
+    }
+
+    #[test]
+    fn scanning_for_links_never_splits_a_multi_byte_character() {
+        // Every one of these opens or ends on a character wider than a byte.
+        for text in ["’", "🌊 https://example.invalid/x", "don’t", "é", "😀😀"] {
+            let _ = find_links(text);
+        }
+        assert_eq!(find_links("’https://example.invalid").len(), 0);
+        assert_eq!(find_links("🌊 https://example.invalid/x").len(), 1);
+    }
+
+    #[test]
+    fn a_bare_word_is_not_a_link_and_a_scheme_mid_word_is_not_either() {
+        assert!(find_links("nothing to see").is_empty());
+        assert!(find_links("xhttps://example.invalid").is_empty());
+        assert!(find_links("www.").is_empty());
+    }
+
+    #[test]
+    fn the_first_link_gets_a_scheme_when_the_text_left_it_out() {
+        assert_eq!(
+            first_link("go to www.example.invalid/x now"),
+            Some("https://www.example.invalid/x".to_string())
+        );
+        assert_eq!(
+            first_link("http://example.invalid one https://other.invalid two"),
+            Some("http://example.invalid".to_string())
+        );
+        assert_eq!(first_link("no links"), None);
     }
 
     #[test]

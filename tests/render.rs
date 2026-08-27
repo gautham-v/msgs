@@ -501,3 +501,403 @@ fn five_hundred_chats_draw_only_what_fits_and_do_it_quickly() {
         "twenty frames of 500 chats took {elapsed:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The conversation pane. Every body, name, and number below is invented; no
+// test in this file opens a real database.
+// ---------------------------------------------------------------------------
+
+use msgs::db::{AttachmentRef, Handle, Message, Tapback, TapbackAction, TapbackKind};
+
+/// Raw Messages timestamp `minutes` before now.
+fn ago(minutes: i64) -> i64 {
+    let when = Local::now() - Duration::minutes(minutes);
+    (when.timestamp() - 978_307_200) * 1_000_000_000
+}
+
+fn message(rowid: i64, from_me: bool, handle_rowid: i64, text: &str, minutes: i64) -> Message {
+    Message {
+        rowid,
+        guid: format!("G{rowid}"),
+        chat_rowid: 1,
+        handle_rowid: (!from_me).then_some(handle_rowid),
+        handle: (!from_me).then(|| format!("someone{handle_rowid}@example.invalid")),
+        service: Some("iMessage".to_string()),
+        is_from_me: from_me,
+        is_read: true,
+        date: ago(minutes),
+        date_delivered: 0,
+        date_read: 0,
+        date_edited: 0,
+        is_edited: false,
+        text: (!text.is_empty()).then(|| text.to_string()),
+        subject: None,
+        attachments: Vec::new(),
+        reply_to_guid: None,
+        thread_originator_guid: None,
+        tapbacks: Vec::new(),
+        item_type: 0,
+        group_action_type: 0,
+        group_title: None,
+        other_handle: None,
+        group_action: None,
+    }
+}
+
+fn handle(rowid: i64) -> Handle {
+    Handle {
+        rowid,
+        id: format!("someone{rowid}@example.invalid"),
+        service: "iMessage".to_string(),
+    }
+}
+
+/// An app with one open conversation, focused on it and scrolled to the newest
+/// message, the way opening a chat leaves it.
+fn with_conversation(group: bool, participants: usize, messages: Vec<Message>) -> App {
+    let mut room = chat(1, "Fixture Chat", 2, "last line");
+    room.is_group = group;
+    room.style = if group { 43 } else { 45 };
+    room.participants = (1..=participants as i64).map(handle).collect();
+    room.message_count = messages.len() as i64;
+
+    let mut app = with_chats(vec![room]);
+    app.message_rows = messages;
+    app.messages.set_len(app.message_rows.len());
+    app.update(Action::FocusPane(Focus::Conversation));
+    // One frame measures the blocks at the size these tests draw at, which is
+    // what lets the jump to the newest message land where the real app lands.
+    let _ = frame(&mut app, 120, 34);
+    app.update(Action::ToBottom);
+    app
+}
+
+#[test]
+fn a_conversation_draws_blocks_a_day_header_and_meta_lines() {
+    let mut first = message(1, true, 0, "dinner tonight? that thai place near you", 40);
+    first.date_delivered = ago(39);
+    first.date_read = ago(38);
+    let second = message(2, false, 1, "yes!! 7?", 30);
+    let mut third = message(3, true, 0, "perfect", 20);
+    third.date_delivered = ago(19);
+
+    let mut app = with_conversation(false, 1, vec![first, second, third]);
+    let buffer = frame(&mut app, 120, 34);
+
+    assert!(contains(&buffer, "dinner tonight"), "a body");
+    assert!(contains(&buffer, "· Read "), "a read stamp");
+    assert!(contains(&buffer, "· Delivered"), "a delivery stamp");
+    assert!(contains(&buffer, "Today"), "the day header");
+    assert!(!contains(&buffer, "no messages yet"));
+}
+
+#[test]
+fn the_day_header_sits_on_the_top_row_and_keeps_its_band() {
+    let mut app = with_conversation(false, 1, vec![message(1, false, 1, "hello", 5)]);
+    let buffer = frame(&mut app, 120, 34);
+    let area = app.panes.conversation;
+
+    let row: String = (0..area.width)
+        .map(|x| buffer[(x + area.x, area.y)].symbol().to_string())
+        .collect();
+    assert!(row.contains("Today"), "sticky header row: {row:?}");
+    assert_eq!(buffer[(area.x, area.y)].bg, app.theme.bg_light);
+}
+
+#[test]
+fn rails_are_blue_for_you_green_for_them_and_per_person_in_a_group() {
+    let mut app = with_conversation(
+        false,
+        1,
+        vec![
+            message(1, false, 1, "theirs", 20),
+            message(2, true, 0, "mine", 10),
+        ],
+    );
+    let buffer = frame(&mut app, 120, 34);
+    let area = app.panes.conversation;
+    let rails: Vec<_> = (0..area.height)
+        .map(|y| buffer[(area.x + 1, area.y + y)].fg)
+        .collect();
+    assert!(rails.contains(&app.theme.accent_them), "the other person");
+    assert!(rails.contains(&app.theme.accent_me), "you");
+
+    let mut group = with_conversation(
+        true,
+        3,
+        vec![
+            message(1, false, 1, "one", 30),
+            message(2, false, 2, "two", 20),
+            message(3, false, 3, "three", 10),
+        ],
+    );
+    let buffer = frame(&mut group, 120, 34);
+    let area = group.panes.conversation;
+    let rails: Vec<_> = (0..area.height)
+        .map(|y| buffer[(area.x + 1, area.y + y)].fg)
+        .collect();
+    for slot in 0..3 {
+        assert!(
+            rails.contains(&group.theme.participant(slot)),
+            "participant {slot} keeps their own color"
+        );
+    }
+    // A group names its senders; a one-to-one chat does not.
+    assert!(contains(&buffer, "someone1"), "sender name in a group");
+}
+
+#[test]
+fn a_group_event_is_dim_italic_and_railless() {
+    let mut event = message(2, false, 1, "", 10);
+    event.item_type = 2;
+    event.group_action = Some(msgs::db::GroupAction::NameChange("Sunday".to_string()));
+
+    let mut app = with_conversation(true, 2, vec![message(1, false, 1, "hello", 20), event]);
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "named the conversation"));
+
+    // The event's rail column is blank, unlike the message above it.
+    let area = app.panes.conversation;
+    let rails: Vec<_> = (0..area.height)
+        .map(|y| buffer[(area.x + 1, area.y + y)].symbol().to_string())
+        .collect();
+    assert!(
+        rails.iter().any(|cell| cell == "▌"),
+        "the message has a rail"
+    );
+}
+
+#[test]
+fn tapbacks_and_replies_show_under_and_above_the_message() {
+    let mut target = message(1, false, 1, "who's in for the draft?", 30);
+    target.tapbacks = vec![Tapback {
+        rowid: 90,
+        target_guid: "G1".to_string(),
+        target_part: 0,
+        action: TapbackAction::Added,
+        kind: TapbackKind::Liked,
+        is_from_me: false,
+        handle_rowid: Some(2),
+        handle: Some("someone2@example.invalid".to_string()),
+        date: 0,
+    }];
+    let mut reply = message(2, false, 2, "can we do 4?", 20);
+    reply.thread_originator_guid = Some("p:0/G1".to_string());
+
+    let mut app = with_conversation(true, 3, vec![target, reply]);
+    let buffer = frame(&mut app, 120, 34);
+
+    assert!(contains(&buffer, "👍"), "a tapback chip");
+    assert!(contains(&buffer, "↳"), "a quoted reply");
+    assert!(
+        contains(&buffer, "who's in for the draft?"),
+        "the quote body"
+    );
+}
+
+#[test]
+fn an_attachment_without_words_still_says_what_was_sent() {
+    let mut photo = message(1, false, 1, "", 10);
+    photo.attachments = vec![AttachmentRef {
+        rowid: 1,
+        guid: "A1".to_string(),
+        message_rowid: 1,
+        filename: None,
+        mime_type: Some("application/pdf".to_string()),
+        uti: None,
+        transfer_name: Some("draft-order.pdf".to_string()),
+        total_bytes: 86_016,
+        transfer_state: 5,
+        is_sticker: false,
+        hide_attachment: false,
+    }];
+    let mut app = with_conversation(false, 1, vec![photo]);
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "draft-order.pdf · 84 KB"));
+}
+
+#[test]
+fn the_header_names_the_chat_the_service_and_the_counts() {
+    let mut app = with_conversation(false, 1, vec![message(1, false, 1, "hi", 5)]);
+    app.open_chat_photos = 38;
+    let buffer = frame(&mut app, 120, 34);
+
+    assert!(contains(&buffer, "Fixture Chat"), "the name");
+    assert!(contains(&buffer, "iMessage"), "the service");
+    assert!(contains(&buffer, "someone1"), "the other party");
+    assert!(contains(&buffer, "38 photos"), "the photo count");
+}
+
+#[test]
+fn j_and_k_move_the_message_selection_and_g_jumps_to_the_ends() {
+    let messages = (1..=30)
+        .map(|index| {
+            message(
+                index,
+                index % 2 == 0,
+                1,
+                &format!("line {index}"),
+                60 - index,
+            )
+        })
+        .collect();
+    let mut app = with_conversation(false, 1, messages);
+    let _ = frame(&mut app, 120, 34);
+    assert_eq!(app.messages.selected, 29);
+
+    press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+    assert_eq!(app.messages.selected, 28);
+    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+    assert_eq!(app.messages.selected, 29);
+
+    press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE);
+    assert_eq!(app.messages.selected, 0);
+    assert_eq!(app.convo.top, 0);
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "line 1"));
+
+    press(&mut app, KeyCode::Char('G'), KeyModifiers::NONE);
+    assert_eq!(app.messages.selected, 29);
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "line 30"));
+    assert!(!contains(&buffer, "line 1 "), "the top has scrolled away");
+}
+
+#[test]
+fn the_selected_block_is_highlighted_and_a_click_moves_the_selection() {
+    let messages = (1..=10)
+        .map(|index| message(index, false, 1, &format!("line {index}"), 60 - index))
+        .collect();
+    let mut app = with_conversation(false, 1, messages);
+    let buffer = frame(&mut app, 120, 34);
+    let area = app.panes.conversation;
+
+    let selected_row = app
+        .hits
+        .rows
+        .iter()
+        .position(|row| *row == Some(app.messages.selected))
+        .expect("the selected block is on screen");
+    let y = area.y + selected_row as u16;
+    assert_eq!(buffer[(area.x + 4, y)].bg, app.theme.bg_highlight);
+
+    // Click the first block that is not the selected one.
+    let (other_row, other_index) = app
+        .hits
+        .rows
+        .iter()
+        .enumerate()
+        .find_map(|(row, index)| match index {
+            Some(index) if *index != app.messages.selected => Some((row, *index)),
+            _ => None,
+        })
+        .expect("another block on screen");
+    click(&mut app, area.x + 6, area.y + other_row as u16);
+    assert_eq!(app.messages.selected, other_index);
+}
+
+#[test]
+fn the_wheel_scrolls_the_conversation_without_moving_the_selection() {
+    let messages = (1..=60)
+        .map(|index| message(index, false, 1, &format!("line {index}"), 120 - index))
+        .collect();
+    let mut app = with_conversation(false, 1, messages);
+    let _ = frame(&mut app, 120, 34);
+    let selected = app.messages.selected;
+    let before = app.convo;
+
+    let area = app.panes.conversation;
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: area.x + 5,
+        row: area.y + 5,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    assert_ne!(app.convo, before, "the wheel scrolls");
+    assert_eq!(app.messages.selected, selected, "but does not select");
+    assert_eq!(app.focus, Focus::Conversation);
+}
+
+#[test]
+fn links_are_underlined_and_a_click_on_one_is_a_link_not_a_selection() {
+    let mut app = with_conversation(
+        false,
+        1,
+        vec![message(
+            1,
+            true,
+            0,
+            "menu here https://example.invalid/menu",
+            5,
+        )],
+    );
+    let buffer = frame(&mut app, 120, 34);
+
+    assert_eq!(app.hits.links.len(), 1, "one link was recorded");
+    let hit = &app.hits.links[0];
+    assert_eq!(hit.url, "https://example.invalid/menu");
+    let cell = &buffer[(hit.start, hit.y)];
+    assert!(
+        cell.modifier.contains(ratatui::style::Modifier::UNDERLINED),
+        "links are underlined"
+    );
+    assert_eq!(cell.fg, app.theme.accent_me);
+}
+
+#[test]
+fn copying_the_selected_message_reports_what_it_did() {
+    let mut app = with_conversation(false, 1, vec![message(1, false, 1, "sounds good", 5)]);
+    let _ = frame(&mut app, 120, 34);
+    press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+
+    let (toast, _) = app.status.active_toast().expect("a toast");
+    assert!(
+        toast.contains("clipboard") || toast.contains("could not copy"),
+        "unexpected toast: {toast}"
+    );
+    // Nothing about the message body leaks onto the status line.
+    assert!(!toast.contains("sounds good"));
+}
+
+#[test]
+fn ctrl_l_says_so_when_the_selected_message_has_no_link() {
+    let mut app = with_conversation(false, 1, vec![message(1, false, 1, "no links here", 5)]);
+    let _ = frame(&mut app, 120, 34);
+    press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+
+    let (toast, _) = app.status.active_toast().expect("a toast");
+    assert!(toast.contains("no link"), "unexpected toast: {toast}");
+}
+
+#[test]
+fn five_thousand_messages_lay_out_only_what_is_on_screen() {
+    let messages = (1..=5000)
+        .map(|index| {
+            message(
+                index,
+                index % 3 == 0,
+                1,
+                "a line of about the length a real message has in it",
+                6000 - index,
+            )
+        })
+        .collect();
+    let mut app = with_conversation(false, 1, messages);
+
+    let started = std::time::Instant::now();
+    for _ in 0..20 {
+        let buffer = frame(&mut app, 120, 34);
+        assert!(!contains(&buffer, "no messages yet"));
+    }
+    for _ in 0..40 {
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        let _ = frame(&mut app, 120, 34);
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "sixty frames of a 5,000-message conversation took {elapsed:?}"
+    );
+    assert!(app.convo.top < 5000);
+}

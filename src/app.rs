@@ -4,9 +4,11 @@
 //! [`Action`], [`App::update`] applies the action, and `ui` draws the result.
 //! Nothing else touches state, so behavior stays testable without a terminal.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use chrono::Local;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
@@ -14,6 +16,8 @@ use crate::config::Config;
 use crate::db::{Chat, Db, DbError, Message, PAGE};
 use crate::theme::Theme;
 use crate::ui::Panes;
+use crate::ui::conversation::{Hits, Measured, Scroll};
+use crate::ui::message::{self, Ctx};
 
 /// How long a toast stays on the status line.
 const TOAST_TTL: Duration = Duration::from_secs(2);
@@ -95,6 +99,8 @@ pub enum Action {
     React,
     /// Copy the selected message to the clipboard.
     CopySelection,
+    /// Open the first link in the selected message in the browser.
+    OpenLink,
     /// Attach a file to the message being composed.
     Attach,
     /// Type a character into whatever text field has focus.
@@ -452,6 +458,20 @@ pub struct App {
     pub open_chat: Option<i64>,
     /// The open conversation's loaded page of messages, oldest first.
     pub message_rows: Vec<Message>,
+    /// Pictures in the open conversation, for the header.
+    pub open_chat_photos: i64,
+    /// Set once the oldest message of the open chat is loaded, so scrolling up
+    /// stops asking the database for a page that is not there.
+    pub conversation_start_loaded: bool,
+    /// Where the conversation is scrolled to.
+    pub convo: Scroll,
+    /// Block heights and the reply index for the loaded page.
+    pub measured: Measured,
+    /// What the conversation put where on the last frame, for mouse clicks.
+    pub hits: Hits,
+    /// Set when a freshly opened conversation still has to be pinned to its
+    /// newest message, which needs a pane height to do.
+    pending_bottom: bool,
     /// Set to leave the event loop.
     pub should_quit: bool,
     /// Selection state of the chat list.
@@ -503,6 +523,12 @@ impl App {
             pinned_visible: 0,
             open_chat: None,
             message_rows: Vec::new(),
+            open_chat_photos: 0,
+            conversation_start_loaded: false,
+            convo: Scroll::default(),
+            measured: Measured::default(),
+            hits: Hits::default(),
+            pending_bottom: false,
             should_quit: false,
             chats: ListPane::default(),
             chat_filter: None,
@@ -667,16 +693,135 @@ impl App {
         let Some(db) = self.db.as_ref() else {
             return;
         };
+        let photos = db
+            .attachment_counts(chat_rowid)
+            .map_or(0, |(_, photos)| photos);
+        let page = db.messages_before(chat_rowid, None, PAGE);
+
         self.open_chat = Some(chat_rowid);
-        match db.messages_before(chat_rowid, None, PAGE) {
+        self.open_chat_photos = photos;
+        match page {
             Ok(messages) => self.message_rows = messages,
             Err(err) => {
                 self.message_rows.clear();
                 self.status.error(format!("messages: {}", err.summary()));
             }
         }
+        // A short conversation arrives whole, and nothing above it will ever
+        // be asked for.
+        self.conversation_start_loaded = self.message_rows.len() < PAGE;
         self.messages.set_len(self.message_rows.len());
         self.messages.to_bottom();
+        self.measured = Measured::default();
+        self.convo = Scroll::default();
+        // The newest message goes to the bottom edge, which needs a pane
+        // height; the next frame has one.
+        self.pending_bottom = true;
+    }
+
+    /// The message under the conversation selection.
+    #[must_use]
+    pub fn selected_message(&self) -> Option<&Message> {
+        self.message_rows.get(self.messages.selected)
+    }
+
+    /// Load the page above the loaded one, keeping the selection and the
+    /// viewport on the messages they were already on.
+    ///
+    /// Returns how many rows arrived, so a caller scrolling upward can tell the
+    /// top of the conversation from a slow page.
+    pub fn load_older(&mut self) -> usize {
+        if self.conversation_start_loaded || self.message_rows.is_empty() {
+            return 0;
+        }
+        let added = self.load_older_messages();
+        if added < PAGE {
+            self.conversation_start_loaded = true;
+        }
+        if added == 0 {
+            return 0;
+        }
+        self.messages.set_len(self.message_rows.len());
+        self.messages.selected += added;
+        self.convo.top += added;
+        // The heights the scroll arithmetic works from must describe the page
+        // it is about to move through.
+        self.measure(self.panes.conversation.width);
+        added
+    }
+
+    /// Get the conversation ready to draw at `area`: measure what changed, and
+    /// settle the viewport.
+    pub fn prepare_conversation(&mut self, area: Rect) {
+        self.measure(area.width);
+        let viewport = area.height.max(1);
+        if self.pending_bottom && !self.measured.heights.is_empty() {
+            self.convo.to_bottom(&self.measured.heights, viewport);
+            self.pending_bottom = false;
+        } else {
+            self.convo.clamp(&self.measured.heights, viewport);
+        }
+    }
+
+    /// Re-measure the loaded page if the page or the pane width has changed.
+    ///
+    /// Laying every block out is what makes the scroll arithmetic exact, so it
+    /// is done once per change rather than once per frame, and a page arriving
+    /// on top of the loaded one only measures the rows it brought.
+    fn measure(&mut self, width: u16) {
+        let len = self.message_rows.len();
+        let first = self.message_rows.first().map_or(0, |message| message.rowid);
+        let last = self.message_rows.last().map_or(0, |message| message.rowid);
+        if self.measured.width == width
+            && self.measured.first == first
+            && self.measured.last == last
+            && self.measured.heights.len() == len
+        {
+            return;
+        }
+
+        let prepended = self.measured.width == width
+            && self.measured.last == last
+            && !self.measured.heights.is_empty()
+            && self.measured.heights.len() < len;
+        let old = std::mem::take(&mut self.measured.heights);
+
+        let by_guid: HashMap<String, usize> = self
+            .message_rows
+            .iter()
+            .enumerate()
+            .map(|(index, message)| (message.guid.clone(), index))
+            .collect();
+        let now = Local::now();
+        let heights = {
+            let ctx = Ctx {
+                theme: &self.theme,
+                chat: self.selected_chat(),
+                messages: &self.message_rows,
+                by_guid: &by_guid,
+                now,
+            };
+            let one = |index: usize| message::block(&ctx, index, width).height();
+            if prepended {
+                let added = len - old.len();
+                // The message that used to open the page can lose its day
+                // separator now that something sits above it, so it is
+                // measured again along with the new rows.
+                let mut rows: Vec<u16> = (0..=added).map(one).collect();
+                rows.extend_from_slice(&old[1..]);
+                rows
+            } else {
+                (0..len).map(one).collect()
+            }
+        };
+
+        self.measured = Measured {
+            width,
+            first,
+            last,
+            heights,
+            by_guid,
+        };
     }
 
     /// Prepend the page of messages above the ones already loaded.
@@ -782,8 +927,8 @@ impl App {
             Action::ToggleChatList => self.toggle_chat_list(),
             Action::SelectPrev => self.move_selection(-1),
             Action::SelectNext => self.move_selection(1),
-            Action::PageUp => self.move_selection(-i64::from(self.config.page_step)),
-            Action::PageDown => self.move_selection(i64::from(self.config.page_step)),
+            Action::PageUp => self.page(-1),
+            Action::PageDown => self.page(1),
             Action::ToTop => self.jump(true),
             Action::ToBottom => self.jump(false),
             Action::Scroll(delta) => self.scroll(i64::from(delta)),
@@ -805,9 +950,10 @@ impl App {
             Action::Attach => self.not_yet("Attaching files arrives with the composer"),
             Action::OpenAttachment => self.not_yet("Attachments arrive with the attachment pass"),
             Action::SaveAttachment => self.not_yet("Attachments arrive with the attachment pass"),
-            Action::QuoteReply => self.not_yet("Reply quoting arrives with the conversation pane"),
+            Action::QuoteReply => self.not_yet("Reply quoting arrives with the composer"),
             Action::React => self.not_yet("Tapbacks arrive with the imsg integration"),
-            Action::CopySelection => self.not_yet("Copy arrives with the conversation pane"),
+            Action::CopySelection => self.copy_selection(),
+            Action::OpenLink => self.open_selected_link(),
         }
         // Every path out of an action ends here, so a filter keystroke, an
         // arrow key, and a click all leave the chat list in the same state.
@@ -833,6 +979,7 @@ impl App {
                 let next = i64::from(self.help_scroll) + delta;
                 self.help_scroll = u16::try_from(next.max(0)).unwrap_or(u16::MAX);
             }
+            Focus::Conversation => self.move_message(delta),
             _ => {
                 if let Some(list) = self.active_list() {
                     list.move_by(delta);
@@ -841,9 +988,31 @@ impl App {
         }
     }
 
+    /// `PageUp` / `PageDown`: a page of rows in the conversation, a page of
+    /// entries anywhere else.
+    fn page(&mut self, direction: i64) {
+        if self.focus == Focus::Conversation {
+            let rows = i64::from(self.conversation_height().max(2)) - 1;
+            self.scroll_conversation(direction * rows);
+            return;
+        }
+        self.move_selection(direction * i64::from(self.config.page_step));
+    }
+
     fn jump(&mut self, to_top: bool) {
         if self.focus == Focus::Help {
             self.help_scroll = 0;
+            return;
+        }
+        if self.focus == Focus::Conversation {
+            if to_top {
+                self.messages.to_top();
+                self.convo.to_top();
+            } else {
+                self.messages.to_bottom();
+                self.convo
+                    .to_bottom(&self.measured.heights, self.conversation_height());
+            }
             return;
         }
         if let Some(list) = self.active_list() {
@@ -856,13 +1025,54 @@ impl App {
     }
 
     fn scroll(&mut self, delta: i64) {
-        if self.focus == Focus::Help {
-            let next = i64::from(self.help_scroll) + delta;
-            self.help_scroll = u16::try_from(next.max(0)).unwrap_or(u16::MAX);
+        match self.focus {
+            Focus::Help => {
+                let next = i64::from(self.help_scroll) + delta;
+                self.help_scroll = u16::try_from(next.max(0)).unwrap_or(u16::MAX);
+            }
+            Focus::Conversation => self.scroll_conversation(delta),
+            _ => {
+                if let Some(list) = self.active_list() {
+                    list.scroll_by(delta);
+                }
+            }
+        }
+    }
+
+    /// Rows the message area had on the last frame, never zero.
+    #[must_use]
+    fn conversation_height(&self) -> u16 {
+        self.panes.conversation.height.max(1)
+    }
+
+    /// Move the message selection, pulling the view along with it and reaching
+    /// for an older page when it walks off the top.
+    fn move_message(&mut self, delta: i64) {
+        if self.messages.len == 0 {
             return;
         }
-        if let Some(list) = self.active_list() {
-            list.scroll_by(delta);
+        if delta < 0 && self.messages.selected == 0 {
+            self.load_older();
+        }
+        self.messages.move_by(delta);
+        let viewport = self.conversation_height();
+        self.convo
+            .reveal(&self.measured.heights, viewport, self.messages.selected);
+    }
+
+    /// Scroll the message area by rows, loading older pages as the top is
+    /// reached so scrolling up never stops at the edge of a page.
+    fn scroll_conversation(&mut self, delta: i64) {
+        let viewport = self.conversation_height();
+        if delta < 0 && self.convo.at_start() {
+            self.load_older();
+        }
+        self.convo.by_rows(&self.measured.heights, viewport, delta);
+        // The move can land on the first loaded row; fetching what is above it
+        // now means the next notch has somewhere to go. Both calls are no-ops
+        // once the start of the conversation is loaded.
+        if delta < 0 && self.convo.at_start() {
+            self.load_older();
         }
     }
 
@@ -928,6 +1138,47 @@ impl App {
         self.status.toast(format!("{what} — not wired up yet"));
     }
 
+    /// `y`: put the selected message on the clipboard.
+    ///
+    /// The body goes to the pasteboard and nowhere else — not to the status
+    /// line, not to a log.
+    fn copy_selection(&mut self) {
+        let Some(text) = self.selected_message().map(copyable) else {
+            self.status.error("no message selected");
+            return;
+        };
+        if text.is_empty() {
+            self.status.toast("nothing to copy in that message");
+            return;
+        }
+        match crate::shell::copy(&text) {
+            Ok(()) => self.status.toast("copied to the clipboard"),
+            Err(err) => self.status.error(format!("could not copy: {err}")),
+        }
+    }
+
+    /// `Ctrl+L`: open the first link in the selected message.
+    fn open_selected_link(&mut self) {
+        let link = self
+            .selected_message()
+            .and_then(|message| message.text.as_deref())
+            .and_then(crate::ui::format::first_link);
+        let Some(url) = link else {
+            self.status.toast("no link in the selected message");
+            return;
+        };
+        self.open_link(&url);
+    }
+
+    /// Hand a link to the browser. The link is message content, so it is never
+    /// echoed back onto the status line.
+    fn open_link(&mut self, url: &str) {
+        match crate::shell::open_url(url) {
+            Ok(()) => self.status.toast("opening the link"),
+            Err(err) => self.status.error(format!("could not open the link: {err}")),
+        }
+    }
+
     /// Height the composer wants, borders included.
     #[must_use]
     pub fn composer_height(&self) -> u16 {
@@ -990,8 +1241,17 @@ impl App {
                 self.refresh_chat_view();
             }
         } else if pane == Focus::Conversation {
-            self.messages
-                .select_at_row(self.panes.conversation, position.y);
+            // A click on a link opens it; anywhere else it selects the block
+            // that was drawn on that row.
+            if let Some(url) = self
+                .hits
+                .link_at(position.x, position.y)
+                .map(ToString::to_string)
+            {
+                self.open_link(&url);
+            } else if let Some(index) = self.hits.message_at(self.panes.conversation, position.y) {
+                self.messages.selected = index;
+            }
         }
     }
 
@@ -1013,6 +1273,20 @@ impl App {
     pub fn tick(&mut self) -> bool {
         self.status.tick()
     }
+}
+
+/// What `y` puts on the clipboard: the body, or the names of what was sent when
+/// there is no body.
+fn copyable(message: &Message) -> String {
+    if let Some(text) = message.text.as_deref().filter(|text| !text.is_empty()) {
+        return text.to_string();
+    }
+    message
+        .attachments
+        .iter()
+        .filter_map(|attachment| attachment.display_name())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -1171,11 +1445,26 @@ mod tests {
         assert_eq!(field.cursor(), 0);
     }
 
+    /// An app whose conversation is `count` blocks of two rows each, as if a
+    /// frame had already measured them.
+    fn with_measured_conversation(count: usize) -> App {
+        let mut app = app();
+        app.messages.set_len(count);
+        app.panes.conversation = Rect::new(30, 1, 50, 20);
+        app.measured = Measured {
+            width: 50,
+            first: 1,
+            last: count as i64,
+            heights: vec![2; count],
+            by_guid: HashMap::new(),
+        };
+        app.conversation_start_loaded = true;
+        app
+    }
+
     #[test]
     fn wheel_scrolls_the_pane_under_the_pointer_without_stealing_focus() {
-        let mut app = app();
-        app.messages.set_len(100);
-        app.panes.conversation = Rect::new(30, 1, 50, 20);
+        let mut app = with_measured_conversation(100);
         app.panes.chat_list = Some(Rect::new(0, 0, 30, 22));
 
         app.on_mouse(MouseEvent {
@@ -1190,24 +1479,54 @@ mod tests {
             Focus::ChatList,
             "focus must not follow the wheel"
         );
-        assert_eq!(app.messages.offset, usize::try_from(WHEEL_ROWS).unwrap());
+        // Three rows down through two-row blocks: one whole block and a half.
+        assert_eq!(app.convo, Scroll { top: 1, skip: 1 });
+        assert_eq!(app.messages.selected, 0, "the wheel does not select");
+        assert_eq!(WHEEL_ROWS, 3);
     }
 
     #[test]
     fn clicking_a_pane_focuses_it_and_selects_the_row() {
-        let mut app = app();
-        app.messages.set_len(100);
-        app.panes.conversation = Rect::new(30, 1, 50, 20);
+        let mut app = with_measured_conversation(100);
+        // As the last frame drew it: two rows per message, from the pane's top.
+        app.hits = Hits {
+            rows: (0..20).map(|row| Some(row / 2)).collect(),
+            links: Vec::new(),
+        };
 
         app.on_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 40,
-            row: 4,
+            row: 8,
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
 
         assert_eq!(app.focus, Focus::Conversation);
         assert_eq!(app.messages.selected, 3);
+    }
+
+    #[test]
+    fn keys_move_the_message_selection_and_pull_the_view_after_it() {
+        let mut app = with_measured_conversation(40);
+        app.focus = Focus::Conversation;
+
+        app.update(Action::ToBottom);
+        assert_eq!(app.messages.selected, 39);
+        // Eighty rows of blocks in twenty rows of pane: the last ten are shown.
+        assert_eq!(app.convo, Scroll { top: 30, skip: 0 });
+
+        app.update(Action::SelectPrev);
+        assert_eq!(app.messages.selected, 38);
+        assert_eq!(app.convo, Scroll { top: 30, skip: 0 }, "already on screen");
+
+        app.update(Action::ToTop);
+        assert_eq!(app.messages.selected, 0);
+        assert_eq!(app.convo, Scroll::default());
+
+        // A page moves the view without touching the selection.
+        app.update(Action::PageDown);
+        assert_eq!(app.messages.selected, 0);
+        assert_eq!(app.convo, Scroll { top: 9, skip: 1 });
     }
 
     #[test]

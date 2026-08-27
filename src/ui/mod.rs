@@ -11,6 +11,7 @@ pub mod conversation;
 pub mod db_error;
 pub mod format;
 pub mod help;
+pub mod message;
 pub mod palette;
 pub mod status;
 
@@ -182,11 +183,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         return;
     }
 
+    // Measuring and settling the viewport happens before anything is drawn, so
+    // the blocks, the scrollback, and the mouse map all describe one state.
+    app.prepare_conversation(panes.conversation);
+
     if let (Some(list), Some(rows)) = (panes.chat_list, panes.chat_list_rows) {
         chat_list::render(frame, app, list, rows);
     }
     conversation::render_header(frame, app, panes.header);
-    conversation::render(frame, app, panes.conversation);
+    let hits = conversation::render(frame, app, panes.conversation);
+    app.hits = hits;
     composer::render(frame, app, panes.composer);
     if let Some(info_row) = panes.info_row {
         composer::render_info_row(frame, app, info_row);
