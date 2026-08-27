@@ -30,7 +30,7 @@ Flags:
 | `--db <PATH>` | read this database instead of `~/Library/Messages/chat.db` |
 | `--config <PATH>` | read this config file instead of the default |
 | `--no-mouse` | do not capture the mouse |
-| `--check` | print a readiness report (database, row counts, unread, read state, live updates, Messages.app, `osascript`, `imsg`, search index, contacts) and exit |
+| `--check` | print a readiness report (Full Disk Access, database, row counts, unread, read state, live updates, Messages.app and whether it is running, `osascript`, `imsg`, search index, contacts, terminal graphics) and exit |
 | `--no-index` | do not build or use the full-text message index |
 | `--no-images` | do not draw pictures inline; show every attachment as a chip |
 | `--no-contacts` | do not read Contacts; show numbers and addresses instead of names |
@@ -60,7 +60,50 @@ Flags:
 | `Alt+Enter` | newline in the composer (`Shift+Enter` where the terminal supports it) |
 | `Esc` | close an overlay / leave the composer |
 | `?` | help |
+| `r` (first run) | try to open `chat.db` again |
 | `q` / `Ctrl+C` | quit |
+
+## When it cannot start
+
+`chat.db` lives behind Full Disk Access, so the first thing a new terminal sees
+is a refusal. msgs does not fail on it: the panes are replaced by one panel that
+says what happened, which file it happened to, and the three steps that fix it —
+System Settings → Privacy & Security → Full Disk Access, switch on the app msgs
+runs inside, quit that app and open it again, because macOS only applies the
+change on a fresh launch. The same switch is what lets msgs read Contacts, so
+the panel says so rather than letting names fail separately later.
+
+msgs stays running while you do it. `r` opens the database again, and a retry
+that works picks up everything a launch would have — the chats, the names, the
+read state, and the index — rather than leaving an open database with nothing
+hanging off it. A retry that fails leaves the panel up and says why on it. `?`
+still opens the help modal over the panel and `q` still quits, and no other key
+does anything, because there are no panes behind it to steer.
+
+Nothing that goes wrong at startup is fatal. A config key that will not parse, a
+file watcher that will not start, Contacts that will not open: each is said once
+as a toast and then kept under `NOTES` at the bottom of the help modal, which is
+where to look after the toast has gone.
+
+`msgs --check` answers the same questions from the shell without starting the
+UI: Full Disk Access, whether `chat.db` opens and what is in it, the read state,
+live updates, Messages.app and whether it is running, `osascript`, `imsg`, the
+search index, Contacts, the terminal's graphics support, and `sips`. It prints
+paths and counts — never a name, a number, or a message.
+
+## The status line
+
+Along the bottom: whether Messages.app is running, how much is unread and in how
+many chats, what the message index is doing while it builds, and whether live
+updates are watching or polling with how long ago the screen was last refreshed.
+Messages.app is asked about on its own thread every five seconds — by `pgrep`,
+not by AppleScript, because asking Messages whether it is running would start
+it — and until the first answer lands the line says `unknown` rather than
+guessing.
+
+Anything transient — a copy, a save, a send that was refused — takes the whole
+line for two seconds and then gives it back. Failures are drawn in the error
+color; everything else in the accent.
 
 ## Attachments
 

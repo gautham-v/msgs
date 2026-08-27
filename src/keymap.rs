@@ -151,6 +151,11 @@ pub const BINDINGS: &[Binding] = &[
         description: "quit",
         scope: "global",
     },
+    Binding {
+        keys: "r / Enter",
+        description: "try to open chat.db again",
+        scope: "first run",
+    },
 ];
 
 /// The condensed bar along the bottom of the screen: `(keys, label)` pairs.
@@ -187,6 +192,7 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
     }
 
     match focus {
+        Focus::DbError => db_error_keys(key),
         Focus::Help => help_keys(key),
         Focus::Palette => palette_keys(key, ctrl, alt, shift),
         Focus::Reactions => reaction_keys(key),
@@ -223,6 +229,17 @@ fn palette_keys(key: KeyEvent, ctrl: bool, alt: bool, shift: bool) -> Option<Act
         KeyCode::PageUp => Some(Action::PageUp),
         KeyCode::PageDown => Some(Action::PageDown),
         _ => text_entry_keys(key, ctrl, alt, shift),
+    }
+}
+
+/// The first-run surface has three keys and no panes behind it, so every other
+/// key is deliberately dead rather than steering a list nobody can see.
+fn db_error_keys(key: KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Char('r') | KeyCode::Enter => Some(Action::RetryDb),
+        KeyCode::Char('?') => Some(Action::OpenHelp),
+        KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
+        _ => None,
     }
 }
 
@@ -446,6 +463,36 @@ mod tests {
             ),
             Some(Action::React)
         );
+    }
+
+    #[test]
+    fn the_first_run_surface_retries_and_quits_and_nothing_else() {
+        assert_eq!(
+            resolve(key(KeyCode::Char('r')), Focus::DbError),
+            Some(Action::RetryDb)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Enter), Focus::DbError),
+            Some(Action::RetryDb)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Char('?')), Focus::DbError),
+            Some(Action::OpenHelp)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Char('q')), Focus::DbError),
+            Some(Action::Quit)
+        );
+        assert_eq!(
+            resolve(
+                with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                Focus::DbError
+            ),
+            Some(Action::Quit)
+        );
+        // Nothing to select and nothing to type into.
+        assert_eq!(resolve(key(KeyCode::Down), Focus::DbError), None);
+        assert_eq!(resolve(key(KeyCode::Char('x')), Focus::DbError), None);
     }
 
     #[test]

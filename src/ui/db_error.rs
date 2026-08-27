@@ -53,13 +53,34 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, err: &DbError) {
         }
     }
 
+    // Granting Full Disk Access does not need msgs restarted, so the surface
+    // that asks for it is also the one that picks it up.
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("?", Style::new().fg(theme.accent_me)),
-        Span::styled(" help    ", Style::new().fg(theme.gray)),
-        Span::styled("q", Style::new().fg(theme.accent_me)),
-        Span::styled(" quit", Style::new().fg(theme.gray)),
-    ]));
+    lines.push(Line::from(Span::styled(
+        "msgs will keep running — fix it and press r.",
+        Style::new().fg(theme.text_secondary),
+    )));
+
+    // There is no status line under this surface, so a retry that failed
+    // again says so here instead of nowhere.
+    if let Some((toast, is_error)) = app.status.active_toast() {
+        let color = if is_error {
+            theme.error
+        } else {
+            theme.accent_me
+        };
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            toast.to_string(),
+            Style::new().fg(color),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(super::composer::hint_line(
+        app,
+        &[("r", "retry"), ("?", "help"), ("q", "quit")],
+    ));
 
     let width = MAX_WIDTH.min(area.width);
     // Two rows of border plus the text, or as much of it as fits.

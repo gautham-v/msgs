@@ -87,8 +87,12 @@ fn main() -> Result<()> {
     // and never fatal: a Mac that will not open its Contacts stores says so on
     // the status line and shows numbers.
     if !cli.no_contacts && app.config.contacts {
-        app.enable_contacts(Contacts::load());
+        app.enable_contacts_from_stores();
     }
+
+    // Whether Messages.app is up, asked on a timer on its own thread. The
+    // status line says `unknown` until the first answer lands.
+    app.enable_presence();
 
     // Which chats msgs itself has already put in front of you. Its own small
     // file beside the index; `chat.db` and Messages.app's badge are untouched.
@@ -208,6 +212,12 @@ fn check(cli: &Cli, warnings: &[String]) -> Result<()> {
     println!("msgs {}", env!("CARGO_PKG_VERSION"));
 
     let path = cli.db.clone().unwrap_or_else(default_db_path);
+
+    // The one answer everything else depends on, so it goes first. It is
+    // asked of the real database even when `--db` points somewhere else,
+    // because that is what Full Disk Access actually gates.
+    row("full disk access", &full_disk_access());
+
     match Db::open(&path) {
         Ok(db) => {
             let where_from = match db.source() {
@@ -280,7 +290,10 @@ fn check(cli: &Cli, warnings: &[String]) -> Result<()> {
     .find(|path| std::path::Path::new(path).exists());
     row(
         "Messages.app",
-        messages_app.unwrap_or("not found — sending will not work"),
+        &match messages_app {
+            Some(app) => format!("{app} — {}", running_label()),
+            None => "not found — sending will not work".to_string(),
+        },
     );
 
     row(
@@ -381,6 +394,34 @@ fn check(cli: &Cli, warnings: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Whether this process can read the real `chat.db`, which is what Full Disk
+/// Access grants. Nothing is read out of the file — only whether it opens.
+fn full_disk_access() -> String {
+    let real = default_db_path();
+    if !real.exists() {
+        return format!(
+            "cannot tell — no database at {} yet",
+            msgs::ui::home_relative(&real)
+        );
+    }
+    match std::fs::File::open(&real) {
+        Ok(_) => "granted".to_string(),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            "NOT granted — System Settings → Privacy & Security → Full Disk Access".to_string()
+        }
+        Err(err) => format!("cannot tell — {}", err.kind()),
+    }
+}
+
+/// Whether Messages.app is running, in the words the status line uses.
+fn running_label() -> &'static str {
+    match send::messages_app_running() {
+        Some(true) => "running",
+        Some(false) => "not running",
+        None => "cannot tell whether it is running",
+    }
+}
+
 /// What `--check` says about inline images, without querying the terminal.
 ///
 /// The real answer comes from a control sequence the terminal replies to, and
@@ -402,7 +443,7 @@ fn guessed_images() -> &'static str {
 }
 
 fn row(label: &str, value: &str) {
-    println!("  {label:<14} {value}");
+    println!("  {label:<16} {value}");
 }
 
 #[cfg(test)]

@@ -38,6 +38,12 @@ pub const IMSG: &str = "imsg";
 /// What to tell somebody who does not have [`IMSG`].
 pub const IMSG_INSTALL: &str = "brew install steipete/tap/imsg";
 
+/// The tool that answers whether Messages.app is running.
+const PGREP: &str = "/usr/bin/pgrep";
+
+/// What Messages.app calls itself in the process table.
+const MESSAGES_PROCESS: &str = "Messages";
+
 /// Which of Messages' services a chat is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Service {
@@ -561,6 +567,119 @@ fn run(script: &str) -> Result<(), SendError> {
     ))))
 }
 
+/// Whether Messages.app is running right now, when the answer can be had.
+///
+/// This asks `pgrep` for a process called `Messages` and reads nothing but its
+/// exit status: `0` is running, `1` is not, and anything else — no `pgrep`, a
+/// signal, a sandbox that will not let it run — is `None`, which the status
+/// line writes as `Messages.app unknown` rather than guessing.
+///
+/// Deliberately not `osascript`: asking Messages whether it is running starts
+/// it, which is the opposite of a question.
+#[must_use]
+pub fn messages_app_running() -> Option<bool> {
+    let output = Command::new(PGREP)
+        .arg("-x")
+        .arg(MESSAGES_PROCESS)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    match output.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+/// A background answer to "is Messages.app running?", refreshed on a timer.
+///
+/// The probe costs a process, so it is off by default — nothing under `tests/`
+/// ever spawns one — and one launch's worth of it runs at a time: [`poll`]
+/// starts a thread when the interval is up and picks the answer off a channel
+/// whenever it lands, so the event loop never waits on `pgrep`.
+///
+/// [`poll`]: Presence::poll
+#[derive(Debug)]
+pub struct Presence {
+    /// The answer to the probe that is in flight, if one is.
+    rx: Option<Receiver<Option<bool>>>,
+    /// When the next probe may start. `None` while one is in flight.
+    due: Option<std::time::Instant>,
+    /// How long between probes.
+    interval: std::time::Duration,
+}
+
+/// How often [`Presence`] asks again.
+pub const PRESENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl Presence {
+    /// A probe that never asks anything. This is the default, and what the
+    /// tests get.
+    #[must_use]
+    pub const fn off() -> Self {
+        Self {
+            rx: None,
+            due: None,
+            interval: PRESENCE_INTERVAL,
+        }
+    }
+
+    /// A probe that asks now and then every [`PRESENCE_INTERVAL`].
+    #[must_use]
+    pub fn watching() -> Self {
+        Self {
+            rx: None,
+            due: Some(std::time::Instant::now()),
+            interval: PRESENCE_INTERVAL,
+        }
+    }
+
+    /// Whether this probe will ever ask anything.
+    #[must_use]
+    pub const fn is_on(&self) -> bool {
+        self.rx.is_some() || self.due.is_some()
+    }
+
+    /// Collect an answer if one has arrived, and start the next probe if it is
+    /// time. Never blocks.
+    ///
+    /// The outer `Option` is "there is news"; the inner one is the answer,
+    /// where `None` means the question could not be asked.
+    pub fn poll(&mut self) -> Option<Option<bool>> {
+        if let Some(rx) = self.rx.as_ref() {
+            match rx.try_recv() {
+                Ok(answer) => {
+                    self.rx = None;
+                    self.due = Some(std::time::Instant::now() + self.interval);
+                    return Some(answer);
+                }
+                Err(TryRecvError::Empty) => return None,
+                // The thread died without answering; ask again on the timer.
+                Err(TryRecvError::Disconnected) => {
+                    self.rx = None;
+                    self.due = Some(std::time::Instant::now() + self.interval);
+                    return None;
+                }
+            }
+        }
+        if self.due.is_some_and(|due| due <= std::time::Instant::now()) {
+            self.due = None;
+            let (tx, rx) = channel();
+            self.rx = Some(rx);
+            std::thread::spawn(move || {
+                let _ = tx.send(messages_app_running());
+            });
+        }
+        None
+    }
+}
+
+impl Default for Presence {
+    fn default() -> Self {
+        Self::off()
+    }
+}
+
 /// Take a lock, stepping over a panic in another thread rather than adding one.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -849,6 +968,40 @@ impl Outbox {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_presence_probe_that_is_off_never_asks_and_never_answers() {
+        let mut off = Presence::off();
+        assert!(!off.is_on());
+        assert_eq!(off.poll(), None);
+        assert_eq!(off.poll(), None);
+        assert!(!off.is_on());
+    }
+
+    #[test]
+    fn a_watching_probe_asks_once_and_answers_once() {
+        let mut probe = Presence::watching();
+        assert!(probe.is_on());
+        // The first poll starts the thread; the answer lands on a later one.
+        assert_eq!(probe.poll(), None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let answer = loop {
+            if let Some(answer) = probe.poll() {
+                break answer;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the probe never answered"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        // Whether Messages is running is this machine's business; that an
+        // answer came back at all is what is being tested.
+        assert!(answer.is_some() || answer.is_none());
+        // And it does not ask again straight away.
+        assert_eq!(probe.poll(), None);
+        assert!(probe.is_on());
+    }
+
     use super::*;
 
     fn direct() -> Target {

@@ -20,8 +20,8 @@ use crate::media::{self, Images};
 use crate::search::{self, Search};
 use crate::seen::Seen;
 use crate::send::{
-    self, Delivery, Outbox, Outgoing, Pending, PendingTapback, REACTIONS, ReactFallback, Reaction,
-    SendError, Service, Target,
+    self, Delivery, Outbox, Outgoing, Pending, PendingTapback, Presence, REACTIONS, ReactFallback,
+    Reaction, SendError, Service, Target,
 };
 use crate::theme::Theme;
 use crate::ui::Panes;
@@ -73,6 +73,13 @@ pub enum Focus {
     Help,
     /// The `Ctrl+R` reaction picker, floating over the selected message.
     Reactions,
+    /// The first-run surface, shown while `chat.db` cannot be read.
+    ///
+    /// Never assigned to [`App::focus`]: [`App::key_focus`] reports it while
+    /// [`App::db_error`] is set, so the keys that screen offers are routed
+    /// without disturbing whichever pane focus goes back to once the database
+    /// opens.
+    DbError,
 }
 
 impl Focus {
@@ -123,6 +130,8 @@ pub enum Action {
     NewChat,
     /// Open the help modal.
     OpenHelp,
+    /// Try to open `chat.db` again, from the first-run surface.
+    RetryDb,
     /// `Esc`: close an overlay, clear a filter, or leave the composer.
     Cancel,
     /// Start filtering the chat list by name.
@@ -635,6 +644,17 @@ pub struct App {
     /// on screen here. [`Seen::off`] until something asks for it, which is how
     /// the tests run and what keeps them out of the user's home.
     pub seen: Seen,
+    /// Whether Messages.app is running, asked on a timer.
+    /// [`Presence::off`] until something asks for it, so no test spawns one.
+    pub presence: Presence,
+    /// Where the read state was asked to live, so a retry can pick it up again.
+    seen_path: Option<PathBuf>,
+    /// Where the message index was asked to live, for the same reason.
+    index_path: Option<PathBuf>,
+    /// Whether the names on screen came from the machine's own Contacts
+    /// stores, so a retry after Full Disk Access is granted reads them again.
+    /// False for the fixture contacts the tests hand over.
+    contacts_from_stores: bool,
 }
 
 impl App {
@@ -699,6 +719,10 @@ impl App {
             images: Images::off(),
             contacts: Contacts::empty(),
             seen: Seen::off(),
+            presence: Presence::off(),
+            seen_path: None,
+            index_path: None,
+            contacts_from_stores: false,
         }
     }
 
@@ -750,6 +774,38 @@ impl App {
         }
     }
 
+    /// `r` on the first-run surface: open `chat.db` again.
+    ///
+    /// This is what somebody presses after granting Full Disk Access, so it
+    /// does the whole of what a launch does — the database, then the names,
+    /// the read state, and the index that were asked for at startup — rather
+    /// than leaving an open database with nothing hanging off it. A retry that
+    /// fails leaves the same surface up and says so on it.
+    fn retry_db(&mut self) {
+        let Some(path) = self.db_path.clone() else {
+            return;
+        };
+        self.open_db(path);
+        if let Some(err) = self.db_error.as_ref() {
+            let summary = err.summary();
+            self.status
+                .error(format!("still cannot read chat.db — {summary}"));
+            return;
+        }
+        if self.contacts_from_stores && self.contacts.status().warning().is_some() {
+            self.enable_contacts_from_stores();
+        }
+        if let Some(seen) = self.seen_path.clone() {
+            self.enable_seen(&seen);
+        }
+        if self.search.is_none()
+            && let Some(index) = self.index_path.clone()
+        {
+            self.enable_search(&index);
+        }
+        self.status.toast("chat.db opened");
+    }
+
     /// Start building the full-text message index at `index_path`.
     ///
     /// The build runs on its own thread and reports onto the status line, so a
@@ -757,6 +813,7 @@ impl App {
     /// unless something asks for it, which is what keeps the tests from ever
     /// writing an index anywhere.
     pub fn enable_search(&mut self, index_path: &std::path::Path) {
+        self.index_path = Some(index_path.to_path_buf());
         let Some(db_path) = self.db_path.clone() else {
             return;
         };
@@ -764,6 +821,14 @@ impl App {
             return;
         }
         self.search = Some(Search::start(&db_path, index_path));
+    }
+
+    /// Start asking, on a timer, whether Messages.app is running.
+    ///
+    /// Off until something asks for it: the answer costs a process, and no
+    /// test should spawn one.
+    pub fn enable_presence(&mut self) {
+        self.presence = Presence::watching();
     }
 
     /// Take the names read out of the macOS Contacts stores.
@@ -775,7 +840,11 @@ impl App {
     /// address.
     pub fn enable_contacts(&mut self, contacts: Contacts) {
         if let Some(warning) = contacts.status().warning() {
-            self.status.warnings.push(warning.clone());
+            // A retry reads the stores again, so the same complaint can arrive
+            // twice; the notes list keeps one of each.
+            if !self.status.warnings.contains(&warning) {
+                self.status.warnings.push(warning.clone());
+            }
             if self.status.active_toast().is_none() {
                 self.status.error(warning);
             }
@@ -785,6 +854,16 @@ impl App {
         self.measured.stale = true;
     }
 
+    /// Read the machine's own Contacts stores and take the names from them.
+    ///
+    /// The only caller is the binary. Going through here rather than
+    /// [`App::enable_contacts`] is what tells a retry that the names can be
+    /// read again — the tests hand over a fixture and this is never reached.
+    pub fn enable_contacts_from_stores(&mut self) {
+        self.contacts_from_stores = true;
+        self.enable_contacts(Contacts::load());
+    }
+
     /// Start keeping local read state at `path`.
     ///
     /// Off until something asks for it, which is how the tests run: nothing
@@ -792,6 +871,7 @@ impl App {
     /// after the database is open marks whatever conversation is already on
     /// screen as seen, because it is.
     pub fn enable_seen(&mut self, path: &std::path::Path) {
+        self.seen_path = Some(path.to_path_buf());
         let Some(db_path) = self.db_path.clone() else {
             return;
         };
@@ -1658,6 +1738,12 @@ impl App {
     /// field, so letters type instead of navigating.
     #[must_use]
     pub fn key_focus(&self) -> Focus {
+        // An unreadable database has no panes to steer, so the keys belong to
+        // the surface that is actually on screen — unless an overlay is over
+        // it, which still takes its own keys.
+        if self.db_error.is_some() && !self.focus.is_overlay() {
+            return Focus::DbError;
+        }
         if self.focus == Focus::ChatList && self.chat_filter.is_some() {
             Focus::Composer
         } else {
@@ -1721,7 +1807,7 @@ impl App {
             Focus::ChatList => Some(&mut self.chats),
             Focus::Conversation => Some(&mut self.messages),
             Focus::Palette => Some(&mut self.jump.list),
-            Focus::Help | Focus::Composer | Focus::Reactions => None,
+            Focus::Help | Focus::Composer | Focus::Reactions | Focus::DbError => None,
         }
     }
 
@@ -1746,6 +1832,7 @@ impl App {
             Action::PaletteFilter => self.jump.filter = self.jump.filter.next(),
             Action::NewChat => self.start_new_chat(),
             Action::OpenHelp => self.open_overlay(Focus::Help),
+            Action::RetryDb => self.retry_db(),
             Action::Cancel => self.cancel(),
             Action::StartFilter => self.start_filter(),
             Action::Insert(c) => {
@@ -2094,6 +2181,8 @@ impl App {
             Focus::Conversation => self.focus = Focus::Composer,
             Focus::Reactions => self.send_reaction(),
             Focus::Help => self.close_overlay(),
+            // Unreachable: `focus` is never set to it. Retrying is `r`.
+            Focus::DbError => {}
         }
     }
 
@@ -2113,6 +2202,7 @@ impl App {
                     self.focus = Focus::ChatList;
                 }
             }
+            Focus::DbError => {}
         }
     }
 
@@ -2584,6 +2674,14 @@ impl App {
         if self.images.take_arrived() {
             self.images.reconsider();
             self.measured.stale = true;
+            dirty = true;
+        }
+        // Only a changed answer is worth a frame; the probe itself runs on its
+        // own thread and never holds the loop up.
+        if let Some(answer) = self.presence.poll()
+            && self.status.messages_app_running != answer
+        {
+            self.status.messages_app_running = answer;
             dirty = true;
         }
         if self.watcher.ready() {

@@ -269,6 +269,95 @@ fn a_blocked_database_names_full_disk_access_and_the_settings_path() {
 }
 
 #[test]
+fn the_first_run_surface_offers_a_retry_and_takes_no_other_key() {
+    let mut app = app();
+    app.open_db(PathBuf::from("/nonexistent/msgs/chat.db"));
+
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "r retry"), "the retry key is offered");
+    assert!(contains(&buffer, "press r"), "and what it is for");
+
+    // Keys that steer panes are dead here: there are no panes.
+    assert_eq!(app.key_focus(), Focus::DbError);
+    assert_eq!(
+        keymap::resolve(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            app.key_focus()
+        ),
+        None
+    );
+    assert_eq!(
+        keymap::resolve(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            app.key_focus()
+        ),
+        Some(Action::RetryDb)
+    );
+
+    // Retrying a database that is still not there says so and stays put.
+    press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+    assert!(app.db_error.is_some());
+    let (text, is_error) = app.status.active_toast().expect("a toast");
+    assert!(text.contains("still cannot read"), "{text}");
+    assert!(is_error);
+    // There is no status line under this surface, so the toast lands on it.
+    assert!(contains(&frame(&mut app, 120, 34), "still cannot read"));
+}
+
+#[test]
+fn a_blocked_database_spells_out_the_full_disk_access_steps() {
+    let mut app = app();
+    app.db_error = Some(DbError::PermissionDenied(PathBuf::from(
+        "/Users/someone/Library/Messages/chat.db",
+    )));
+
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "1. Open System Settings"), "step one");
+    assert!(contains(&buffer, "2. Switch on the app"), "step two");
+    assert!(contains(&buffer, "3. Quit that app"), "step three");
+    assert!(
+        contains(&buffer, "Contacts"),
+        "the same switch covers names"
+    );
+}
+
+#[test]
+fn startup_warnings_are_listed_in_the_help_modal() {
+    let (config, warnings) = Config::parse("shwo_chat_list = true\n");
+    let mut app = App::new(config, warnings);
+    assert!(!app.status.warnings.is_empty());
+
+    app.update(Action::OpenHelp);
+    let buffer = frame(&mut app, 140, 44);
+    assert!(contains(&buffer, "NOTES"), "the notes heading");
+    assert!(contains(&buffer, "config: "), "and the warning itself");
+}
+
+#[test]
+fn a_wide_terminal_puts_the_help_modal_into_two_columns() {
+    let mut app = app();
+    app.update(Action::OpenHelp);
+
+    // Two scopes on one row is what a second column means.
+    let wide = frame(&mut app, 200, 44);
+    let wide_rows = rows(&wide);
+    assert!(
+        wide_rows
+            .iter()
+            .any(|row| row.contains("GLOBAL") && row.contains("CONVERSATION")),
+        "two headings share a row"
+    );
+
+    // Narrow, they stack, and every binding is still reachable by scrolling.
+    let narrow = rows(&frame(&mut app, 90, 44));
+    assert!(
+        !narrow
+            .iter()
+            .any(|row| row.contains("GLOBAL") && row.contains("CONVERSATION"))
+    );
+}
+
+#[test]
 fn the_error_screen_survives_every_terminal_size() {
     let mut app = app();
     app.open_db(PathBuf::from("/nonexistent/msgs/chat.db"));

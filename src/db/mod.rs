@@ -158,10 +158,15 @@ impl DbError {
     #[must_use]
     pub const fn hint(&self) -> Option<&'static str> {
         match self {
-            Self::PermissionDenied(_) => Some(
-                "Grant Full Disk Access to your terminal, then start msgs again:\n\
-                 System Settings → Privacy & Security → Full Disk Access",
-            ),
+            Self::PermissionDenied(_) => Some(concat!(
+                "Give your terminal Full Disk Access:\n",
+                "\n",
+                "1. Open System Settings → Privacy & Security → Full Disk Access\n",
+                "2. Switch on the app you run msgs in — Terminal, iTerm2, Ghostty\n",
+                "3. Quit that app and open it again; macOS applies it on launch\n",
+                "\n",
+                "The same switch is what lets msgs read Contacts for names.",
+            )),
             Self::NotFound(_) => Some(
                 "Open Messages.app and sign in to create it,\n\
                  or point msgs at another file with --db <PATH>.",

@@ -14,8 +14,10 @@ mod fixtures;
 
 use std::path::{Path, PathBuf};
 
-use msgs::app::{Action, App, WatcherStatus};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use msgs::app::{Action, App, Focus, WatcherStatus};
 use msgs::config::Config;
+use msgs::keymap;
 use msgs::ui;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -482,4 +484,35 @@ fn the_status_line_says_how_fresh_the_screen_is() {
         "the watcher segment must carry the age of the last read"
     );
     assert!(segments[2].ends_with("just now"));
+}
+
+#[test]
+fn retrying_picks_up_a_database_that_was_not_there_at_launch() {
+    // What granting Full Disk Access looks like from inside msgs: the file
+    // that could not be read a moment ago can be read now, and `r` is the key
+    // that finds out.
+    let store = Store::new("retry");
+    let later = store.dir.join("appears-later.db");
+
+    let mut app = App::new(Config::default(), Vec::new());
+    app.open_db(later.clone());
+    assert!(app.db_error.is_some());
+    assert!(app.chat_rows.is_empty());
+    assert_eq!(app.key_focus(), Focus::DbError);
+
+    std::fs::copy(fixtures::database(), &later).expect("put a database there");
+
+    let action = keymap::resolve(
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        app.key_focus(),
+    )
+    .expect("r is bound on the first-run surface");
+    assert_eq!(action, Action::RetryDb);
+    app.update(action);
+
+    assert!(app.db_error.is_none(), "the database opened");
+    assert!(!app.chat_rows.is_empty(), "and its chats loaded");
+    // Keys go back to the panes, and live updates are running.
+    assert_eq!(app.key_focus(), Focus::ChatList);
+    assert_ne!(app.status.watcher, WatcherStatus::Off);
 }
