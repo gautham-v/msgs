@@ -10,7 +10,7 @@ Rust + ratatui terminal client for iMessage on macOS.
 - `src/theme.rs` — named color slots (mockup palette), overridable per slot from config
 - `src/keymap.rs` — focus-sensitive key → `Action`; `BINDINGS` also feeds the help modal and shortcuts bar
 - `src/db/` — read-only access to `chat.db` (rusqlite + `imessage-database` for typedstream parsing)
-- `src/ui/` — ratatui widgets: chat list, conversation, composer, palette, help; `ui::compute` is a pure layout function with tests
+- `src/ui/` — ratatui widgets: chat list, conversation, composer, palette, help; `ui::compute` and `chat_list::Shape` are pure layout functions with tests, and `ui::format` holds the string helpers (relative times, previews, truncation)
 - `src/send.rs` — outbound messages via `osascript` → Messages.app; tapbacks via `imsg`
 - `src/search.rs` — FTS5 index kept next to the app (not inside chat.db)
 - `docs/mockups.html` — the design target; match it

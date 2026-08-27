@@ -25,6 +25,57 @@ impl Handle {
     pub fn is_email(&self) -> bool {
         self.id.contains('@')
     }
+
+    /// The address written for a reader; see [`display_name`].
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        display_name(&self.id)
+    }
+
+    /// The shortest thing that still identifies the person; see [`short_name`].
+    #[must_use]
+    pub fn short_name(&self) -> String {
+        short_name(&self.id)
+    }
+}
+
+/// An address written for a reader: a North American number spaced out,
+/// anything else as it is stored.
+///
+/// This is the last resort. Once contact lookup lands, a real name replaces it;
+/// until then a row showing a number should at least show a readable one.
+#[must_use]
+pub fn display_name(id: &str) -> String {
+    format_phone(id).unwrap_or_else(|| id.to_string())
+}
+
+/// The shortest thing that still identifies a person, for the joined
+/// participant list of an unnamed group and for the `Name:` prefix on a
+/// chat-list preview.
+///
+/// Emails lose their domain; numbers keep every digit, because half a phone
+/// number identifies nobody.
+#[must_use]
+pub fn short_name(id: &str) -> String {
+    match id.split_once('@') {
+        Some((local, _)) if !local.is_empty() => local.to_string(),
+        _ => display_name(id),
+    }
+}
+
+/// `+15555550132` → `+1 (555) 555-0132`, and `None` for anything that is not a
+/// plain eleven-digit North American number.
+fn format_phone(id: &str) -> Option<String> {
+    let digits = id.strip_prefix("+1")?;
+    if digits.len() != 10 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!(
+        "+1 ({}) {}-{}",
+        &digits[0..3],
+        &digits[3..6],
+        &digits[6..10]
+    ))
 }
 
 const SELECT: &str = "SELECT ROWID, id, service FROM handle";
@@ -82,5 +133,41 @@ mod tests {
         };
         assert!(email.is_email());
         assert!(!phone.is_email());
+    }
+
+    #[test]
+    fn a_north_american_number_is_spaced_out_and_anything_else_is_left_alone() {
+        let phone = Handle {
+            rowid: 1,
+            id: "+15550000000".to_string(),
+            service: "SMS".to_string(),
+        };
+        assert_eq!(phone.display_name(), "+1 (555) 000-0000");
+        assert_eq!(phone.short_name(), phone.display_name());
+
+        let short_code = Handle {
+            rowid: 2,
+            id: "26236".to_string(),
+            service: "SMS".to_string(),
+        };
+        assert_eq!(short_code.display_name(), "26236");
+
+        let international = Handle {
+            rowid: 3,
+            id: "+442071234567".to_string(),
+            service: "SMS".to_string(),
+        };
+        assert_eq!(international.display_name(), international.id);
+    }
+
+    #[test]
+    fn an_email_keeps_only_its_local_part_as_a_short_name() {
+        let email = Handle {
+            rowid: 1,
+            id: "sam@example.invalid".to_string(),
+            service: "iMessage".to_string(),
+        };
+        assert_eq!(email.short_name(), "sam");
+        assert_eq!(email.display_name(), email.id);
     }
 }

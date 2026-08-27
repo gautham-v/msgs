@@ -27,9 +27,12 @@ use chrono::{DateTime, Local};
 use imessage_database::util::dates::{get_local_time, get_offset};
 use rusqlite::{Connection, OpenFlags};
 
-pub use chat::Chat;
+pub use chat::{Chat, Preview};
 pub use handle::Handle;
-pub use message::{AttachmentRef, GroupAction, Message, Tapback, TapbackAction, TapbackKind};
+pub use message::{
+    AttachmentKind, AttachmentRef, GroupAction, Message, Tapback, TapbackAction, TapbackKind,
+    body_text,
+};
 
 /// How many messages a conversation page holds by default.
 pub const PAGE: usize = 100;

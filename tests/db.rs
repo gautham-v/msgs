@@ -6,9 +6,9 @@
 
 mod fixtures;
 
-use msgs::app::{App, DbStatus};
+use msgs::app::{Action, App, DbStatus};
 use msgs::config::Config;
-use msgs::db::{Db, GroupAction, Source, TapbackKind};
+use msgs::db::{AttachmentKind, Db, GroupAction, Source, TapbackKind};
 
 fn db() -> Db {
     Db::open(&fixtures::database()).expect("open the fixture read-only")
@@ -343,4 +343,110 @@ fn a_missing_database_becomes_a_friendly_error_instead_of_a_crash() {
     assert!(!err.headline().is_empty());
     assert!(err.hint().is_some());
     assert_eq!(app.status.db, DbStatus::Unreadable("not found".to_string()));
+}
+
+#[test]
+fn every_chat_carries_a_preview_of_its_last_message() {
+    let chats = db().chats().expect("chats");
+
+    let group = chats
+        .iter()
+        .find(|chat| chat.rowid == fixtures::CHAT_GROUP)
+        .expect("the group chat");
+    assert_eq!(group.last_message_rowid, fixtures::MSG_GROUP_RENAME);
+    let preview = group.preview.as_ref().expect("a preview");
+    // The newest row in the group is the rename event, not something typed.
+    assert!(preview.is_announcement());
+    assert!(!preview.is_from_me);
+    assert_eq!(preview.sender_rowid, Some(fixtures::HANDLE_BAILEY));
+
+    let direct = chats
+        .iter()
+        .find(|chat| chat.rowid == fixtures::CHAT_DIRECT)
+        .expect("the direct chat");
+    assert_eq!(direct.last_message_rowid, fixtures::MSG_UNREAD);
+    let preview = direct.preview.as_ref().expect("a preview");
+    assert!(!preview.is_announcement());
+    assert!(preview.text.is_some());
+    assert_eq!(preview.attachments, 0);
+
+    let empty = chats
+        .iter()
+        .find(|chat| chat.rowid == fixtures::CHAT_EMPTY)
+        .expect("the empty chat");
+    assert_eq!(empty.last_message_rowid, 0);
+    assert!(empty.preview.is_none());
+}
+
+#[test]
+fn a_preview_of_an_attachment_names_the_file_it_carries() {
+    let previews = db().previews(&[fixtures::MSG_PHOTO]).expect("previews");
+    let preview = previews.get(&fixtures::MSG_PHOTO).expect("the photo");
+
+    assert!(preview.is_from_me);
+    // The body was nothing but the attachment placeholder.
+    assert!(preview.text.is_none());
+    assert_eq!(preview.attachments, 1);
+    assert_eq!(preview.attachment_kind, Some(AttachmentKind::Image));
+    assert_eq!(preview.attachment_name.as_deref(), Some("photo.png"));
+}
+
+#[test]
+fn asking_for_no_previews_costs_nothing_and_returns_nothing() {
+    assert!(db().previews(&[]).expect("previews").is_empty());
+    assert!(db().previews(&[999_999]).expect("previews").is_empty());
+}
+
+#[test]
+fn opening_the_database_selects_the_newest_chat_and_loads_it() {
+    let mut app = App::new(Config::default(), Vec::new());
+    app.open_db(fixtures::database());
+
+    assert_eq!(app.visible_chats.len(), 3);
+    assert_eq!(app.chats.selected, 0);
+    // The group holds the newest message, so it opens first.
+    assert_eq!(app.open_chat, Some(fixtures::CHAT_GROUP));
+    assert_eq!(app.message_rows.len(), 3);
+    assert_eq!(app.messages.selected, 2, "the newest message is selected");
+
+    // Moving down the list opens the next conversation.
+    app.update(Action::SelectNext);
+    assert_eq!(
+        app.selected_chat().map(|chat| chat.rowid),
+        Some(fixtures::CHAT_DIRECT)
+    );
+    assert_eq!(app.open_chat, Some(fixtures::CHAT_DIRECT));
+    assert_eq!(app.message_rows.len(), 4);
+
+    // The empty chat opens to nothing rather than keeping the last one.
+    app.update(Action::SelectNext);
+    assert_eq!(app.open_chat, Some(fixtures::CHAT_EMPTY));
+    assert!(app.message_rows.is_empty());
+}
+
+#[test]
+fn filtering_the_list_narrows_it_and_opens_what_is_left() {
+    let mut app = App::new(Config::default(), Vec::new());
+    app.open_db(fixtures::database());
+
+    app.update(Action::StartFilter);
+    for c in "fixture gr".chars() {
+        app.update(Action::Insert(c));
+    }
+    assert_eq!(app.visible_chats.len(), 1);
+    assert_eq!(
+        app.selected_chat().map(|chat| chat.rowid),
+        Some(fixtures::CHAT_GROUP)
+    );
+
+    // A query that matches nothing leaves an empty list and no open chat.
+    for c in "zzz".chars() {
+        app.update(Action::Insert(c));
+    }
+    assert!(app.visible_chats.is_empty());
+    assert!(app.selected_chat().is_none());
+    assert!(app.message_rows.is_empty());
+
+    app.update(Action::Cancel);
+    assert_eq!(app.visible_chats.len(), 3);
 }

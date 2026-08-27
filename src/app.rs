@@ -438,8 +438,18 @@ pub struct App {
     /// Why the database could not be opened. While this is set the UI shows a
     /// full-screen explanation instead of the panes.
     pub db_error: Option<DbError>,
-    /// The chat list as read from the database, newest first.
+    /// The chat list as read from the database, pinned first and newest first.
     pub chat_rows: Vec<Chat>,
+    /// Indices into [`App::chat_rows`] that pass the filter, in display order.
+    /// The chat-list selection indexes this, not `chat_rows`.
+    pub visible_chats: Vec<usize>,
+    /// How many leading entries of [`App::visible_chats`] are pinned, which is
+    /// what puts the `Pinned` / `Recent` headings in the list. Always `0` while
+    /// the database does not record pinning.
+    pub pinned_visible: usize,
+    /// `chat.ROWID` of the conversation currently loaded into
+    /// [`App::message_rows`].
+    pub open_chat: Option<i64>,
     /// The open conversation's loaded page of messages, oldest first.
     pub message_rows: Vec<Message>,
     /// Set to leave the event loop.
@@ -489,6 +499,9 @@ impl App {
             db: None,
             db_error: None,
             chat_rows: Vec::new(),
+            visible_chats: Vec::new(),
+            pinned_visible: 0,
+            open_chat: None,
             message_rows: Vec::new(),
             should_quit: false,
             chats: ListPane::default(),
@@ -523,6 +536,7 @@ impl App {
                 self.db_error = Some(err);
                 self.chat_rows.clear();
                 self.message_rows.clear();
+                self.refresh_chat_view();
             }
         }
     }
@@ -545,19 +559,115 @@ impl App {
                 self.status.error(format!("chat list: {}", err.summary()));
             }
         }
+        self.refresh_chat_view();
+    }
+
+    /// Re-apply the filter, keep the selection on the chat it was on, and open
+    /// whatever it now points at.
+    ///
+    /// Cheap enough to run after every action: filtering a list of 500 chats is
+    /// 500 substring tests, and the conversation is only re-read when the
+    /// selected chat actually changed.
+    pub fn refresh_chat_view(&mut self) {
+        self.refresh(true);
+    }
+
+    /// [`App::refresh_chat_view`], but `follow_selection` is `false` after a
+    /// wheel notch, which moves the viewport on purpose and must not be dragged
+    /// back to the selection.
+    fn refresh(&mut self, follow_selection: bool) {
+        let needle = self
+            .chat_filter
+            .as_ref()
+            .map(|field| field.text().trim().to_lowercase())
+            .unwrap_or_default();
+
+        let visible: Vec<usize> = self
+            .chat_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, chat)| chat.matches(&needle))
+            .map(|(index, _)| index)
+            .collect();
+
+        if visible != self.visible_chats {
+            // Narrowing the list must not drag the selection onto a different
+            // conversation, so it follows the chat it was on where it can.
+            let anchor = self.selected_chat().map(|chat| chat.rowid);
+            self.visible_chats = visible;
+            self.chats.set_len(self.visible_chats.len());
+            if let Some(rowid) = anchor
+                && let Some(position) = self
+                    .visible_chats
+                    .iter()
+                    .position(|index| self.chat_rows[*index].rowid == rowid)
+            {
+                self.chats.selected = position;
+            }
+        }
+        self.pinned_visible = self
+            .visible_chats
+            .iter()
+            .take_while(|index| self.chat_rows[**index].is_pinned())
+            .count();
+
+        if follow_selection {
+            self.sync_chat_scroll();
+        }
+        self.sync_open_chat();
+    }
+
+    /// Pull the chat list's scroll offset back to the selection, using the
+    /// geometry of the last frame.
+    fn sync_chat_scroll(&mut self) {
+        let Some(rows) = self.panes.chat_list_rows else {
+            // Nothing has been drawn yet, so all we can say is that the
+            // selection must not be above the window.
+            self.chats.offset = self.chats.offset.min(self.chats.selected);
+            return;
+        };
+        self.chats.offset =
+            crate::ui::chat_list::Shape::of(self, rows.height).offset_for(self.chats.selected);
+    }
+
+    /// Load the selected chat's conversation, if it is not the loaded one.
+    fn sync_open_chat(&mut self) {
+        let Some(rowid) = self.selected_chat().map(|chat| chat.rowid) else {
+            // Nothing selected: close whatever was open, and leave the pane
+            // alone if nothing was.
+            if self.open_chat.take().is_some() {
+                self.message_rows.clear();
+                self.messages.set_len(0);
+            }
+            return;
+        };
+        if self.open_chat == Some(rowid) {
+            return;
+        }
+        self.load_conversation(rowid);
     }
 
     /// The chat under the chat-list selection.
     #[must_use]
     pub fn selected_chat(&self) -> Option<&Chat> {
-        self.chat_rows.get(self.chats.selected)
+        self.visible_chat(self.chats.selected)
     }
 
-    /// Load the newest page of `chat_rowid` into [`App::message_rows`].
+    /// The `n`th chat the filter leaves visible.
+    #[must_use]
+    pub fn visible_chat(&self, n: usize) -> Option<&Chat> {
+        self.visible_chats
+            .get(n)
+            .and_then(|index| self.chat_rows.get(*index))
+    }
+
+    /// Load the newest page of `chat_rowid` into [`App::message_rows`], with
+    /// the newest message selected.
     pub fn load_conversation(&mut self, chat_rowid: i64) {
         let Some(db) = self.db.as_ref() else {
             return;
         };
+        self.open_chat = Some(chat_rowid);
         match db.messages_before(chat_rowid, None, PAGE) {
             Ok(messages) => self.message_rows = messages,
             Err(err) => {
@@ -565,6 +675,8 @@ impl App {
                 self.status.error(format!("messages: {}", err.summary()));
             }
         }
+        self.messages.set_len(self.message_rows.len());
+        self.messages.to_bottom();
     }
 
     /// Prepend the page of messages above the ones already loaded.
@@ -697,6 +809,9 @@ impl App {
             Action::React => self.not_yet("Tapbacks arrive with the imsg integration"),
             Action::CopySelection => self.not_yet("Copy arrives with the conversation pane"),
         }
+        // Every path out of an action ends here, so a filter keystroke, an
+        // arrow key, and a click all leave the chat list in the same state.
+        self.refresh(!matches!(action, Action::Scroll(_)));
     }
 
     fn toggle_chat_list(&mut self) {
@@ -864,8 +979,15 @@ impl App {
 
     fn click(&mut self, pane: Focus, position: Position) {
         if pane == Focus::ChatList {
-            if let Some(rect) = self.panes.chat_list_rows {
-                self.chats.select_at_row(rect, position.y);
+            // Chats are two rows tall and section headings take one, so the
+            // list's own geometry decides what was clicked.
+            if let Some(rect) = self.panes.chat_list_rows
+                && position.y >= rect.y
+                && let Some(index) =
+                    crate::ui::chat_list::Shape::of(self, rect.height).chat_at(position.y - rect.y)
+            {
+                self.chats.selected = index;
+                self.refresh_chat_view();
             }
         } else if pane == Focus::Conversation {
             self.messages

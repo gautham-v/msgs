@@ -10,14 +10,16 @@
 
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use chrono::{Duration, Local};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use msgs::app::{Action, App, Focus};
 use msgs::config::Config;
-use msgs::db::DbError;
+use msgs::db::{Chat, DbError, Preview};
 use msgs::{keymap, ui};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use ratatui::layout::Position;
 
 fn app() -> App {
     App::new(Config::default(), Vec::new())
@@ -54,6 +56,16 @@ fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     if let Some(action) = keymap::resolve(key, app.key_focus()) {
         app.update(action);
     }
+}
+
+/// Click the left button at an absolute terminal cell.
+fn click(app: &mut App, column: u16, row: u16) {
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    });
 }
 
 fn type_text(app: &mut App, text: &str) {
@@ -259,4 +271,233 @@ fn the_error_screen_survives_every_terminal_size() {
             assert_eq!(buffer.area.width, width);
         }
     }
+}
+
+/// A chat with a name, an age, and a one-line preview. Every name and body
+/// here is invented; no test in this file opens a real database.
+fn chat(rowid: i64, name: &str, minutes_ago: i64, preview: &str) -> Chat {
+    let when = Local::now() - Duration::minutes(minutes_ago);
+    // Messages stores nanoseconds since 2001-01-01.
+    let raw = (when.timestamp() - 978_307_200) * 1_000_000_000;
+    Chat {
+        rowid,
+        guid: format!("iMessage;-;chat{rowid}"),
+        identifier: Some(format!("chat{rowid}")),
+        display_name: Some(name.to_string()),
+        service: Some("iMessage".to_string()),
+        style: 45,
+        is_group: false,
+        participants: Vec::new(),
+        last_message_date: raw,
+        last_message_rowid: rowid,
+        preview: Some(Preview {
+            message_rowid: rowid,
+            text: Some(preview.to_string()),
+            ..Preview::default()
+        }),
+        message_count: 12,
+        unread_count: 0,
+        is_pinned: None,
+    }
+}
+
+fn with_chats(chats: Vec<Chat>) -> App {
+    let mut app = app();
+    app.chat_rows = chats;
+    app.refresh_chat_view();
+    app
+}
+
+/// The cell at `(x, y)` of the last drawn frame.
+fn cell(buffer: &Buffer, x: u16, y: u16) -> ratatui::buffer::Cell {
+    buffer[(x, y)].clone()
+}
+
+#[test]
+fn chat_rows_carry_a_name_a_preview_a_time_and_an_unread_badge() {
+    let mut first = chat(1, "Alpha Person", 2, "sounds good, see you at 7");
+    first.unread_count = 2;
+    let mut app = with_chats(vec![
+        first,
+        chat(2, "Bravo Group", 61, "the second one"),
+        chat(3, "Charlie", 60 * 24 * 9, "an old one"),
+    ]);
+
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "Alpha Person"), "name");
+    assert!(contains(&buffer, "sounds good"), "preview");
+    assert!(contains(&buffer, "2m"), "relative time");
+    assert!(contains(&buffer, " 2 "), "unread badge");
+    assert!(contains(&buffer, "1h"), "an hour-old chat");
+    assert!(contains(&buffer, "Charlie"), "a nine-day-old chat");
+    // No pinning in this database, so no section headings.
+    assert!(!contains(&buffer, "PINNED"));
+}
+
+#[test]
+fn the_selected_row_is_outlined_and_the_hovered_one_is_tinted() {
+    let mut app = with_chats(vec![
+        chat(1, "Alpha", 2, "one"),
+        chat(2, "Bravo", 5, "two"),
+        chat(3, "Charlie", 9, "three"),
+    ]);
+    let rows = {
+        let buffer = frame(&mut app, 120, 34);
+        let _ = buffer;
+        app.panes.chat_list_rows.expect("the rows area")
+    };
+
+    // Hover over the third chat, which starts four rows into the list.
+    app.hover = Some(Position::new(rows.x + 2, rows.y + 4));
+    let buffer = frame(&mut app, 120, 34);
+
+    let selected = cell(&buffer, rows.x, rows.y);
+    assert_eq!(selected.fg, app.theme.border_active, "selection bar");
+    assert_eq!(selected.bg, app.theme.bg_highlight, "selection background");
+
+    let hovered = cell(&buffer, rows.x + 2, rows.y + 4);
+    assert_eq!(hovered.bg, app.theme.bg_hover, "hover tint");
+
+    let plain = cell(&buffer, rows.x + 2, rows.y + 2);
+    assert_eq!(plain.bg, app.theme.bg_dark, "an untouched row");
+}
+
+#[test]
+fn arrows_move_the_chat_selection_and_a_click_lands_on_either_of_its_rows() {
+    let mut app = with_chats(vec![
+        chat(1, "Alpha", 2, "one"),
+        chat(2, "Bravo", 5, "two"),
+        chat(3, "Charlie", 9, "three"),
+    ]);
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "Alpha"));
+    assert_eq!(app.chats.selected, 0);
+
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(app.chats.selected, 1);
+    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+    assert_eq!(app.chats.selected, 2);
+    press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE);
+    assert_eq!(app.chats.selected, 0);
+
+    let rows = app.panes.chat_list_rows.expect("the rows area");
+    // The preview line of the second chat.
+    click(&mut app, rows.x + 3, rows.y + 3);
+    assert_eq!(app.focus, Focus::ChatList);
+    assert_eq!(app.chats.selected, 1);
+    assert_eq!(app.selected_chat().map(|chat| chat.rowid), Some(2));
+}
+
+#[test]
+fn the_wheel_scrolls_the_chat_list_without_moving_the_selection() {
+    let chats = (0..40)
+        .map(|index| chat(index + 1, &format!("Chat {index}"), index, "body"))
+        .collect();
+    let mut app = with_chats(chats);
+    let _ = frame(&mut app, 120, 34);
+
+    let rows = app.panes.chat_list_rows.expect("the rows area");
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: rows.x + 2,
+        row: rows.y + 2,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    assert_eq!(app.chats.selected, 0, "the wheel does not select");
+    assert!(app.chats.offset > 0, "but it does scroll");
+
+    // Moving the selection pulls the window back to it, and no further than
+    // it has to: the selection lands on the top row.
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(app.chats.selected, 1);
+    assert_eq!(app.chats.offset, 1);
+}
+
+#[test]
+fn slash_filters_the_list_by_name_without_case() {
+    let mut app = with_chats(vec![
+        chat(1, "Alpha", 2, "one"),
+        chat(2, "Bravo", 5, "two"),
+        chat(3, "Bravado", 9, "three"),
+    ]);
+
+    press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+    type_text(&mut app, "BRAV");
+
+    let buffer = frame(&mut app, 120, 34);
+    assert!(!contains(&buffer, "Alpha"), "filtered out");
+    assert!(contains(&buffer, "Bravo"));
+    assert!(contains(&buffer, "Bravado"));
+    assert_eq!(app.visible_chats.len(), 2);
+    assert_eq!(app.selected_chat().map(|chat| chat.rowid), Some(2));
+
+    // Narrowing further keeps the selection on the chat it was already on.
+    type_text(&mut app, "ado");
+    assert_eq!(app.visible_chats.len(), 1);
+    assert_eq!(app.selected_chat().map(|chat| chat.rowid), Some(3));
+
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(app.visible_chats.len(), 3);
+    assert!(contains(&frame(&mut app, 120, 34), "Alpha"));
+}
+
+#[test]
+fn a_pinned_chat_opens_a_section_and_the_rest_follow_under_another() {
+    let mut pinned = chat(1, "Pinned One", 30, "kept on top");
+    pinned.is_pinned = Some(true);
+    let mut newer = chat(2, "Newer", 1, "more recent, but not pinned");
+    newer.is_pinned = Some(false);
+    let mut app = with_chats(vec![pinned, newer]);
+    // `Db::chats` does this ordering; the fixture list is built by hand.
+    app.chat_rows.sort_by_key(|chat| !chat.is_pinned());
+    app.refresh_chat_view();
+
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "PINNED"));
+    assert!(contains(&buffer, "RECENT"));
+    assert_eq!(app.pinned_visible, 1);
+
+    // The heading rows are not selectable.
+    let rows = app.panes.chat_list_rows.expect("the rows area");
+    click(&mut app, rows.x + 3, rows.y);
+    assert_eq!(app.chats.selected, 0);
+    click(&mut app, rows.x + 3, rows.y + 4);
+    assert_eq!(app.chats.selected, 1);
+}
+
+#[test]
+fn five_hundred_chats_draw_only_what_fits_and_do_it_quickly() {
+    let chats = (0..500)
+        .map(|index| {
+            chat(
+                index + 1,
+                &format!("Chat number {index}"),
+                index,
+                "a preview line of about the length a real one has",
+            )
+        })
+        .collect();
+    let mut app = with_chats(chats);
+    assert_eq!(app.visible_chats.len(), 500);
+
+    let started = std::time::Instant::now();
+    for _ in 0..20 {
+        let buffer = frame(&mut app, 120, 34);
+        // Only the chats that fit are drawn: 32 rows of list, two rows each.
+        assert!(!contains(&buffer, "Chat number 20"));
+    }
+    press(&mut app, KeyCode::End, KeyModifiers::NONE);
+    let buffer = frame(&mut app, 120, 34);
+    assert!(
+        contains(&buffer, "Chat number 499"),
+        "the bottom is reachable"
+    );
+    assert!(!contains(&buffer, "Chat number 0"));
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "twenty frames of 500 chats took {elapsed:?}"
+    );
 }

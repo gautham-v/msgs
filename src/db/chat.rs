@@ -1,17 +1,53 @@
 //! The `chat` table: conversations, who is in them, and how stale they are.
 //!
 //! One grouped query carries the whole list — last message date, message count,
-//! and unread count per chat — and a second pulls every chat's participants, so
-//! a list of 500 chats costs two round trips rather than 1,001.
+//! and unread count per chat — a second pulls every chat's participants, and
+//! two more fetch the last message of each chat and its attachments for the
+//! preview line. A list of 500 chats costs four round trips rather than 2,001.
 
 use std::collections::HashMap;
 
 use chrono::{DateTime, Local};
 
-use super::{Db, DbError, Handle, local_time};
+use super::{AttachmentKind, Db, DbError, GroupAction, Handle, MAX_PAGE, body_text, local_time};
 
 /// `chat.style` for a group conversation. Anything else is one-to-one.
 const STYLE_GROUP: i64 = 43;
+
+/// The last message in a chat, reduced to the one line the chat list shows.
+///
+/// It deliberately holds the sender's handle rather than a name: contact lookup
+/// is a later pass, and the row is drawn from this in `ui::format`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Preview {
+    /// `message.ROWID` of the message being previewed.
+    pub message_rowid: i64,
+    /// Whether you sent it.
+    pub is_from_me: bool,
+    /// `handle.ROWID` of the sender, absent when you sent it.
+    pub sender_rowid: Option<i64>,
+    /// The sender's handle, for the `Name:` prefix in a group.
+    pub sender: Option<String>,
+    /// The body, with attachment placeholders already stripped.
+    pub text: Option<String>,
+    /// How many files came with it.
+    pub attachments: usize,
+    /// What sort of file the first of them is.
+    pub attachment_kind: Option<AttachmentKind>,
+    /// The name of the first file, when Messages recorded one.
+    pub attachment_name: Option<String>,
+    /// The group event this row announces, when it announces one.
+    pub group_action: Option<GroupAction>,
+}
+
+impl Preview {
+    /// Whether the previewed row is a group event rather than something
+    /// somebody typed.
+    #[must_use]
+    pub const fn is_announcement(&self) -> bool {
+        self.group_action.is_some()
+    }
+}
 
 /// One conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +71,10 @@ pub struct Chat {
     pub participants: Vec<Handle>,
     /// Raw Messages timestamp of the newest message, `0` when the chat is empty.
     pub last_message_date: i64,
+    /// `message.ROWID` of that newest message, `0` when the chat is empty.
+    pub last_message_rowid: i64,
+    /// That message reduced to one line, once [`Db::chats`] has filled it in.
+    pub preview: Option<Preview>,
     /// How many messages the chat holds, tapbacks excluded.
     pub message_count: i64,
     /// Incoming messages Messages has not marked read. Group events such as
@@ -60,10 +100,21 @@ impl Chat {
         self.unread_count > 0
     }
 
+    /// Whether the chat sits in the pinned section of the list.
+    ///
+    /// `false` on every database that does not record pinning at all, which is
+    /// every current macOS.
+    #[must_use]
+    pub fn is_pinned(&self) -> bool {
+        self.is_pinned == Some(true)
+    }
+
     /// A name to show before contacts have been resolved: the group's own name
     /// if it has one, then its participants, then its raw identifier.
     ///
-    /// The participant fallback is raw handles, so this is for the screen only.
+    /// The participant fallback is short handles — the local part of an email,
+    /// a spaced-out phone number — so an unnamed group reads as a list of
+    /// people rather than a list of addresses.
     #[must_use]
     pub fn fallback_title(&self) -> String {
         if let Some(name) = self.display_name.as_deref().filter(|s| !s.is_empty()) {
@@ -73,19 +124,45 @@ impl Chat {
             return self
                 .participants
                 .iter()
-                .map(|handle| handle.id.as_str())
+                .map(Handle::short_name)
                 .collect::<Vec<_>>()
                 .join(", ");
         }
         self.identifier.clone().unwrap_or_else(|| self.guid.clone())
     }
+
+    /// Whether `needle`, already lowercased, appears in anything the chat can
+    /// be found by: its name, its identifier, or a participant's address.
+    #[must_use]
+    pub fn matches(&self, needle: &str) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        if self.fallback_title().to_lowercase().contains(needle) {
+            return true;
+        }
+        if self
+            .identifier
+            .as_deref()
+            .is_some_and(|id| id.to_lowercase().contains(needle))
+        {
+            return true;
+        }
+        self.participants
+            .iter()
+            .any(|handle| handle.id.to_lowercase().contains(needle))
+    }
 }
 
 impl Db {
-    /// Every chat, newest first, with participants and counts filled in.
+    /// Every chat, pinned first and newest first inside each group, with
+    /// participants, counts, and the one-line preview filled in.
     ///
     /// Chats that hold no messages sort to the bottom rather than being hidden,
     /// so a conversation you started but never sent in is still reachable.
+    ///
+    /// Four queries carry the whole list however long it is: the grouped chat
+    /// query, the participants, the previewed messages, and their attachments.
     ///
     /// # Errors
     ///
@@ -100,7 +177,7 @@ impl Db {
         let sql = format!(
             "SELECT c.ROWID, c.guid, c.chat_identifier, c.display_name, c.service_name, \
                     c.style, {pinned}, \
-                    COALESCE(MAX(m.date), 0), COUNT(m.ROWID), \
+                    COALESCE(MAX(m.date), 0), COALESCE(MAX(m.ROWID), 0), COUNT(m.ROWID), \
                     COALESCE(SUM(CASE WHEN m.is_from_me = 0 AND COALESCE(m.is_read, 0) = 0 \
                                        AND COALESCE(m.item_type, 0) = 0 \
                                       THEN 1 ELSE 0 END), 0) \
@@ -126,8 +203,10 @@ impl Db {
                 participants: Vec::new(),
                 is_pinned: row.get::<_, Option<i64>>(6)?.map(|flag| flag != 0),
                 last_message_date: row.get::<_, Option<i64>>(7)?.unwrap_or_default(),
-                message_count: row.get::<_, Option<i64>>(8)?.unwrap_or_default(),
-                unread_count: row.get::<_, Option<i64>>(9)?.unwrap_or_default(),
+                last_message_rowid: row.get::<_, Option<i64>>(8)?.unwrap_or_default(),
+                preview: None,
+                message_count: row.get::<_, Option<i64>>(9)?.unwrap_or_default(),
+                unread_count: row.get::<_, Option<i64>>(10)?.unwrap_or_default(),
             })
         })?;
 
@@ -138,13 +217,113 @@ impl Db {
             // whose style was never set, still sorts out correctly here.
             chat.is_group = chat.style == STYLE_GROUP || chat.participants.len() > 1;
         }
-        // Newest first, with empty chats after everything that has a message.
+
+        let mut previews = self.previews(
+            &chats
+                .iter()
+                .map(|chat| chat.last_message_rowid)
+                .filter(|rowid| *rowid != 0)
+                .collect::<Vec<_>>(),
+        )?;
+        for chat in &mut chats {
+            chat.preview = previews.remove(&chat.last_message_rowid);
+        }
+
+        // Pinned first, then newest first, with empty chats after everything
+        // that has a message.
         chats.sort_by(|a, b| {
-            b.last_message_date
-                .cmp(&a.last_message_date)
+            b.is_pinned()
+                .cmp(&a.is_pinned())
+                .then_with(|| b.last_message_date.cmp(&a.last_message_date))
                 .then_with(|| a.rowid.cmp(&b.rowid))
         });
         Ok(chats)
+    }
+
+    /// One-line previews of the given messages, keyed by `message.ROWID`.
+    ///
+    /// Ids are read a bounded chunk at a time so a long chat list cannot build
+    /// an unbounded `IN (…)` list.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `message` or the attachment tables cannot be read.
+    pub fn previews(&self, message_rowids: &[i64]) -> Result<HashMap<i64, Preview>, DbError> {
+        let mut previews = HashMap::with_capacity(message_rowids.len());
+        for chunk in message_rowids.chunks(MAX_PAGE) {
+            self.previews_chunk(chunk, &mut previews)?;
+        }
+        Ok(previews)
+    }
+
+    fn previews_chunk(
+        &self,
+        message_rowids: &[i64],
+        into: &mut HashMap<i64, Preview>,
+    ) -> Result<(), DbError> {
+        if message_rowids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = (1..=message_rowids.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT m.ROWID, m.is_from_me, m.handle_id, h.id, m.text, m.attributedBody, \
+                    m.item_type, m.group_action_type, m.group_title, m.other_handle \
+             FROM message m \
+             LEFT JOIN handle h ON h.ROWID = m.handle_id \
+             WHERE m.ROWID IN ({placeholders})"
+        );
+
+        let mut statement = self.conn().prepare(&sql)?;
+        let rows = statement.query_map(
+            rusqlite::params_from_iter(message_rowids.iter().copied()),
+            |row| {
+                let sender_rowid = row.get::<_, Option<i64>>(2)?.filter(|id| *id != 0);
+                let text: Option<String> = row.get(4)?;
+                let attributed: Option<Vec<u8>> = row.get(5)?;
+                let item_type = row.get::<_, Option<i64>>(6)?.unwrap_or_default();
+                let group_action_type = row.get::<_, Option<i64>>(7)?.unwrap_or_default();
+                let group_title: Option<String> = row.get(8)?;
+                let other_handle = row.get::<_, Option<i64>>(9)?.filter(|id| *id != 0);
+                Ok(Preview {
+                    message_rowid: row.get(0)?,
+                    is_from_me: row.get::<_, Option<i64>>(1)?.unwrap_or_default() != 0,
+                    sender_rowid,
+                    sender: row.get(3)?,
+                    text: body_text(text.as_deref(), attributed.as_deref()),
+                    attachments: 0,
+                    attachment_kind: None,
+                    attachment_name: None,
+                    group_action: GroupAction::from_row(
+                        item_type,
+                        group_action_type,
+                        other_handle,
+                        sender_rowid,
+                        group_title.as_deref(),
+                    ),
+                })
+            },
+        )?;
+
+        for preview in rows {
+            let preview = preview?;
+            into.insert(preview.message_rowid, preview);
+        }
+
+        // One more query hangs the files off the previews that have any.
+        for (message_rowid, files) in self.attachments_by_message(message_rowids)? {
+            let Some(preview) = into.get_mut(&message_rowid) else {
+                continue;
+            };
+            preview.attachments = files.len();
+            if let Some(first) = files.first() {
+                preview.attachment_kind = Some(first.kind());
+                preview.attachment_name = first.display_name().map(ToString::to_string);
+            }
+        }
+        Ok(())
     }
 
     /// Total unread messages, and how many chats hold them.
@@ -202,6 +381,8 @@ mod tests {
             is_group: false,
             participants: Vec::new(),
             last_message_date: 0,
+            last_message_rowid: 0,
+            preview: None,
             message_count: 0,
             unread_count: 0,
             is_pinned: None,
@@ -235,10 +416,56 @@ mod tests {
                 service: "iMessage".to_string(),
             },
         ];
-        assert_eq!(unnamed.fallback_title(), "a@example.com, b@example.com");
+        assert_eq!(unnamed.fallback_title(), "a, b");
 
         let empty = chat(3);
         assert_eq!(empty.fallback_title(), "chat3");
+    }
+
+    #[test]
+    fn an_unnamed_group_reads_as_its_people_not_its_addresses() {
+        let mut group = chat(5);
+        group.participants = vec![
+            Handle {
+                rowid: 1,
+                id: "sam@example.invalid".to_string(),
+                service: "iMessage".to_string(),
+            },
+            Handle {
+                rowid: 2,
+                id: "+15550000000".to_string(),
+                service: "SMS".to_string(),
+            },
+        ];
+        assert_eq!(group.fallback_title(), "sam, +1 (555) 000-0000");
+    }
+
+    #[test]
+    fn the_filter_matches_names_identifiers_and_addresses() {
+        let mut named = chat(6);
+        named.display_name = Some("Weekend Plans".to_string());
+        named.participants = vec![Handle {
+            rowid: 1,
+            id: "casey@example.invalid".to_string(),
+            service: "iMessage".to_string(),
+        }];
+
+        assert!(named.matches(""));
+        assert!(named.matches("weekend"));
+        assert!(named.matches("plans"));
+        assert!(named.matches("casey"));
+        assert!(named.matches("chat6"));
+        assert!(!named.matches("nobody"));
+    }
+
+    #[test]
+    fn pinning_is_a_predicate_that_is_false_when_the_schema_is_silent() {
+        let mut chat = chat(7);
+        assert!(!chat.is_pinned());
+        chat.is_pinned = Some(false);
+        assert!(!chat.is_pinned());
+        chat.is_pinned = Some(true);
+        assert!(chat.is_pinned());
     }
 
     #[test]

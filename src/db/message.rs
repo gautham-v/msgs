@@ -161,7 +161,67 @@ pub struct AttachmentRef {
     pub hide_attachment: bool,
 }
 
+/// The broad sort of file an attachment is, which is all a one-line preview or
+/// a file chip needs to know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentKind {
+    /// A picture, shown inline where the terminal can draw one.
+    Image,
+    /// A video clip.
+    Video,
+    /// A voice message or other audio.
+    Audio,
+    /// Anything else.
+    File,
+}
+
+impl AttachmentKind {
+    /// The emoji the mockup puts in front of the file in a preview line.
+    #[must_use]
+    pub const fn glyph(self) -> &'static str {
+        match self {
+            Self::Image => "📷",
+            Self::Video => "🎬",
+            Self::Audio => "🎤",
+            Self::File => "📄",
+        }
+    }
+
+    /// The word to show when there is no filename worth showing.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Image => "Photo",
+            Self::Video => "Video",
+            Self::Audio => "Audio",
+            Self::File => "File",
+        }
+    }
+}
+
 impl AttachmentRef {
+    /// Which sort of file this is, from its MIME type and then its UTI.
+    #[must_use]
+    pub fn kind(&self) -> AttachmentKind {
+        if let Some(mime) = self.mime_type.as_deref() {
+            if mime.starts_with("image/") {
+                return AttachmentKind::Image;
+            }
+            if mime.starts_with("video/") {
+                return AttachmentKind::Video;
+            }
+            if mime.starts_with("audio/") {
+                return AttachmentKind::Audio;
+            }
+        }
+        match self.uti.as_deref() {
+            Some(uti) if uti.contains("image") => AttachmentKind::Image,
+            Some(uti) if uti.contains("movie") || uti.contains("video") => AttachmentKind::Video,
+            Some(uti) if uti.contains("audio") => AttachmentKind::Audio,
+            _ => AttachmentKind::File,
+        }
+    }
+
     /// The file's absolute path, with a leading `~` expanded.
     ///
     /// `None` when the row has no filename, which happens for attachments that
@@ -184,13 +244,7 @@ impl AttachmentRef {
     /// Whether it can be shown inline as a picture.
     #[must_use]
     pub fn is_image(&self) -> bool {
-        self.mime_type
-            .as_deref()
-            .is_some_and(|mime| mime.starts_with("image/"))
-            || self
-                .uti
-                .as_deref()
-                .is_some_and(|uti| uti.starts_with("public.") && uti.contains("image"))
+        self.kind() == AttachmentKind::Image
     }
 
     /// The best name to show for the file.
@@ -526,7 +580,8 @@ impl Db {
         if page.is_empty() {
             return Ok(());
         }
-        let mut attachments = self.attachments_for(page)?;
+        let ids: Vec<i64> = page.iter().map(|message| message.rowid).collect();
+        let mut attachments = self.attachments_by_message(&ids)?;
         let mut tapbacks = self.tapbacks_for(chat_rowid, page)?;
         for message in page.iter_mut() {
             message.attachments = attachments.remove(&message.rowid).unwrap_or_default();
@@ -535,14 +590,27 @@ impl Db {
         Ok(())
     }
 
-    /// Attachments for a page, keyed by message `ROWID`.
-    fn attachments_for(
+    /// Attachments hanging off the given messages, keyed by message `ROWID`.
+    ///
+    /// The chat list uses this too, for the one message it previews per chat,
+    /// so both callers share a single query shape. At most [`MAX_PAGE`] ids are
+    /// read in one call, which is what keeps the `IN (…)` list bounded; callers
+    /// with more than that chunk their ids.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `attachment` or `message_attachment_join` cannot be read.
+    pub fn attachments_by_message(
         &self,
-        page: &[Message],
+        message_rowids: &[i64],
     ) -> Result<HashMap<i64, Vec<AttachmentRef>>, DbError> {
-        let ids: Vec<Value> = page
+        if message_rowids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids: Vec<Value> = message_rowids
             .iter()
-            .map(|message| Value::Integer(message.rowid))
+            .take(MAX_PAGE)
+            .map(|rowid| Value::Integer(*rowid))
             .collect();
         let sql = format!(
             "SELECT k.message_id, a.ROWID, a.guid, a.filename, a.mime_type, a.uti, \

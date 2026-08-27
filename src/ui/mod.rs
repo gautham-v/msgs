@@ -9,6 +9,7 @@ pub mod chat_list;
 pub mod composer;
 pub mod conversation;
 pub mod db_error;
+pub mod format;
 pub mod help;
 pub mod palette;
 pub mod status;

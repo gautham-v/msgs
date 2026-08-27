@@ -63,7 +63,13 @@ file, msgs copies `chat.db` and its `-wal` / `-shm` sidecars to a scratch
 directory, reads the copy, and deletes the copy on exit.
 
 Conversations load a page at a time from the newest end, so opening a thread
-with 25,000 messages in it costs the same as opening a short one.
+with 25,000 messages in it costs the same as opening a short one. The chat list
+costs four queries however long it is, and only the rows on screen are drawn.
+
+Pinned conversations are shown as their own section when the database records
+pinning. macOS keeps that in Messages.app's preferences rather than in
+`chat.db`, so on every current system the list is one flat run of chats,
+newest first.
 
 ## Config
 
