@@ -107,6 +107,21 @@ pub const BINDINGS: &[Binding] = &[
         scope: "conversation",
     },
     Binding {
+        keys: "← →",
+        description: "choose a reaction",
+        scope: "react picker",
+    },
+    Binding {
+        keys: "1–6",
+        description: "send that reaction straight away",
+        scope: "react picker",
+    },
+    Binding {
+        keys: "Enter",
+        description: "send it, or take back one of yours",
+        scope: "react picker",
+    },
+    Binding {
         keys: "Ctrl+A",
         description: "attach a file",
         scope: "composer",
@@ -169,8 +184,26 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
     match focus {
         Focus::Help => help_keys(key),
         Focus::Palette => palette_keys(key, ctrl, alt, shift),
+        Focus::Reactions => reaction_keys(key),
         Focus::Composer => text_entry_keys(key, ctrl, alt, shift),
         Focus::ChatList | Focus::Conversation => navigation_keys(key, focus, shift),
+    }
+}
+
+/// The reaction picker is a one-row menu: the cursor moves along it, `Enter`
+/// sends what is under the cursor, and `1`–`6` do both at once.
+fn reaction_keys(key: KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => Some(Action::Cancel),
+        KeyCode::Enter | KeyCode::Char(' ') => Some(Action::Activate),
+        KeyCode::Left | KeyCode::Up | KeyCode::Char('h' | 'k') | KeyCode::BackTab => {
+            Some(Action::SelectPrev)
+        }
+        KeyCode::Right | KeyCode::Down | KeyCode::Char('l' | 'j') | KeyCode::Tab => {
+            Some(Action::SelectNext)
+        }
+        KeyCode::Char(c @ '1'..='6') => Some(Action::Insert(c)),
+        _ => None,
     }
 }
 
@@ -355,6 +388,36 @@ mod tests {
             Some(Action::OpenAttachment)
         );
         assert_eq!(resolve(key(KeyCode::Char('o')), Focus::ChatList), None);
+    }
+
+    #[test]
+    fn the_reaction_picker_is_a_menu_not_a_text_field() {
+        assert_eq!(
+            resolve(key(KeyCode::Right), Focus::Reactions),
+            Some(Action::SelectNext)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Char('h')), Focus::Reactions),
+            Some(Action::SelectPrev)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Enter), Focus::Reactions),
+            Some(Action::Activate)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Char('3')), Focus::Reactions),
+            Some(Action::Insert('3'))
+        );
+        // A letter that means nothing here types nothing.
+        assert_eq!(resolve(key(KeyCode::Char('z')), Focus::Reactions), None);
+        // Ctrl+R closes it again, the same key that opened it.
+        assert_eq!(
+            resolve(
+                with(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                Focus::Reactions
+            ),
+            Some(Action::React)
+        );
     }
 
     #[test]

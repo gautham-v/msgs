@@ -27,7 +27,8 @@ use msgs::app::{App, WatcherStatus};
 use msgs::config::Config;
 use msgs::contacts::Contacts;
 use msgs::db::{Db, Source};
-use msgs::{config, contacts, default_db_path, keymap, media, search, ui};
+use msgs::send::which;
+use msgs::{config, contacts, default_db_path, keymap, media, search, send, ui};
 
 /// How long the loop waits for input before waking up to expire toasts.
 const TICK: Duration = Duration::from_millis(250);
@@ -270,8 +271,8 @@ fn check(cli: &Cli, warnings: &[String]) -> Result<()> {
 
     row(
         "imsg",
-        &which("imsg").map_or_else(
-            || "not on PATH — tapbacks will be unavailable".to_string(),
+        &send::imsg_path().map_or_else(
+            || format!("not on PATH — no tapbacks; {}", send::IMSG_INSTALL),
             |path| path.display().to_string(),
         ),
     );
@@ -380,14 +381,6 @@ fn guessed_images() -> &'static str {
 
 fn row(label: &str, value: &str) {
     println!("  {label:<14} {value}");
-}
-
-/// First match for `name` on `$PATH`.
-fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]

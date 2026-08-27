@@ -20,7 +20,7 @@ use crate::contacts::Contacts;
 use crate::db::message::split_association;
 use crate::db::{AttachmentRef, Chat, GroupAction, Message, Tapback};
 use crate::media::{Images, NOT_DOWNLOADED};
-use crate::send::{Delivery, Pending};
+use crate::send::{Delivery, Pending, PendingTapback};
 use crate::theme::Theme;
 use crate::ui::format::{bytes, clock, day_label, find_links, single_line, truncate, width, wrap};
 
@@ -119,6 +119,10 @@ pub struct Ctx<'a> {
     /// Messages sent but not yet read back out of `chat.db`, so their blocks
     /// can say so.
     pub pending: &'a [Pending],
+    /// Reactions sent but not yet read back out of `chat.db`. They are laid
+    /// over the database's own reactions here rather than written into the
+    /// loaded page, so the page stays exactly what was read.
+    pub reactions: &'a [PendingTapback],
     /// The clock, passed in so day labels are testable.
     pub now: DateTime<Local>,
     /// What the terminal can draw pictures with, and how big they come out.
@@ -134,6 +138,34 @@ impl Ctx<'_> {
     #[must_use]
     pub fn is_group(&self) -> bool {
         self.chat.is_some_and(|chat| chat.is_group)
+    }
+
+    /// The reactions standing on `message`: what the database holds, plus the
+    /// ones just sent that it has not caught up with, minus the ones just
+    /// taken back.
+    ///
+    /// This is the only place the two are combined, so the height a block is
+    /// measured at and the chips it is drawn with come from one answer.
+    #[must_use]
+    pub fn tapbacks(&self, message: &Message) -> Vec<Tapback> {
+        let mut standing = message.tapbacks.clone();
+        for pending in self
+            .reactions
+            .iter()
+            .filter(|pending| pending.target_guid == message.guid)
+        {
+            let mine = standing
+                .iter()
+                .position(|tapback| tapback.is_from_me && tapback.kind == pending.kind);
+            match (pending.remove, mine) {
+                (true, Some(index)) => {
+                    standing.remove(index);
+                }
+                (false, None) => standing.push(pending.as_tapback()),
+                _ => {}
+            }
+        }
+        standing
     }
 
     /// The rail color for a message.
@@ -557,8 +589,9 @@ pub fn meta_text(message: &Message) -> String {
 /// A one-to-one chat has room to say who reacted; a group says how many did.
 #[must_use]
 pub fn tapback_chips(ctx: &Ctx<'_>, message: &Message) -> Vec<String> {
+    let standing = ctx.tapbacks(message);
     let mut kinds: Vec<(String, Vec<&Tapback>)> = Vec::new();
-    for tapback in &message.tapbacks {
+    for tapback in &standing {
         let glyph = tapback.kind.glyph().to_string();
         match kinds.iter_mut().find(|(seen, _)| *seen == glyph) {
             Some((_, group)) => group.push(tapback),
@@ -751,6 +784,7 @@ mod tests {
                 messages: &self.messages,
                 by_guid: &self.by_guid,
                 pending: &[],
+                reactions: &[],
                 now: now(),
                 images: &self.images,
                 contacts: &self.contacts,

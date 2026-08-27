@@ -91,6 +91,32 @@ impl Store {
     }
 
     /// An already-delivered message is edited in place.
+    /// A tapback of your own arrives on `target`, as Messages records it once
+    /// the reaction has been round-tripped through the service.
+    fn i_react(&self, rowid: i64, chat: i64, kind: i64, target: i64, at: i64) {
+        let conn = Connection::open(&self.db).expect("open the copy for writing");
+        conn.execute(
+            "INSERT INTO message (
+                 ROWID, guid, handle_id, service, is_from_me, is_read, date,
+                 associated_message_guid, associated_message_type
+             ) VALUES (?1, ?2, 0, 'iMessage', 1, 1, ?3, ?4, ?5)",
+            rusqlite::params![
+                rowid,
+                fixtures::guid(rowid),
+                at,
+                format!("p:0/{}", fixtures::guid(target)),
+                kind,
+            ],
+        )
+        .expect("insert my tapback");
+        conn.execute(
+            "INSERT INTO chat_message_join (chat_id, message_id, message_date)
+             VALUES (?1, ?2, ?3)",
+            (chat, rowid, at),
+        )
+        .expect("join my tapback to its chat");
+    }
+
     fn edits(&self, rowid: i64, body: &str, at: i64) {
         let conn = Connection::open(&self.db).expect("open the copy for writing");
         conn.execute(
@@ -337,6 +363,57 @@ fn a_tapback_lands_on_the_block_it_belongs_to() {
         .find(|message| message.rowid == target)
         .expect("the reacted-to message is still loaded");
     assert_eq!(reacted.tapbacks.len(), 1);
+}
+
+#[test]
+fn an_optimistic_chip_retires_into_the_row_the_database_brings() {
+    let store = Store::new("own-tapback");
+    let mut app = app_on(&store);
+    app.outbox = msgs::send::Outbox::inert();
+    let target = fixtures::MSG_UNREAD;
+    let row = app
+        .message_rows
+        .iter()
+        .position(|message| message.rowid == target)
+        .expect("the target is loaded");
+    app.update(Action::FocusPane(msgs::app::Focus::Conversation));
+    app.messages.selected = row;
+
+    // React: the chip goes up before anything is on the wire.
+    app.update(Action::React);
+    app.update(Action::Activate);
+    assert_eq!(app.pending_tapbacks.len(), 1);
+    assert_eq!(
+        app.outbox.recorded().len(),
+        1,
+        "one imsg call was asked for"
+    );
+    assert!(
+        app.message_rows[row].tapbacks.is_empty(),
+        "the loaded page is still the database's own answer"
+    );
+    frame(&mut app, 100, 30);
+
+    // Messages round-trips it and the row lands in `chat.db`.
+    store.i_react(
+        501,
+        fixtures::CHAT_DIRECT,
+        2000,
+        target,
+        fixtures::BASE + 901 * fixtures::SECOND,
+    );
+    assert!(app.on_db_change());
+    assert!(
+        app.pending_tapbacks.is_empty(),
+        "the optimistic chip has nothing left to stand for"
+    );
+    let reacted = app
+        .message_rows
+        .iter()
+        .find(|message| message.rowid == target)
+        .expect("the target is still loaded");
+    assert_eq!(reacted.tapbacks.len(), 1);
+    assert!(reacted.tapbacks[0].is_from_me);
 }
 
 #[test]

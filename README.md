@@ -15,7 +15,7 @@ Early. See the GitHub issues for the build plan.
 - macOS 14+
 - Full Disk Access for your terminal (System Settings → Privacy & Security → Full Disk Access) so `chat.db` and your Contacts can be read — without it msgs starts and explains what to do instead of failing
 - Messages.app signed in (it is launched hidden in the background when you send; reading never needs it open)
-- Optional: [`imsg`](https://github.com/openclaw/imsg) on `$PATH` for sending tapback reactions
+- Optional: [`imsg`](https://github.com/steipete/imsg) on `$PATH` (`brew install steipete/tap/imsg`) for sending tapback reactions
 
 ## Run
 
@@ -52,7 +52,7 @@ Flags:
 | `/` (chat list) | filter the chat list by name |
 | `o` / `s` | open / save selected attachment |
 | `r` | quote the selected message in a reply |
-| `Ctrl+R` | react to selected message |
+| `Ctrl+R` | react to selected message (`←→` choose, `1`–`6` straight to one, `Enter` send) |
 | `y` | copy selected message |
 | `Ctrl+L` | open the first link in the selected message |
 | `Ctrl+A` | attach a file to the open conversation |
@@ -225,6 +225,37 @@ marked `· Failed` with the reason, and the text goes back in the composer.
 
 `Ctrl+A` asks for a path — `~` is expanded — and sends that file to the open
 conversation.
+
+## Reactions
+
+`Ctrl+R` on the selected message opens a small picker: ❤️ 👍 👎 😂 ‼️ ❓. `←` and
+`→` move along it, `1` through `6` go straight to one and send it, and `Enter`
+sends whatever the cursor is on. A reaction you have already given
+is drawn in the accent color and the picker starts on it, because pressing
+`Enter` there takes it back, which is what tapping it again does in Messages.
+
+`chat.db` is read-only and Messages will not take a tapback from AppleScript, so
+reactions go out through [`imsg`](https://github.com/steipete/imsg), which has
+two routes and msgs tries both. `imsg tapback` reaches any message by its own
+GUID, which is the one msgs wants — but it needs a bridge injected into
+Messages.app, and macOS will not load that while System Integrity Protection is
+on. `imsg react` drives Messages' own UI instead, which works on a stock Mac but
+can only reach the newest incoming message of a conversation, so msgs only falls
+back to it for exactly that message. Taking a reaction back is something only
+the bridge can do.
+
+The chip goes under the message the moment you choose it, marked as yours, and
+the loaded page is left exactly as `chat.db` handed it over — the optimistic
+chip is drawn over the page rather than written into it. When the real row
+arrives on the next live update the chip retires into it without moving, and if
+`imsg` refuses, the chip comes back down and the status line says so. A reaction
+that the database has still not confirmed twenty seconds later is dropped, so
+what is on screen is the database's own answer rather than a guess.
+
+Without `imsg` on `$PATH` the picker still opens and says
+`brew install steipete/tap/imsg`; nothing is sent and no chip goes up.
+Reactions with an arbitrary emoji are read and drawn but cannot be sent —
+neither `imsg` route will put one on the wire.
 
 ## Config
 

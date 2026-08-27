@@ -13,6 +13,7 @@ pub mod format;
 pub mod help;
 pub mod message;
 pub mod palette;
+pub mod reactions;
 pub mod status;
 
 use std::path::Path;
@@ -178,6 +179,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         match app.focus {
             Focus::Palette => palette::render(frame, app, area),
             Focus::Help => help::render(frame, app, area),
+            Focus::Reactions => reactions::render(frame, app, area),
             _ => {}
         }
         return;
@@ -208,6 +210,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.focus {
         Focus::Palette => palette::render(frame, app, area),
         Focus::Help => help::render(frame, app, area),
+        Focus::Reactions => reactions::render(frame, app, area),
         _ => {}
     }
 }

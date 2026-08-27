@@ -10,10 +10,10 @@ Rust + ratatui terminal client for iMessage on macOS.
 - `src/theme.rs` — named color slots (mockup palette), overridable per slot from config
 - `src/keymap.rs` — focus-sensitive key → `Action`; `BINDINGS` also feeds the help modal and shortcuts bar
 - `src/db/` — read-only access to `chat.db` (rusqlite + `imessage-database` for typedstream parsing)
-- `src/ui/` — ratatui widgets: chat list, conversation, composer, palette, help; `ui::compute`, `chat_list::Shape`, `conversation::Scroll`, and `ui::message::block` are pure layout functions with tests, and `ui::format` holds the string helpers (relative times, previews, wrapping, truncation)
+- `src/ui/` — ratatui widgets: chat list, conversation, composer, palette, help, reactions; `ui::compute`, `chat_list::Shape`, `conversation::Scroll`, and `ui::message::block` are pure layout functions with tests, and `ui::format` holds the string helpers (relative times, previews, wrapping, truncation)
 - `src/media.rs` — attachments as pictures: `fit` (pure cell arithmetic), `Images` (the measure/encode cache, `ratatui-image` under it), HEIC through `sips` into `~/Library/Caches/msgs/attachments`, and `s` copying a file to `~/Downloads`
 - `src/shell.rs` — the clipboard (`pbcopy`, then OSC 52), the browser, and `open` for an attachment; the only things msgs asks the rest of the machine to do
-- `src/send.rs` — outbound messages via `osascript` → Messages.app; tapbacks via `imsg`
+- `src/send.rs` — outbound messages via `osascript` → Messages.app; tapbacks via `imsg` (`tapback` by message GUID first, `react` by chat rowid as the SIP-on fallback), plus `Pending` / `PendingTapback`, the optimistic echoes
 - `src/watch.rs` — live updates: `notify` on the directory `chat.db` lives in, debounced, with a 2s timer as the fallback; `App::on_db_change` does the re-reading
 - `src/search.rs` — the FTS5 message index at `~/Library/Application Support/msgs/index.db` (never inside chat.db): a worker thread builds it, tops it up from the live-update stream by `ROWID`, and answers `MATCH` queries
 - `src/contacts.rs` — names for handles: the macOS AddressBook stores read read-only, normalized phone/email keys, and the stamped cache at `~/Library/Application Support/msgs/contacts.json`; `Contacts::apply` hangs a `Name` on every `Handle`, which is how names reach every pane at once
@@ -26,4 +26,5 @@ Rust + ratatui terminal client for iMessage on macOS.
 - A person is named in one place: `Contacts::apply` fills `Handle::name`, and every pane reads `Handle::display_name` / `Handle::short_name`. Do not resolve a name inside a widget.
 - `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` must pass before a commit.
 - Keep the UI calm: no feature creep beyond the mockups.
+- An optimistic chip is drawn over the loaded page, never written into it: `App::pending_tapbacks` reaches the blocks through `ui::message::Ctx::tapbacks`, so `App::message_rows` stays exactly what `chat.db` handed over and reconciling is a comparison rather than an undo.
 - A block's height and its drawing must come from one number. `ui::message::block` reserves rows for a picture from `Images::cells`, and `Images::render` draws into exactly those rows; never let the two compute a size separately.
