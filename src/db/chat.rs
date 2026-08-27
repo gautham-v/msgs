@@ -51,7 +51,7 @@ impl Preview {
 }
 
 /// One conversation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Chat {
     /// `chat.ROWID`, the id everything else joins against.
     pub rowid: i64,
@@ -80,7 +80,18 @@ pub struct Chat {
     pub message_count: i64,
     /// Incoming messages Messages has not marked read. Group events such as
     /// renames and joins are not messages and do not count.
+    ///
+    /// This is the database's own answer and is never adjusted; what msgs draws
+    /// is [`Chat::unread`].
     pub unread_count: i64,
+    /// What msgs shows as unread: [`Chat::unread_count`] less whatever the
+    /// local read state has already put in front of you.
+    ///
+    /// Equal to [`Chat::unread_count`] as the row leaves the database;
+    /// [`crate::seen::Seen::apply`] is the one place it moves, the way
+    /// [`crate::contacts::Contacts::apply`] is the one place a name is
+    /// attached.
+    pub unread: i64,
     /// Whether the chat is pinned, when the schema records that at all.
     ///
     /// macOS keeps pinned conversations in Messages.app's preferences rather
@@ -95,10 +106,10 @@ impl Chat {
         local_time(self.last_message_date)
     }
 
-    /// Whether anything in the chat is unread.
+    /// Whether msgs should draw the chat as unread.
     #[must_use]
     pub const fn is_unread(&self) -> bool {
-        self.unread_count > 0
+        self.unread > 0
     }
 
     /// Whether the chat sits in the pinned section of the list.
@@ -200,6 +211,7 @@ impl Db {
         let mut statement = self.conn().prepare(&sql)?;
         let rows = statement.query_map([], |row| {
             let style: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or_default();
+            let unread_count: i64 = row.get::<_, Option<i64>>(10)?.unwrap_or_default();
             Ok(Chat {
                 rowid: row.get(0)?,
                 guid: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -214,7 +226,10 @@ impl Db {
                 last_message_rowid: row.get::<_, Option<i64>>(8)?.unwrap_or_default(),
                 preview: None,
                 message_count: row.get::<_, Option<i64>>(9)?.unwrap_or_default(),
-                unread_count: row.get::<_, Option<i64>>(10)?.unwrap_or_default(),
+                unread_count,
+                // The local read state has not been over the row yet, so what
+                // msgs would draw is what the database said.
+                unread: unread_count,
             })
         })?;
 
@@ -393,6 +408,7 @@ mod tests {
             preview: None,
             message_count: 0,
             unread_count: 0,
+            unread: 0,
             is_pinned: None,
         }
     }
@@ -461,10 +477,14 @@ mod tests {
     }
 
     #[test]
-    fn unread_is_a_predicate_not_just_a_number() {
+    fn unread_is_a_predicate_over_what_msgs_draws() {
         let mut chat = chat(4);
         assert!(!chat.is_unread());
+        // The database's own count is not the one the dot is drawn from: the
+        // local read state can have cleared it.
         chat.unread_count = 2;
+        assert!(!chat.is_unread());
+        chat.unread = 2;
         assert!(chat.is_unread());
     }
 }

@@ -30,7 +30,7 @@ Flags:
 | `--db <PATH>` | read this database instead of `~/Library/Messages/chat.db` |
 | `--config <PATH>` | read this config file instead of the default |
 | `--no-mouse` | do not capture the mouse |
-| `--check` | print a readiness report (database, row counts, live updates, Messages.app, `osascript`, `imsg`, search index, contacts) and exit |
+| `--check` | print a readiness report (database, row counts, unread, read state, live updates, Messages.app, `osascript`, `imsg`, search index, contacts) and exit |
 | `--no-index` | do not build or use the full-text message index |
 | `--no-images` | do not draw pictures inline; show every attachment as a chip |
 | `--no-contacts` | do not read Contacts; show numbers and addresses instead of names |
@@ -49,6 +49,7 @@ Flags:
 | `Tab` (palette) | cycle the filter: all / chats / messages / photos |
 | `Ctrl+N` (palette) | start a new message to a typed number or address |
 | `Ctrl+B` | toggle chat list |
+| `Ctrl+U` | mark everything seen here, or give the unread back |
 | `/` (chat list) | filter the chat list by name |
 | `o` / `s` | open / save selected attachment |
 | `r` | quote the selected message in a reply |
@@ -106,9 +107,11 @@ on screen are drawn.
 A conversation is drawn as blocks: a colored rail per sender — blue for you,
 green for the other person, and a color per participant in a group, assigned in
 `handle.ROWID` order so it follows a person for the life of the thread — a body
-wrapped to the pane, and a meta line with the time, `Delivered` / `Read`, and
-any tapbacks. Replies quote what they answer, group events (renames, joins,
-leaves) are dim italic lines without a rail, and days are separated by a header
+wrapped to the pane, and a meta line with the time and any tapbacks. The newest
+message you sent carries `Delivered` or `Read 18:05` after its clock and the
+older ones do not, which is where Messages.app puts the receipt too. Replies
+quote what they answer, group events (renames, joins, leaves) are dim italic
+lines without a rail, and days are separated by a header
 that sticks to the top edge as it scrolls. Because block heights are measured
 once per page rather than once per frame, only the blocks actually on screen are
 laid out, and a 25,000-message thread scrolls at the same speed as a short one.
@@ -174,6 +177,30 @@ Pinned conversations are shown as their own section when the database records
 pinning. macOS keeps that in Messages.app's preferences rather than in
 `chat.db`, so on every current system the list is one flat run of chats,
 newest first.
+
+## Read state
+
+The chat list draws an unread dot, a bold name, and a count on any chat with
+incoming messages Messages has not marked read, and the status line adds them
+up: `3 unread in 2 chats`.
+
+Opening a chat in msgs clears that badge — but only msgs's. `chat.db` is
+read-only and Messages.app's read flags and Dock badge are its own; there is no
+supported way to clear either from outside that app, and msgs does not try. What
+it keeps instead is a small state of its own at
+`~/Library/Application Support/msgs/seen.json`, `0600` inside a `0700`
+directory: for every chat, how many unread messages were already on screen here.
+The badge is the database's count less that number, never below zero, so opening
+a thread takes it to nothing, the next message to arrive brings it back showing
+exactly the new ones, and reading the thread on your phone — which drops the
+database's own count — lowers the stored number with it rather than swallowing
+what comes next.
+
+`Ctrl+U` marks every chat seen; pressing it again hands the unread straight back.
+The state survives a restart, holds nothing but chat row numbers and counts — no
+names, numbers, or message text — and records which database it was built from,
+so `--db` pointed at a copy starts fresh instead of reading someone else's row
+numbers as if they were this one's.
 
 ## Search
 

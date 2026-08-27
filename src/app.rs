@@ -18,6 +18,7 @@ use crate::db::{AttachmentRef, Chat, Db, DbError, MAX_PAGE, Message, PAGE, Sourc
 use crate::jump::{self, Jump};
 use crate::media::{self, Images};
 use crate::search::{self, Search};
+use crate::seen::Seen;
 use crate::send::{
     self, Delivery, Outbox, Outgoing, Pending, PendingTapback, REACTIONS, ReactFallback, Reaction,
     SendError, Service, Target,
@@ -138,6 +139,8 @@ pub enum Action {
     CopySelection,
     /// Open the first link in the selected message in the browser.
     OpenLink,
+    /// `Ctrl+U`: mark every chat seen here, or give the unread back.
+    ToggleAllSeen,
     /// Attach a file to the message being composed.
     Attach,
     /// Type a character into whatever text field has focus.
@@ -628,6 +631,10 @@ pub struct App {
     /// Names for handles. [`Contacts::empty`] until something reads the macOS
     /// Contacts stores, which is how the tests run.
     pub contacts: Contacts,
+    /// The local read state: how much of each chat's unread has already been
+    /// on screen here. [`Seen::off`] until something asks for it, which is how
+    /// the tests run and what keeps them out of the user's home.
+    pub seen: Seen,
 }
 
 impl App {
@@ -691,6 +698,7 @@ impl App {
             last_snapshot: None,
             images: Images::off(),
             contacts: Contacts::empty(),
+            seen: Seen::off(),
         }
     }
 
@@ -777,6 +785,86 @@ impl App {
         self.measured.stale = true;
     }
 
+    /// Start keeping local read state at `path`.
+    ///
+    /// Off until something asks for it, which is how the tests run: nothing
+    /// under `tests/` writes a read state into the user's home. Enabling it
+    /// after the database is open marks whatever conversation is already on
+    /// screen as seen, because it is.
+    pub fn enable_seen(&mut self, path: &std::path::Path) {
+        let Some(db_path) = self.db_path.clone() else {
+            return;
+        };
+        self.seen = Seen::load(path, &db_path);
+        self.apply_seen();
+        self.mark_open_seen();
+    }
+
+    /// Lay the local read state over the chat rows and re-total the status
+    /// line.
+    ///
+    /// The one place [`Chat::unread`] and the status-line totals are set, so
+    /// the badge in the list, the dot beside it, and the count on the status
+    /// line can never disagree.
+    fn apply_seen(&mut self) {
+        self.seen.apply(&mut self.chat_rows);
+        self.seen.save();
+        self.status.unread_total = self
+            .chat_rows
+            .iter()
+            .map(|chat| usize::try_from(chat.unread).unwrap_or(0))
+            .sum();
+        self.status.unread_chats = self
+            .chat_rows
+            .iter()
+            .filter(|chat| chat.is_unread())
+            .count();
+    }
+
+    /// Record that the open conversation has been read here.
+    ///
+    /// Messages.app's own flags and its Dock badge are untouched: `chat.db` is
+    /// read-only and there is no supported way to clear either from outside
+    /// that app. Only msgs's own indicator moves.
+    fn mark_open_seen(&mut self) {
+        let Some(rowid) = self.open_chat else {
+            return;
+        };
+        let Some(unread) = self
+            .chat_rows
+            .iter()
+            .find(|chat| chat.rowid == rowid)
+            .map(|chat| chat.unread_count)
+        else {
+            return;
+        };
+        if self.seen.mark(rowid, unread) {
+            self.apply_seen();
+        }
+    }
+
+    /// `Ctrl+U`: mark every chat seen here, or hand the unread back.
+    ///
+    /// Both halves are local. Messages.app keeps its own count either way, and
+    /// its badge is not something msgs can clear.
+    fn toggle_all_seen(&mut self) {
+        if !self.seen.is_on() {
+            self.status.toast("read state is off");
+            return;
+        }
+        if self.chat_rows.iter().any(Chat::is_unread) {
+            self.seen.mark_all(&self.chat_rows);
+            self.apply_seen();
+            self.status
+                .toast("marked all seen here — Messages.app keeps its own badge");
+        } else if self.seen.forget_all() {
+            self.apply_seen();
+            self.status.toast("unread restored from Messages");
+        } else {
+            self.status.toast("nothing unread");
+        }
+    }
+
     /// Take the terminal's picture-drawing ability, once it has been asked.
     ///
     /// Until this is called nothing is drawn inline and every attachment is a
@@ -809,12 +897,11 @@ impl App {
                 // The one place names enter the app: every pane reads them off
                 // the participants.
                 self.contacts.apply(&mut chats);
-                self.status.unread_total = chats
-                    .iter()
-                    .map(|chat| usize::try_from(chat.unread_count).unwrap_or(0))
-                    .sum();
-                self.status.unread_chats = chats.iter().filter(|chat| chat.is_unread()).count();
                 self.chat_rows = chats;
+                // The local read state is laid over the database's counts the
+                // same way names are laid over the handles: once, here, so
+                // every pane and the status line read one number.
+                self.apply_seen();
             }
             Err(err) => {
                 self.status.error(format!("chat list: {}", err.summary()));
@@ -1006,6 +1093,8 @@ impl App {
         // height; the next frame has one.
         self.messages.to_bottom();
         self.pending_bottom = true;
+        // Reading a conversation here is what clears its badge here.
+        self.mark_open_seen();
     }
 
     /// The message under the conversation selection.
@@ -1526,6 +1615,9 @@ impl App {
             // preview and unread badge change with it.
             self.reload_chats();
         }
+        // Whatever arrived in the thread you are looking at is on screen, so
+        // it does not come back as a badge on the chat you are already in.
+        self.mark_open_seen();
         self.status.last_update = Some(Instant::now());
         true
     }
@@ -1681,6 +1773,7 @@ impl App {
             Action::React => self.toggle_reactions(),
             Action::CopySelection => self.copy_selection(),
             Action::OpenLink => self.open_selected_link(),
+            Action::ToggleAllSeen => self.toggle_all_seen(),
         }
         // Every path out of an action ends here, so a filter keystroke, an
         // arrow key, and a click all leave the chat list in the same state.
@@ -2914,6 +3007,7 @@ mod tests {
             preview: None,
             message_count: 0,
             unread_count: 0,
+            unread: 0,
             is_pinned: None,
         }];
         app.refresh_chat_view();

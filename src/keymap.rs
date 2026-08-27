@@ -57,6 +57,11 @@ pub const BINDINGS: &[Binding] = &[
         scope: "global",
     },
     Binding {
+        keys: "Ctrl+U",
+        description: "mark everything seen here, or give the unread back",
+        scope: "list",
+    },
+    Binding {
         keys: "/",
         description: "filter chats by name",
         scope: "chat list",
@@ -186,7 +191,7 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         Focus::Palette => palette_keys(key, ctrl, alt, shift),
         Focus::Reactions => reaction_keys(key),
         Focus::Composer => text_entry_keys(key, ctrl, alt, shift),
-        Focus::ChatList | Focus::Conversation => navigation_keys(key, focus, shift),
+        Focus::ChatList | Focus::Conversation => navigation_keys(key, focus, ctrl, shift),
     }
 }
 
@@ -266,7 +271,12 @@ fn text_entry_keys(key: KeyEvent, ctrl: bool, alt: bool, shift: bool) -> Option<
     }
 }
 
-fn navigation_keys(key: KeyEvent, focus: Focus, shift: bool) -> Option<Action> {
+fn navigation_keys(key: KeyEvent, focus: Focus, ctrl: bool, shift: bool) -> Option<Action> {
+    // `Ctrl+U` is only the read-state toggle out here; in a text field it is
+    // still the line the shell would clear.
+    if ctrl && key.code == KeyCode::Char('u') {
+        return Some(Action::ToggleAllSeen);
+    }
     match key.code {
         KeyCode::Tab => Some(Action::FocusNext),
         KeyCode::BackTab => Some(Action::FocusPrev),
@@ -329,6 +339,24 @@ mod tests {
             resolve(key(KeyCode::Char('q')), Focus::Composer),
             Some(Action::Insert('q'))
         );
+    }
+
+    #[test]
+    fn ctrl_u_toggles_read_state_in_the_lists_and_clears_the_line_in_a_field() {
+        for focus in [Focus::ChatList, Focus::Conversation] {
+            assert_eq!(
+                resolve(with(KeyCode::Char('u'), KeyModifiers::CONTROL), focus),
+                Some(Action::ToggleAllSeen),
+                "focus {focus:?}"
+            );
+        }
+        for focus in [Focus::Composer, Focus::Palette] {
+            assert_eq!(
+                resolve(with(KeyCode::Char('u'), KeyModifiers::CONTROL), focus),
+                Some(Action::ClearLine),
+                "focus {focus:?}"
+            );
+        }
     }
 
     #[test]

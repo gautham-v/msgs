@@ -140,6 +140,18 @@ impl Ctx<'_> {
         self.chat.is_some_and(|chat| chat.is_group)
     }
 
+    /// Whether the message at `index` is the newest one you sent.
+    ///
+    /// Only that one carries a `Delivered` / `Read` stamp, which is where
+    /// Messages.app puts it: a receipt for the last thing you said, not a
+    /// column of them down the thread. A page is only ever extended upwards, so
+    /// the newest of yours is still the last of yours after scrolling back.
+    #[must_use]
+    pub fn is_latest_mine(&self, index: usize) -> bool {
+        let mine = |message: &Message| message.is_from_me && !message.is_announcement();
+        self.messages.get(index).is_some_and(mine) && !self.messages[index + 1..].iter().any(mine)
+    }
+
     /// The reactions standing on `message`: what the database holds, plus the
     /// ones just sent that it has not caught up with, minus the ones just
     /// taken back.
@@ -368,7 +380,13 @@ pub fn block(ctx: &Ctx<'_>, index: usize, columns: u16) -> Block {
     }
 
     let note = first_inline.map(|attachment| inline_note(attachment, images.len()));
-    lines.extend(meta_lines(ctx, message, room, note.as_deref()));
+    lines.extend(meta_lines(
+        ctx,
+        message,
+        room,
+        note.as_deref(),
+        ctx.is_latest_mine(index),
+    ));
 
     Block {
         day,
@@ -524,11 +542,12 @@ fn meta_lines(
     message: &Message,
     room: usize,
     note: Option<&str>,
+    stamp: bool,
 ) -> Vec<Line<'static>> {
     let theme = ctx.theme;
     let meta = match note {
-        Some(note) => format!("{} · {note}", meta_text(message)),
-        None => meta_text(message),
+        Some(note) => format!("{} · {note}", meta_text(message, stamp)),
+        None => meta_text(message, stamp),
     };
     let chips = tapback_chips(ctx, message);
 
@@ -569,10 +588,14 @@ fn meta_lines(
 }
 
 /// `18:02`, `18:06 · Delivered`, `18:02 · Read 18:05`.
+///
+/// `stamp` says whether this message is the one the receipt belongs under —
+/// [`Ctx::is_latest_mine`] — so an older message of yours is just its clock,
+/// the way Messages.app draws it.
 #[must_use]
-pub fn meta_text(message: &Message) -> String {
+pub fn meta_text(message: &Message, stamp: bool) -> String {
     let sent = message.sent_at().map(clock).unwrap_or_default();
-    if !message.is_from_me {
+    if !message.is_from_me || !stamp {
         return sent;
     }
     if let Some(read) = message.read_at() {
@@ -747,6 +770,7 @@ mod tests {
             preview: None,
             message_count: 0,
             unread_count: 0,
+            unread: 0,
             is_pinned: None,
         }
     }
@@ -874,19 +898,50 @@ mod tests {
     #[test]
     fn delivery_stamps_only_appear_on_your_own_messages() {
         let mut mine = message(1, true, "sent");
-        assert_eq!(meta_text(&mine), "18:20", "no stamp before delivery");
+        assert_eq!(meta_text(&mine, true), "18:20", "no stamp before delivery");
 
         mine.date_delivered = stamp(9);
-        assert_eq!(meta_text(&mine), "18:20 · Delivered");
+        assert_eq!(meta_text(&mine, true), "18:20 · Delivered");
 
         mine.date_read = stamp(8);
-        assert_eq!(meta_text(&mine), "18:20 · Read 18:22");
+        assert_eq!(meta_text(&mine, true), "18:20 · Read 18:22");
 
         // Incoming messages never carry a stamp, even when the column is set.
         let mut theirs = message(2, false, "got it");
         theirs.date_delivered = stamp(9);
         theirs.date_read = stamp(8);
-        assert_eq!(meta_text(&theirs), "18:20");
+        assert_eq!(meta_text(&theirs, true), "18:20");
+    }
+
+    #[test]
+    fn only_the_newest_message_you_sent_carries_the_stamp() {
+        let stamped = |rowid: i64, text: &str| {
+            let mut message = message(rowid, true, text);
+            message.date_delivered = stamp(9);
+            message.date_read = stamp(8);
+            message
+        };
+        let fixture = Fixture::new(
+            false,
+            vec![stamped(1, "first"), stamped(2, "second"), {
+                let mut theirs = message(3, false, "got it");
+                theirs.date_read = stamp(7);
+                theirs
+            }],
+        );
+        let ctx = fixture.ctx();
+
+        assert!(!ctx.is_latest_mine(0));
+        assert!(ctx.is_latest_mine(1), "the last one you sent");
+        assert!(!ctx.is_latest_mine(2), "not one of yours");
+
+        let meta = |index: usize| {
+            let block = block(&ctx, index, 60);
+            text_of(block.lines.last().expect("a meta line"))
+        };
+        assert!(!meta(0).contains("Read"), "the older one is just its clock");
+        assert!(meta(1).contains("· Read"), "the newest of yours is stamped");
+        assert!(!meta(2).contains("Read"));
     }
 
     #[test]

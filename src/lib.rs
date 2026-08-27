@@ -13,6 +13,7 @@
 //! - [`keymap`] — keys to actions, and the table the help modal renders
 //! - [`media`] — inline pictures, and the files behind the attachment chips
 //! - [`search`] — the FTS5 message index msgs keeps of its own
+//! - [`seen`] — the local read state, kept beside `chat.db` rather than in it
 //! - [`send`] — outbound messages, through Messages.app
 //! - [`shell`] — the clipboard and the browser, the only two things msgs asks
 //!   the rest of the machine to do
@@ -31,6 +32,7 @@ pub mod jump;
 pub mod keymap;
 pub mod media;
 pub mod search;
+pub mod seen;
 pub mod send;
 pub mod shell;
 pub mod theme;
@@ -55,7 +57,8 @@ pub fn default_db_path() -> PathBuf {
 /// person it belongs to.
 ///
 /// The search index holds message bodies and the contacts cache holds names and
-/// numbers, so both are written `0600` inside a `0700` directory.
+/// numbers, so both are written `0600` inside a `0700` directory, and the read
+/// state that sits beside them goes the same way.
 #[cfg(unix)]
 pub(crate) fn private(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;

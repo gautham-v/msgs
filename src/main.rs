@@ -27,6 +27,7 @@ use msgs::app::{App, WatcherStatus};
 use msgs::config::Config;
 use msgs::contacts::Contacts;
 use msgs::db::{Db, Source};
+use msgs::seen::Seen;
 use msgs::send::which;
 use msgs::{config, contacts, default_db_path, keymap, media, search, send, ui};
 
@@ -87,6 +88,12 @@ fn main() -> Result<()> {
     // the status line and shows numbers.
     if !cli.no_contacts && app.config.contacts {
         app.enable_contacts(Contacts::load());
+    }
+
+    // Which chats msgs itself has already put in front of you. Its own small
+    // file beside the index; `chat.db` and Messages.app's badge are untouched.
+    if let Some(path) = Seen::default_path() {
+        app.enable_seen(&path);
     }
 
     // The message index is msgs's own file, never `chat.db`. Building it runs
@@ -222,6 +229,21 @@ fn check(cli: &Cli, warnings: &[String]) -> Result<()> {
             match db.unread_totals() {
                 Ok((total, chats)) => row("unread", &format!("{total} in {chats} chats")),
                 Err(err) => row("unread", &format!("unavailable — {}", err.summary())),
+            }
+            // Counts only; the file holds chat row numbers and nothing else.
+            match Seen::default_path() {
+                Some(state) => {
+                    let seen = Seen::load(&state, &path);
+                    row(
+                        "read state",
+                        &format!(
+                            "{} — {} chats marked seen here (Messages.app's own badge is its own)",
+                            state.display(),
+                            seen.marked()
+                        ),
+                    );
+                }
+                None => row("read state", "unavailable — no home directory"),
             }
         }
         Err(err) => {

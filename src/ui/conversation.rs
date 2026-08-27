@@ -720,6 +720,7 @@ mod tests {
             preview: None,
             message_count: 1204,
             unread_count: 0,
+            unread: 0,
             is_pinned: None,
         };
         assert_eq!(counts(&chat, 38), "1,204 msgs · 38 photos ");

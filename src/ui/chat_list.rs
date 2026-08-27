@@ -259,7 +259,7 @@ fn name_line<'a>(
         .last_message_at()
         .map(|when| relative_time(now, when))
         .unwrap_or_default();
-    let badge = unread_badge(chat.unread_count);
+    let badge = unread_badge(chat.unread);
 
     // The name gives up columns to the time and the badge, but never all of
     // them: below a floor the badge goes first, then the time.

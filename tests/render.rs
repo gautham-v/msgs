@@ -304,6 +304,7 @@ fn chat(rowid: i64, name: &str, minutes_ago: i64, preview: &str) -> Chat {
         }),
         message_count: 12,
         unread_count: 0,
+        unread: 0,
         is_pinned: None,
     }
 }
@@ -324,6 +325,7 @@ fn cell(buffer: &Buffer, x: u16, y: u16) -> ratatui::buffer::Cell {
 fn chat_rows_carry_a_name_a_preview_a_time_and_an_unread_badge() {
     let mut first = chat(1, "Alpha Person", 2, "sounds good, see you at 7");
     first.unread_count = 2;
+    first.unread = 2;
     let mut app = with_chats(vec![
         first,
         chat(2, "Bravo Group", 61, "the second one"),
@@ -592,8 +594,13 @@ fn a_conversation_draws_blocks_a_day_header_and_meta_lines() {
     let buffer = frame(&mut app, 120, 34);
 
     assert!(contains(&buffer, "dinner tonight"), "a body");
-    assert!(contains(&buffer, "· Read "), "a read stamp");
     assert!(contains(&buffer, "· Delivered"), "a delivery stamp");
+    // The receipt goes under the last thing you said and nowhere else, so the
+    // older message's read stamp is not drawn.
+    assert!(
+        !contains(&buffer, "· Read "),
+        "one stamp, on the newest of yours"
+    );
     assert!(contains(&buffer, "Today"), "the day header");
     assert!(!contains(&buffer, "no messages yet"));
 }
