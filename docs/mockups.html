@@ -1,0 +1,256 @@
+<title>Msgs, an iMessage TUI</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --bg: #f2f3f5; --fg: #1e2024; --muted: #676a72; --rule: #d9dbe0; --card: #ffffff; --accent: #2f7fd6;
+    --t-base: #121214; --t-light: #1a1a1e; --t-dark: #0c0c0e; --t-hl: #232329; --t-hover: #1f1f25;
+    --t-text: #e4e4e7; --t-text2: #a1a1aa; --t-gray: #52525b; --t-graydim: #3a3a40;
+    --t-me: #5ea8ff; --t-them: #7ec699; --t-p2: #e5b567; --t-p3: #d17be0; --t-sys: #8a8a94;
+    --t-err: #e06c75; --t-fuzzy: #9dd0ff; --t-border: #2c2c33; --t-border-active: #5ea8ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #0e0e10; --fg: #e6e5e8; --muted: #9c9aa2; --rule: #2a2a30; --card: #17171a; --accent: #5ea8ff; }
+  }
+  :root[data-theme="dark"] { --bg: #0e0e10; --fg: #e6e5e8; --muted: #9c9aa2; --rule: #2a2a30; --card: #17171a; --accent: #5ea8ff; }
+
+  body { background: var(--bg); color: var(--fg); font-family: "IBM Plex Sans", system-ui, sans-serif; line-height: 1.5; margin: 0; }
+  main { max-width: 1040px; margin: 0 auto; padding: 48px 24px 96px; display: flex; flex-direction: column; gap: 60px; }
+  header h1 { font-family: "IBM Plex Mono", ui-monospace, monospace; font-weight: 600; font-size: 1.9rem; margin: 0 0 8px; letter-spacing: -0.01em; }
+  header p, section > p { max-width: 66ch; color: var(--muted); margin: 0; }
+  section { display: flex; flex-direction: column; gap: 16px; }
+  .eyebrow { font-family: "IBM Plex Mono", monospace; font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+  h2 { font-size: 1.3rem; margin: 0; text-wrap: balance; }
+  kbd { font-family: "IBM Plex Mono", monospace; font-size: 0.8em; background: var(--bg); border: 1px solid var(--rule); border-radius: 3px; padding: 0 5px; }
+  code { font-family: "IBM Plex Mono", monospace; font-size: 0.9em; }
+
+  .term { background: var(--t-base); color: var(--t-text); border-radius: 6px; border: 1px solid var(--t-border); overflow-x: auto; box-shadow: 0 12px 32px rgba(0,0,0,.28); font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 13px; line-height: 1.45; }
+  .titlebar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--t-border); font-size: 0.72rem; color: var(--t-gray); }
+  .titlebar i { width: 10px; height: 10px; border-radius: 50%; background: #2e2e35; display: inline-block; }
+  .titlebar span { margin-left: 8px; }
+  .screen { min-width: 780px; display: flex; flex-direction: column; }
+  .split { display: grid; grid-template-columns: 260px 1fr; }
+  .split.wide { grid-template-columns: 1fr; }
+
+  /* chat list */
+  .chats { border-right: 1px solid var(--t-border); background: var(--t-dark); padding: 8px 0; display: flex; flex-direction: column; }
+  .chats .search { margin: 0 10px 8px; border: 1px solid var(--t-border); border-radius: 3px; padding: 3px 8px; color: var(--t-gray); }
+  .chat { display: grid; grid-template-columns: 6px 1fr auto; gap: 8px; padding: 4px 10px 4px 8px; align-items: start; }
+  .chat .dot { width: 6px; height: 6px; border-radius: 50%; margin-top: 7px; }
+  .chat .dot.on { background: var(--t-me); }
+  .chat .name { color: var(--t-text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chat .prev { color: var(--t-gray); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 175px; }
+  .chat .time { color: var(--t-gray); font-size: 12px; }
+  .chat.unread .name { color: #fff; font-weight: 600; } .chat.unread .prev { color: var(--t-text2); }
+  .chat.sel { background: var(--t-hl); outline: 1px solid var(--t-border-active); outline-offset: -1px; }
+  .chat.hover { background: var(--t-hover); }
+  .chat .badge { background: var(--t-me); color: var(--t-base); border-radius: 8px; padding: 0 6px; font-size: 11px; font-weight: 600; }
+  .grp { color: var(--t-gray); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; padding: 6px 10px 2px; }
+
+  /* conversation */
+  .convo { display: flex; flex-direction: column; min-height: 420px; }
+  .hd { padding: 6px 16px; border-bottom: 1px solid var(--t-border); color: var(--t-text2); display: flex; justify-content: space-between; }
+  .hd b { color: var(--t-text); font-weight: 600; }
+  .scroll { position: relative; padding: 10px 0; display: flex; flex-direction: column; gap: 6px; flex: 1; }
+  .scroll .bar { position: absolute; right: 0; top: 0; bottom: 0; width: 6px; background: var(--t-dark); }
+  .scroll .bar i { position: absolute; left: 1px; right: 1px; background: var(--t-gray); border-radius: 2px; }
+  .day { text-align: center; color: var(--t-gray); font-size: 12px; padding: 2px 0; }
+  .day.sticky { background: var(--t-light); color: var(--t-text2); border-bottom: 1px solid var(--t-border); text-align: left; padding: 2px 16px; }
+  .blk { display: grid; grid-template-columns: 2px 1fr; margin: 0 16px 0 12px; }
+  .blk .rail { border-radius: 1px; background: var(--t-graydim); }
+  .blk .body { padding: 3px 0 3px 12px; white-space: pre-wrap; }
+  .blk.me .rail { background: var(--t-me); }
+  .blk.me .body { background: var(--t-light); border-radius: 0 3px 3px 0; }
+  .blk.them .rail { background: var(--t-them); }
+  .blk.p2 .rail { background: var(--t-p2); }
+  .blk.p3 .rail { background: var(--t-p3); }
+  .blk.sys .rail { background: transparent; }
+  .blk.sys .body { color: var(--t-gray); font-style: italic; }
+  .blk.sel .body { outline: 1px solid var(--t-border-active); outline-offset: -1px; background: var(--t-hl); }
+  .who { font-weight: 600; } .who.me { color: var(--t-me); } .who.them { color: var(--t-them); } .who.p2 { color: var(--t-p2); } .who.p3 { color: var(--t-p3); }
+  .meta { color: var(--t-gray); font-size: 12px; }
+  .tap { color: var(--t-text2); font-size: 12px; background: var(--t-hl); border-radius: 8px; padding: 0 6px; }
+  .img { display: inline-block; width: 220px; height: 120px; border-radius: 3px; background: linear-gradient(135deg, #2a3a4a, #3d5a4f 60%, #6b8a5a); border: 1px solid var(--t-border); vertical-align: top; position: relative; }
+  .img::after { content: "IMG_4412.jpg · 2.1 MB"; position: absolute; left: 6px; bottom: 4px; color: #cfd6dc; font-size: 11px; }
+  .file { color: var(--t-text2); border: 1px dashed var(--t-border); border-radius: 3px; padding: 1px 8px; display: inline-block; }
+  .reply { border-left: 2px solid var(--t-graydim); color: var(--t-gray); padding-left: 8px; font-size: 12px; margin-bottom: 2px; }
+  .link { color: var(--t-me); text-decoration: underline; text-decoration-color: var(--t-graydim); }
+  .cur { background: var(--t-text); color: var(--t-base); }
+  .typing { color: var(--t-gray); font-size: 12px; padding: 0 28px; }
+
+  .prompt { margin: 6px 16px 6px 12px; border: 1px solid var(--t-border-active); border-radius: 4px; padding: 6px 10px; white-space: pre-wrap; display: grid; grid-template-columns: 16px 1fr; }
+  .prompt.idle { border-color: var(--t-border); }
+  .prompt .pfx { color: var(--t-me); }
+  .prompt .hint { color: var(--t-gray); }
+  .infrow { padding: 0 16px 4px 24px; color: var(--t-gray); font-size: 12px; white-space: pre; }
+  .status { padding: 3px 16px; color: var(--t-text2); font-size: 12px; white-space: pre; border-top: 1px solid var(--t-border); }
+  .keys { padding: 4px 16px 8px; color: var(--t-gray); font-size: 12px; white-space: pre; }
+  .keys b { color: var(--t-text2); font-weight: 500; }
+  .g { color: var(--t-them); } .m { color: var(--t-me); } .w { color: var(--t-p2); } .e { color: var(--t-err); } .dim { color: var(--t-gray); } .sec { color: var(--t-text2); } .fz { color: var(--t-fuzzy); font-weight: 600; }
+
+  /* palette */
+  .overlay { position: relative; }
+  .overlay .dimmed { opacity: .35; }
+  .palette { position: absolute; left: 50%; top: 36px; transform: translateX(-50%); width: 540px; background: var(--t-light); border: 1px solid var(--t-border-active); border-radius: 5px; box-shadow: 0 16px 40px rgba(0,0,0,.5); white-space: pre; }
+  .palette .in { padding: 8px 12px; border-bottom: 1px solid var(--t-border); }
+  .palette .row { padding: 2px 12px; color: var(--t-text2); }
+  .palette .row.on { background: var(--t-hl); color: var(--t-text); }
+  .palette .foot { padding: 6px 12px; color: var(--t-gray); font-size: 12px; border-top: 1px solid var(--t-border); }
+
+  .notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+  .note { background: var(--card); border: 1px solid var(--rule); border-radius: 6px; padding: 14px 16px; font-size: 0.9rem; }
+  .note h3 { margin: 0 0 6px; font-size: 0.78rem; font-family: "IBM Plex Mono", monospace; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+  .note ul { margin: 0; padding-left: 18px; } .note li { margin: 2px 0; }
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { font-family: "IBM Plex Mono", monospace; font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
+</style>
+
+<main>
+<header>
+  <div class="eyebrow">msgs · iMessage in the terminal · three surfaces</div>
+  <h1>Msgs, an iMessage TUI</h1>
+  <p>A reader with a send box, honestly scoped: read everything from <code>chat.db</code>, send text and files through Messages.app, tapbacks via imsg. Same visual grammar as the jot mockups — accent rail per sender, lighter band for your own messages, bordered composer, shortcuts bar — because it's the same Grok Build lineage. Names below are placeholders.</p>
+</header>
+
+<!-- SURFACE 1 -->
+<section>
+  <div class="eyebrow">Surface 1 · default</div>
+  <h2>Chats + conversation</h2>
+  <p>Chat list on the left (recent-first, unread bold with a count, pinned on top), conversation on the right. Rail color: blue is you, green the other person; in groups each participant gets their own color. Tapbacks sit under the message as a chip. Images render inline with the kitty graphics protocol (Ghostty supports it); anything else is a file chip you can <kbd>o</kbd>pen.</p>
+  <div class="term"><div class="titlebar"><i></i><i></i><i></i><span>msgs</span></div>
+  <div class="screen"><div class="split">
+    <div class="chats">
+      <div class="search">/ search chats…</div>
+      <div class="grp">Pinned</div>
+      <div class="chat unread sel"><div class="dot on"></div><div><div class="name">Priya</div><div class="prev">sounds good, see you at 7</div></div><div class="time">2m <span class="badge">2</span></div></div>
+      <div class="chat"><div class="dot"></div><div><div class="name">Family</div><div class="prev">Mom: 📷 Photo</div></div><div class="time">1h</div></div>
+      <div class="grp">Recent</div>
+      <div class="chat unread"><div class="dot on"></div><div><div class="name">Sunday Football 🏈</div><div class="prev">Dev: who's in for the draft?</div></div><div class="time">14m <span class="badge">5</span></div></div>
+      <div class="chat hover"><div class="dot"></div><div><div class="name">Marcus</div><div class="prev">You: pushed the fix, check CI</div></div><div class="time">3h</div></div>
+      <div class="chat"><div class="dot"></div><div><div class="name">+1 (415) 555-0132</div><div class="prev">Your Amazon order has shipped</div></div><div class="time">5h</div></div>
+      <div class="chat"><div class="dot"></div><div><div class="name">Aisha</div><div class="prev">👍 to "lunch thursday?"</div></div><div class="time">Tue</div></div>
+      <div class="chat"><div class="dot"></div><div><div class="name">Apt 4B</div><div class="prev">Sam: landlord says friday</div></div><div class="time">Mon</div></div>
+      <div class="chat"><div class="dot"></div><div><div class="name">Dad</div><div class="prev">You: yep will call tonight</div></div><div class="time">Sun</div></div>
+    </div>
+    <div class="convo">
+      <div class="hd"><span><b>Priya</b> <span class="dim">· iMessage · +1 (650) 555-0198</span></span><span class="dim">1,204 msgs · 38 photos</span></div>
+      <div class="scroll">
+        <div class="bar"><i style="top:70%;height:28%"></i></div>
+        <div class="day sticky">Today</div>
+        <div class="blk me"><div class="rail"></div><div class="body">dinner tonight? that thai place near you
+<span class="meta">18:02 · Read 18:05</span></div></div>
+        <div class="blk them"><div class="rail"></div><div class="body">yes!! 7?
+<span class="meta">18:05</span></div></div>
+        <div class="blk me"><div class="rail"></div><div class="body">perfect. here's the menu btw <span class="link">https://maps.apple.com/…</span>
+<span class="meta">18:06 · Delivered</span> <span class="tap">❤️ Priya</span></div></div>
+        <div class="blk them"><div class="rail"></div><div class="body"><span class="img"></span>
+<span class="meta">18:31 · IMG_4412.jpg</span></div></div>
+        <div class="blk them sel"><div class="rail"></div><div class="body">sounds good, see you at 7
+<span class="meta">18:33</span></div></div>
+        <div class="typing">Priya is typing…  <span class="dim">(not available — Messages doesn't expose this)</span></div>
+      </div>
+      <div class="prompt"><span class="pfx">›</span><span>on my way in 20<span class="cur"> </span></span></div>
+      <div class="infrow">Enter send · Shift+Enter newline · Ctrl+A attach · Ctrl+R react to selected</div>
+    </div>
+  </div>
+  <div class="status">Messages.app running  │  3 unread in 2 chats  │  watching chat.db</div>
+  <div class="keys"><b>Tab</b> focus list/convo  <b>↑↓</b> select  <b>Enter</b> open/send  <b>Ctrl+K</b> jump to chat  <b>o</b> open attachment  <b>y</b> copy  <b>?</b> help</div>
+  </div></div>
+  <div class="notes">
+    <div class="note"><h3>Read side (all real)</h3><ul><li>Text incl. attributedBody messages</li><li>Tapbacks, replies, edits, attachments</li><li>Delivered / Read timestamps for your messages</li></ul></div>
+    <div class="note"><h3>Write side</h3><ul><li>Send text + files (AppleScript)</li><li>Tapbacks (imsg helper)</li><li>New chat to a number or contact</li></ul></div>
+    <div class="note"><h3>Not possible — shown honestly</h3><ul><li>Typing indicators (mocked above, greyed)</li><li>Marking a chat read in Messages.app</li><li>Edit / unsend / in-thread reply</li></ul></div>
+  </div>
+</section>
+
+<!-- SURFACE 2 -->
+<section>
+  <div class="eyebrow">Surface 2</div>
+  <h2>Group chat — one color per person, threaded replies</h2>
+  <p>Groups are where the accent rail earns its keep: each participant keeps a stable color across the whole thread, so you can skim who said what without reading names. A reply-to shows the quoted line above the message. Joins, renames, and "X reacted" events render as dim system lines instead of full blocks.</p>
+  <div class="term"><div class="titlebar"><i></i><i></i><i></i><span>msgs — Sunday Football 🏈</span></div>
+  <div class="screen"><div class="split wide">
+    <div class="convo">
+      <div class="hd"><span><b>Sunday Football 🏈</b> <span class="dim">· 6 people</span></span><span class="dim">Ctrl+B shows chat list</span></div>
+      <div class="scroll">
+        <div class="bar"><i style="top:76%;height:22%"></i></div>
+        <div class="day sticky">Today</div>
+        <div class="blk p2"><div class="rail"></div><div class="body"><span class="who p2">Dev</span>  who's in for the draft? sunday 3pm
+<span class="meta">17:40</span> <span class="tap">👍 3</span></div></div>
+        <div class="blk them"><div class="rail"></div><div class="body"><span class="who them">Marcus</span>  in. I'm keeping my keeper this year
+<span class="meta">17:42</span></div></div>
+        <div class="blk p3"><div class="rail"></div><div class="body"><span class="who p3">Aisha</span>  <span class="reply">↳ Dev: who's in for the draft? sunday 3pm</span>can we do 4? I have a thing
+<span class="meta">17:45</span></div></div>
+        <div class="blk sys"><div class="rail"></div><div class="body">Dev renamed the group to "Sunday Football 🏈"</div></div>
+        <div class="blk me"><div class="rail"></div><div class="body"><span class="who me">You</span>  4 works. I'll bring the leaguemate rankings
+<span class="meta">17:51 · Delivered</span></div></div>
+        <div class="blk p2 sel"><div class="rail"></div><div class="body"><span class="who p2">Dev</span>  <span class="file">📄 draft-order.pdf · 84 KB</span>
+<span class="meta">18:10</span></div></div>
+      </div>
+      <div class="prompt idle"><span class="pfx">›</span><span class="hint">message Sunday Football 🏈…</span></div>
+      <div class="infrow">selected: draft-order.pdf · <b>o</b> open · <b>s</b> save to ~/Downloads · <b>Ctrl+R</b> react</div>
+    </div>
+  </div>
+  <div class="status">Messages.app running  │  Sunday Football 🏈  │  5 unread here</div>
+  <div class="keys"><b>Ctrl+B</b> chat list  <b>↑↓</b> select message  <b>r</b> reply-quote  <b>Ctrl+R</b> react  <b>o</b> open  <b>Ctrl+K</b> jump  <b>Esc</b> back</div>
+  </div></div>
+</section>
+
+<!-- SURFACE 3 -->
+<section>
+  <div class="eyebrow">Surface 3</div>
+  <h2>Jump palette — people, chats, and message search</h2>
+  <p><kbd>Ctrl+K</kbd> from anywhere. Type a name to switch chats; type more words to full-text search across all messages (SQLite FTS over <code>chat.db</code> text, built once on first launch, incremental after). Results show who, where, when, and the matched line. <kbd>Enter</kbd> jumps to that message in its conversation with it selected.</p>
+  <div class="term"><div class="titlebar"><i></i><i></i><i></i><span>msgs</span></div>
+  <div class="screen overlay">
+    <div class="dimmed"><div class="split">
+      <div class="chats">
+        <div class="search">/ search chats…</div>
+        <div class="chat"><div class="dot"></div><div><div class="name">Priya</div><div class="prev">sounds good, see you at 7</div></div><div class="time">2m</div></div>
+        <div class="chat"><div class="dot"></div><div><div class="name">Family</div><div class="prev">Mom: 📷 Photo</div></div><div class="time">1h</div></div>
+        <div class="chat"><div class="dot"></div><div><div class="name">Sunday Football 🏈</div><div class="prev">Dev: 📄 draft-order.pdf</div></div><div class="time">14m</div></div>
+        <div class="chat"><div class="dot"></div><div><div class="name">Marcus</div><div class="prev">You: pushed the fix</div></div><div class="time">3h</div></div>
+        <div class="chat"><div class="dot"></div><div><div class="name">Aisha</div><div class="prev">👍 to "lunch thursday?"</div></div><div class="time">Tue</div></div>
+      </div>
+      <div class="convo">
+        <div class="hd"><span><b>Priya</b></span></div>
+        <div class="scroll">
+          <div class="blk me"><div class="rail"></div><div class="body">dinner tonight?</div></div>
+          <div class="blk them"><div class="rail"></div><div class="body">yes!! 7?</div></div>
+          <div class="blk them"><div class="rail"></div><div class="body">sounds good, see you at 7</div></div>
+        </div>
+        <div class="prompt idle"><span class="pfx">›</span><span class="hint"></span></div>
+      </div>
+    </div>
+    <div class="status">Messages.app running</div><div class="keys"><b>Esc</b> close</div></div>
+    <div class="palette">
+      <div class="in"><span class="m">›</span> thai<span class="cur"> </span></div>
+      <div class="row on">▸ <span class="fz">Thai</span> Basil group <span class="dim">                                       chat · 3 people</span></div>
+      <div class="row">  <b>Priya</b>   dinner tonight? that <span class="fz">thai</span> place near you       <span class="dim">today 18:02</span></div>
+      <div class="row">  <b>Marcus</b>  the <span class="fz">thai</span> spot on valencia was great        <span class="dim">Aug 12</span></div>
+      <div class="row">  <b>Family</b>  Mom: <span class="fz">thai</span> curry recipe attached            <span class="dim">Jul 30</span></div>
+      <div class="row">  <b>Aisha</b>   <span class="fz">thai</span>? or sushi                            <span class="dim">Jul 3</span></div>
+      <div class="foot">1 chat · 4 messages · <b>Enter</b> jump · <b>Ctrl+N</b> new message to "thai" · <b>Tab</b> filter: chats / messages / photos</div>
+    </div>
+  </div></div>
+</section>
+
+<!-- BUILD NOTES -->
+<section>
+  <div class="eyebrow">Under the hood</div>
+  <h2>How each surface maps to the backend</h2>
+  <div class="tablewrap"><table>
+    <tr><th>Need</th><th>Rust crate route</th><th>imsg route</th></tr>
+    <tr><td>Chat list, unread counts</td><td><code>chat</code>, <code>chat_message_join</code> tables via <code>imessage-database</code></td><td><code>imsg chats --json</code></td></tr>
+    <tr><td>Message bodies (incl. attributedBody)</td><td>built-in typedstream parser</td><td>parsed by IMsgCore</td></tr>
+    <tr><td>Live updates</td><td>watch <code>chat.db-wal</code> with <code>notify</code>, re-query since last ROWID</td><td><code>imsg watch --ndjson</code> stream</td></tr>
+    <tr><td>Send text / file</td><td><code>osascript</code> to Messages.app</td><td><code>imsg send</code></td></tr>
+    <tr><td>Tapbacks (send)</td><td>not available without porting the helper</td><td><code>imsg send --reaction</code></td></tr>
+    <tr><td>Inline images</td><td colspan="2">read attachment path from DB → kitty graphics protocol in Ghostty/Kitty/WezTerm; chafa fallback elsewhere</td></tr>
+    <tr><td>Full-text search</td><td colspan="2">your own SQLite FTS5 index next to the app, rebuilt incrementally from either source</td></tr>
+    <tr><td>Contact names</td><td colspan="2">AddressBook SQLite (<code>~/Library/Application Support/AddressBook</code>) or <code>contacts</code> CLI; cache to disk</td></tr>
+  </table></div>
+  <p>Order of work: surface 1 read-only → send box → surface 3 palette → surface 2 group polish → inline images → tapbacks. Read-only surface 1 alone is a useful app and is roughly a week of evenings with ratatui.</p>
+</section>
+</main>
