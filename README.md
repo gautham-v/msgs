@@ -557,6 +557,9 @@ Some of these are macOS's and some are msgs's, and it is worth knowing which.
   sent by either route. Every reaction is *read* and drawn regardless.
 - **Attachments that never reached this Mac stay chips.** msgs reads files; it
   cannot ask iCloud for one. HEIC needs `sips`, which macOS ships.
+- **A conversation with yourself shows every message twice.** Messages stores
+  a sent copy and a received copy of each one as two rows with two GUIDs, and
+  msgs draws what is in the database.
 - **macOS 14+ only**, with Full Disk Access for the terminal msgs runs in.
   Without it msgs starts and explains what to do rather than failing.
 
