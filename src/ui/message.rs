@@ -260,11 +260,12 @@ impl Ctx<'_> {
     }
 
     /// The message a reply quotes, when it is on the loaded page.
+    ///
+    /// Only `thread_originator_guid` marks a real threaded reply. `reply_to_guid`
+    /// is set by Messages on almost every message (it simply points at the one
+    /// before it), so it must never be used as a reply marker.
     fn quoted(&self, message: &Message) -> Option<&Message> {
-        let raw = message
-            .thread_originator_guid
-            .as_deref()
-            .or(message.reply_to_guid.as_deref())?;
+        let raw = message.thread_originator_guid.as_deref()?;
         let (_, guid) = split_association(raw)?;
         let index = *self.by_guid.get(guid)?;
         self.messages.get(index)
@@ -1018,6 +1019,19 @@ mod tests {
         let quote = text_of(&block.lines[0]);
         assert!(quote.contains('↳'), "{quote}");
         assert!(quote.contains("who's in? sunday"), "{quote}");
+    }
+
+    #[test]
+    fn reply_to_guid_alone_is_not_a_reply() {
+        let mut plain = message(2, false, "just the next message");
+        plain.reply_to_guid = Some("G1".to_string());
+        let fixture = Fixture::new(true, vec![message(1, false, "who's in?"), plain]);
+        let block = block(&fixture.ctx(), 1, 60);
+        assert!(
+            !text_of(&block.lines[0]).contains('↳'),
+            "{}",
+            text_of(&block.lines[0])
+        );
     }
 
     #[test]

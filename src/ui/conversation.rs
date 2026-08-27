@@ -604,9 +604,8 @@ fn thumb(total: u32, viewport: u16, above: u32) -> Option<(u16, u16)> {
 /// The day of the topmost message on screen, held on a row of its own between
 /// the header and the messages — the mockup's `.day.sticky`.
 ///
-/// A day the topmost block is already announcing with its own separator is not
-/// announced twice: the band stays blank and the separator underneath it is
-/// the label.
+/// The band always names the day, even when the topmost block's own separator
+/// is on screen: a blank band read as a rendering gap rather than a choice.
 pub fn render_day_band(frame: &mut Frame, app: &App, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -624,9 +623,6 @@ pub fn render_day_band(frame: &mut Frame, app: &App, area: Rect) {
     else {
         return;
     };
-    if first.skip == 0 && message::opens_a_day(&app.message_rows, first.index) {
-        return;
-    }
     let Some(when) = app.message_rows.get(first.index).and_then(Message::sent_at) else {
         return;
     };

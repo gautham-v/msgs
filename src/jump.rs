@@ -276,6 +276,16 @@ impl Jump {
             buffer.clear();
             let haystack = Utf32Str::new(&title, &mut buffer);
             if let Some(score) = pattern.indices(haystack, &mut self.matcher, &mut indices) {
+                // nucleo happily matches `thai` against `Thanksgiving`; a chat
+                // name only counts when the query sits in it as a substring
+                // or starts one of its words.
+                if !name_matches(&title, query) {
+                    indices.clear();
+                    if participant_matches(&pattern, &mut self.matcher, chat, query) {
+                        scored.push((1, position, chat_row(chat, Vec::new())));
+                    }
+                    continue;
+                }
                 indices.sort_unstable();
                 indices.dedup();
                 let ranges = group_indices(&indices);
@@ -284,7 +294,7 @@ impl Jump {
             }
             // A chat whose name does not match can still be found by the
             // address of somebody in it, which is what makes a raw number work.
-            if participant_matches(&pattern, &mut self.matcher, chat) {
+            if participant_matches(&pattern, &mut self.matcher, chat, query) {
                 scored.push((1, position, chat_row(chat, Vec::new())));
             }
         }
@@ -295,18 +305,50 @@ impl Jump {
     }
 }
 
+/// Whether `query` is found in `name` the way a person expects: as a
+/// case-insensitive substring, or with every query word starting a word of
+/// the name (`ch sh` finds `Chandani, Sham`).
+#[must_use]
+pub fn name_matches(name: &str, query: &str) -> bool {
+    let name = name.to_lowercase();
+    let query = query.trim().to_lowercase();
+    if query.is_empty() || name.contains(&query) {
+        return true;
+    }
+    let words: Vec<&str> = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    query
+        .split_whitespace()
+        .all(|q| words.iter().any(|w| w.starts_with(q)))
+}
+
 /// Whether anybody in `chat` has a name or an address the pattern matches.
 ///
 /// A named group does not put its people in its title, so this is what finds
 /// the conversation you are in with somebody by typing their name.
-fn participant_matches(pattern: &Pattern, matcher: &mut Matcher, chat: &Chat) -> bool {
+fn participant_matches(pattern: &Pattern, matcher: &mut Matcher, chat: &Chat, query: &str) -> bool {
     let mut buffer = Vec::new();
+    let digits: String = query.chars().filter(char::is_ascii_digit).collect();
     chat.participants.iter().any(|handle| {
+        // A name matches the way a chat title does; an address matches when
+        // the digits typed appear in it in order (so `614584` finds a number).
+        if name_matches(&handle.display_name(), query) {
+            return true;
+        }
+        if !digits.is_empty() && digits.len() >= 3 {
+            let address_digits: String = handle.id.chars().filter(char::is_ascii_digit).collect();
+            if address_digits.contains(&digits) {
+                return true;
+            }
+        }
         let mut hit = false;
         for candidate in [handle.id.clone(), handle.display_name()] {
             buffer.clear();
             let haystack = Utf32Str::new(&candidate, &mut buffer);
-            hit = hit || pattern.score(haystack, matcher).is_some();
+            hit = hit
+                || (pattern.score(haystack, matcher).is_some() && name_matches(&candidate, query));
         }
         hit
     })
@@ -560,6 +602,15 @@ pub fn looks_like_address(query: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_names_need_a_substring_or_word_prefix() {
+        assert!(name_matches("Thai Basil group", "thai"));
+        assert!(name_matches("Chandani, Sham", "ch sh"));
+        assert!(name_matches("Sam Bryfczynski", "bryf"));
+        assert!(!name_matches("Thanksgiving 2024", "thai"));
+        assert!(!name_matches("Tanushree Dey", "thai"));
+    }
 
     #[test]
     fn tab_cycles_the_four_filters() {
