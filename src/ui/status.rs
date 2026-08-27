@@ -75,6 +75,12 @@ pub fn segments(app: &App) -> Vec<String> {
         DbStatus::Unreadable(reason) => format!("chat.db unreadable: {reason}"),
     });
 
+    // While the index is building it is the most interesting thing on the
+    // line, so it goes before how fresh the screen is.
+    if let Some(note) = app.search_state().note() {
+        segments.push(note);
+    }
+
     let how = match app.status.watcher {
         WatcherStatus::Off => "watcher off",
         WatcherStatus::Watching => "watching chat.db",

@@ -141,7 +141,14 @@ fn palette_opens_from_the_composer_and_returns_focus_there() {
 
     let buffer = frame(&mut app, 120, 34);
     assert!(contains(&buffer, "thai"), "typed query");
-    assert!(contains(&buffer, "Esc close"), "palette footer");
+    assert!(contains(&buffer, "Enter jump"), "palette footer");
+    assert!(contains(&buffer, "Tab filter: all"), "filter in the footer");
+
+    // Tab in the palette cycles the filter rather than moving focus.
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(app.focus, Focus::Palette);
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "Tab filter: chats"), "filter cycled");
 
     press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!(app.focus, Focus::Composer);

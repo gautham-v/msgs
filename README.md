@@ -30,7 +30,8 @@ Flags:
 | `--db <PATH>` | read this database instead of `~/Library/Messages/chat.db` |
 | `--config <PATH>` | read this config file instead of the default |
 | `--no-mouse` | do not capture the mouse |
-| `--check` | print a readiness report (database, row counts, live updates, Messages.app, `osascript`, `imsg`) and exit |
+| `--check` | print a readiness report (database, row counts, live updates, Messages.app, `osascript`, `imsg`, search index) and exit |
+| `--no-index` | do not build or use the full-text message index |
 | `--version` | print the version |
 
 ## Keys
@@ -42,8 +43,11 @@ Flags:
 | `Enter` | open chat / send message |
 | `PgUp` `PgDn`, `g` `G` | page, jump to top / bottom |
 | `Ctrl+K` | jump palette: chats, people, full-text message search |
+| `/` (conversation) | open the jump palette |
+| `Tab` (palette) | cycle the filter: all / chats / messages / photos |
+| `Ctrl+N` (palette) | start a new message to a typed number or address |
 | `Ctrl+B` | toggle chat list |
-| `/` | filter the chat list by name |
+| `/` (chat list) | filter the chat list by name |
 | `o` / `s` | open / save selected attachment |
 | `r` | quote the selected message in a reply |
 | `Ctrl+R` | react to selected message |
@@ -102,6 +106,34 @@ Pinned conversations are shown as their own section when the database records
 pinning. macOS keeps that in Messages.app's preferences rather than in
 `chat.db`, so on every current system the list is one flat run of chats,
 newest first.
+
+## Search
+
+`Ctrl+K` opens a floating palette over a dimmed screen — `/` does the same from
+the conversation. Chats and the people in them are matched fuzzily as you type,
+with the matched characters picked out; at three characters the query also goes
+to a full-text index of every message, and hits come back as the chat, who said
+it, the matched line, and when. `Enter` opens the chat, and for a message hit it
+opens the conversation with that message selected, loading pages upward until it
+is on screen. `Tab` cycles the filter — all, chats, messages, photos — and
+`Ctrl+N` with something that looks like a phone number or an email addresses a
+new message to it, whether or not you have written to it before. `Esc` closes
+the palette and hands focus back where it was.
+
+The index is msgs's own SQLite FTS5 file at
+`~/Library/Application Support/msgs/index.db`, created `0600` in a `0700`
+directory. Nothing is ever written to `chat.db`. It is built on first launch by
+a background thread — the status line says `indexing messages… 42%` while that
+happens, and the rest of the app keeps working — and topped up afterward from
+the same live-update pass that refreshes the screen, reading only the
+`message.ROWID`s that arrived since the last time. A hundred thousand messages
+index in a few seconds and queries come back in single-digit milliseconds.
+`--no-index` turns the whole thing off.
+
+A jump to a message pages upward from the newest end of the conversation, so
+nothing already on screen moves and no gap can open in the transcript. That
+paging stops after ten thousand messages; a hit further back than that opens the
+conversation and says the message is further back than msgs will load.
 
 ## Sending
 

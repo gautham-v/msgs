@@ -26,7 +26,7 @@ use ratatui::backend::CrosstermBackend;
 use msgs::app::{App, WatcherStatus};
 use msgs::config::Config;
 use msgs::db::{Db, Source};
-use msgs::{config, default_db_path, keymap, ui};
+use msgs::{config, default_db_path, keymap, search, ui};
 
 /// How long the loop waits for input before waking up to expire toasts.
 const TICK: Duration = Duration::from_millis(250);
@@ -50,6 +50,10 @@ struct Cli {
     /// Print a readiness report and exit without starting the UI.
     #[arg(long)]
     check: bool,
+
+    /// Do not build or use the full-text message index.
+    #[arg(long)]
+    no_index: bool,
 }
 
 fn main() -> Result<()> {
@@ -67,6 +71,18 @@ fn main() -> Result<()> {
     // Read-only, and never fatal: a failure becomes the full-screen surface
     // that tells the reader how to grant Full Disk Access.
     app.open_db(cli.db.clone().unwrap_or_else(default_db_path));
+
+    // The message index is msgs's own file, never `chat.db`. Building it runs
+    // on its own thread and reports onto the status line.
+    if !cli.no_index {
+        match search::default_index_path() {
+            Ok(path) => app.enable_search(&path),
+            Err(err) => app
+                .status
+                .warnings
+                .push(format!("search: {}", err.summary())),
+        }
+    }
 
     install_panic_hook();
     let mut terminal = setup_terminal(app.mouse_enabled)?;
@@ -248,6 +264,21 @@ fn check(cli: &Cli, warnings: &[String]) -> Result<()> {
         "not present (defaults in use)"
     };
     row(
+        "search index",
+        &match search::default_index_path() {
+            Ok(path) => {
+                let state = if path.exists() {
+                    "built"
+                } else {
+                    "not built yet — the first launch builds it"
+                };
+                format!("{} — {state}", path.display())
+            }
+            Err(err) => err.summary(),
+        },
+    );
+
+    row(
         "config",
         &format!("{} — {config_state}", config_path.display()),
     );
@@ -288,16 +319,18 @@ mod tests {
 
     #[test]
     fn flags_parse() {
-        let cli = Cli::parse_from(["msgs", "--db", "/tmp/copy.db", "--no-mouse"]);
+        let cli = Cli::parse_from(["msgs", "--db", "/tmp/copy.db", "--no-mouse", "--no-index"]);
         assert_eq!(
             cli.db.as_deref(),
             Some(std::path::Path::new("/tmp/copy.db"))
         );
         assert!(cli.no_mouse);
+        assert!(cli.no_index);
         assert!(!cli.check);
 
         let cli = Cli::parse_from(["msgs"]);
         assert!(cli.db.is_none());
         assert!(!cli.no_mouse);
+        assert!(!cli.no_index);
     }
 }

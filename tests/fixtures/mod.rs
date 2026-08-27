@@ -70,6 +70,90 @@ pub fn database() -> PathBuf {
         .clone()
 }
 
+/// How many messages [`large_database`] invents.
+pub const LARGE_MESSAGES: usize = 100_000;
+
+/// A word that appears on exactly one message of [`large_database`].
+pub const LARGE_NEEDLE: &str = "quokka";
+
+/// A hundred thousand invented messages, for the tests that care about scale.
+///
+/// Built once into `tests/fixtures/large.db` (gitignored) the same way the
+/// small fixture is: every body is made up here, and nothing is ever copied
+/// out of a real database.
+pub fn large_database() -> PathBuf {
+    static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("large.db");
+            if path.exists() {
+                return path;
+            }
+            let staging = path.with_extension(format!("db.building-{}", std::process::id()));
+            let _ = std::fs::remove_file(&staging);
+            build_large(&staging).expect("build the large fixture database");
+            std::fs::rename(&staging, &path).expect("move the large fixture into place");
+            path
+        })
+        .clone()
+}
+
+/// Fill a database with [`LARGE_MESSAGES`] invented bodies in one chat.
+fn build_large(path: &Path) -> rusqlite::Result<()> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch("PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF;")?;
+    conn.execute_batch(SCHEMA)?;
+    handle(&conn, HANDLE_ALEX, "+15550000001", "iMessage")?;
+    chat(&conn, CHAT_DIRECT, "iMessage;-;+15550000001", 45, None)?;
+    conn.execute(
+        "INSERT INTO chat_handle_join (chat_id, handle_id) VALUES (?1, ?2)",
+        (CHAT_DIRECT, HANDLE_ALEX),
+    )?;
+
+    // A small vocabulary, combined by rowid, so every body is different and
+    // none of it came from anywhere real.
+    const WORDS: [&str; 8] = [
+        "morning", "dinner", "later", "office", "train", "coffee", "tomorrow", "photos",
+    ];
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut insert = tx.prepare(
+            "INSERT INTO message (ROWID, guid, text, handle_id, service, is_from_me, is_read,
+                                  date, associated_message_type, item_type)
+             VALUES (?1, ?2, ?3, ?4, 'iMessage', ?5, 1, ?6, 0, 0)",
+        )?;
+        let mut join = tx.prepare(
+            "INSERT INTO chat_message_join (chat_id, message_id, message_date) VALUES (?1, ?2, ?3)",
+        )?;
+        for rowid in 1..=LARGE_MESSAGES {
+            let n = rowid as i64;
+            let body = if rowid == LARGE_MESSAGES / 2 {
+                format!("the {LARGE_NEEDLE} sends its regards")
+            } else {
+                format!(
+                    "{} {} {n}",
+                    WORDS[rowid % WORDS.len()],
+                    WORDS[(rowid / 3) % WORDS.len()]
+                )
+            };
+            insert.execute(rusqlite::params![
+                n,
+                guid(n),
+                body,
+                if rowid % 2 == 0 { HANDLE_ALEX } else { 0 },
+                i64::from(rowid % 2 != 0),
+                BASE + n * SECOND,
+            ])?;
+            join.execute(rusqlite::params![CHAT_DIRECT, n, BASE + n * SECOND])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Create the schema and fill it with invented conversations.
 fn build(path: &Path) -> rusqlite::Result<()> {
     let conn = Connection::open(path)?;

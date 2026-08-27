@@ -14,7 +14,9 @@ use ratatui::layout::{Position, Rect};
 
 use crate::config::Config;
 use crate::db::{Chat, Db, DbError, MAX_PAGE, Message, PAGE, Source};
-use crate::send::{self, Delivery, Outbox, Outgoing, Pending, SendError, Target};
+use crate::jump::{self, Jump};
+use crate::search::{self, Search};
+use crate::send::{self, Delivery, Outbox, Outgoing, Pending, SendError, Service, Target};
 use crate::theme::Theme;
 use crate::ui::Panes;
 use crate::ui::conversation::{Hits, Measured, Scroll};
@@ -37,6 +39,12 @@ const RECONCILE_FOR: Duration = Duration::from_secs(20);
 const RECONCILE_SLACK: i64 = 120;
 /// Longest quoted line `r` puts in the composer.
 const QUOTE_LIMIT: usize = 80;
+/// Pages the palette will load looking for the message it was asked to jump
+/// to, before it gives up and says the message is further back than that.
+const JUMP_PAGES: usize = 100;
+/// `chat.ROWID` standing in for a conversation that does not exist yet: the
+/// one `Ctrl+N` opens to an address nobody has written to.
+pub const DRAFT_CHAT: i64 = -1;
 /// How often a locked database's scratch copy is taken again.
 ///
 /// A copy never changes on its own, so keeping up with a database that had to
@@ -101,6 +109,10 @@ pub enum Action {
     Activate,
     /// Open the jump palette.
     OpenPalette,
+    /// `Tab` in the palette: cycle all / chats / messages / photos.
+    PaletteFilter,
+    /// `Ctrl+N` in the palette: start a chat to the typed address.
+    NewChat,
     /// Open the help modal.
     OpenHelp,
     /// `Esc`: close an overlay, clear a filter, or leave the composer.
@@ -521,6 +533,16 @@ pub struct App {
     reconcile_since: Option<Instant>,
     /// The jump palette query.
     pub palette: TextField,
+    /// What the jump palette is showing: filter, rows, and selection.
+    pub jump: Jump,
+    /// The full-text message index, once one has been asked for.
+    ///
+    /// `None` means message search is off — which is how the tests run, so
+    /// nothing under `tests/` ever builds an index in the user's home.
+    pub search: Option<Search>,
+    /// Where the composer sends while `Ctrl+N` has opened a conversation that
+    /// does not exist in `chat.db` yet.
+    pub draft_target: Option<Target>,
     /// Scroll offset of the help modal.
     pub help_scroll: u16,
     /// Status line state.
@@ -588,6 +610,9 @@ impl App {
             last_reconcile: None,
             reconcile_since: None,
             palette: TextField::default(),
+            jump: Jump::default(),
+            search: None,
+            draft_target: None,
             help_scroll: 0,
             status,
             panes: Panes::default(),
@@ -646,6 +671,30 @@ impl App {
         }
     }
 
+    /// Start building the full-text message index at `index_path`.
+    ///
+    /// The build runs on its own thread and reports onto the status line, so a
+    /// first launch against a large database is readable while it happens. Off
+    /// unless something asks for it, which is what keeps the tests from ever
+    /// writing an index anywhere.
+    pub fn enable_search(&mut self, index_path: &std::path::Path) {
+        let Some(db_path) = self.db_path.clone() else {
+            return;
+        };
+        if self.db_error.is_some() {
+            return;
+        }
+        self.search = Some(Search::start(&db_path, index_path));
+    }
+
+    /// Where the message index lives, for `--check` and the status line.
+    #[must_use]
+    pub fn search_state(&self) -> search::State {
+        self.search
+            .as_ref()
+            .map_or(search::State::Idle, |search| search.state().clone())
+    }
+
     /// Re-read the chat list and the unread totals on the status line.
     ///
     /// The list is ordered by recency, so a message arriving anywhere moves
@@ -669,7 +718,38 @@ impl App {
                 self.status.error(format!("chat list: {}", err.summary()));
             }
         }
+        self.adopt_draft();
         self.refresh_anchored(true, anchor);
+    }
+
+    /// A `Ctrl+N` draft stops being a draft the moment Messages has made the
+    /// conversation real: the list gains a row with that address, and the
+    /// selection moves onto it.
+    fn adopt_draft(&mut self) {
+        let Some(address) = self
+            .draft_target
+            .as_ref()
+            .and_then(|target| target.identifier.clone())
+        else {
+            return;
+        };
+        let Some(rowid) = self
+            .chat_rows
+            .iter()
+            .find(|chat| chat_has_address(chat, &address))
+            .map(|chat| chat.rowid)
+        else {
+            return;
+        };
+        self.draft_target = None;
+        if let Some(position) = self
+            .chat_rows
+            .iter()
+            .position(|chat| chat.rowid == rowid)
+            .and_then(|index| self.visible_chats.iter().position(|i| *i == index))
+        {
+            self.chats.selected = position;
+        }
     }
 
     /// Re-apply the filter, keep the selection on the chat it was on, and open
@@ -749,6 +829,16 @@ impl App {
 
     /// Load the selected chat's conversation, if it is not the loaded one.
     fn sync_open_chat(&mut self) {
+        // A `Ctrl+N` draft has no conversation to load: the pane stays empty
+        // until the first message creates one.
+        if self.draft_target.is_some() {
+            if self.open_chat.take().is_some() || !self.message_rows.is_empty() {
+                self.message_rows.clear();
+                self.messages.set_len(0);
+            }
+            self.sync_pending_rows();
+            return;
+        }
         let Some(rowid) = self.selected_chat().map(|chat| chat.rowid) else {
             // Nothing selected: close whatever was open, and leave the pane
             // alone if nothing was.
@@ -973,6 +1063,9 @@ impl App {
     /// the render tests drive it — whatever the chat list has selected.
     #[must_use]
     pub fn current_chat_rowid(&self) -> Option<i64> {
+        if self.draft_target.is_some() {
+            return Some(DRAFT_CHAT);
+        }
         self.open_chat
             .or_else(|| self.selected_chat().map(|chat| chat.rowid))
     }
@@ -993,7 +1086,7 @@ impl App {
         if self.composer.text().trim().is_empty() {
             return;
         }
-        let Some(target) = self.current_chat().map(Target::for_chat) else {
+        let Some(target) = self.outgoing_target() else {
             self.status.error("no conversation selected");
             return;
         };
@@ -1021,7 +1114,7 @@ impl App {
                 .error(format!("no file at {}", crate::ui::home_relative(&path)));
             return;
         }
-        let Some(target) = self.current_chat().map(Target::for_chat) else {
+        let Some(target) = self.outgoing_target() else {
             self.status.error("no conversation selected");
             return;
         };
@@ -1294,6 +1387,9 @@ impl App {
             return false;
         }
         self.refresh_snapshot();
+        if let Some(search) = self.search.as_mut() {
+            search.catch_up();
+        }
         if !self.pull_new_messages() {
             // Nothing for the open thread, but another conversation may have
             // gained a message: its row moves to the top of the list and its
@@ -1379,6 +1475,7 @@ impl App {
     fn close_overlay(&mut self) {
         self.help_scroll = 0;
         self.palette.clear();
+        self.jump.clear();
         self.focus = self.overlay_return;
     }
 
@@ -1400,7 +1497,9 @@ impl App {
         match self.focus {
             Focus::ChatList => Some(&mut self.chats),
             Focus::Conversation => Some(&mut self.messages),
-            _ => None,
+            Focus::Palette => Some(&mut self.jump.list),
+            Focus::Help => None,
+            Focus::Composer => None,
         }
     }
 
@@ -1421,7 +1520,9 @@ impl App {
             Action::ToBottom => self.jump(false),
             Action::Scroll(delta) => self.scroll(i64::from(delta)),
             Action::Activate => self.activate(),
-            Action::OpenPalette => self.open_overlay(Focus::Palette),
+            Action::OpenPalette => self.open_palette(),
+            Action::PaletteFilter => self.jump.filter = self.jump.filter.next(),
+            Action::NewChat => self.start_new_chat(),
             Action::OpenHelp => self.open_overlay(Focus::Help),
             Action::Cancel => self.cancel(),
             Action::StartFilter => self.start_filter(),
@@ -1446,6 +1547,176 @@ impl App {
         // Every path out of an action ends here, so a filter keystroke, an
         // arrow key, and a click all leave the chat list in the same state.
         self.refresh(!matches!(action, Action::Scroll(_)));
+        self.refresh_jump();
+    }
+
+    /// `Ctrl+K`: open the palette with the list you already have.
+    fn open_palette(&mut self) {
+        self.open_overlay(Focus::Palette);
+        self.jump.clear();
+    }
+
+    /// Rebuild the palette rows when the query, the filter, or the index moved.
+    ///
+    /// Called after every action, and cheap when nothing changed: the rows
+    /// remember what they were built from and only a difference rebuilds them.
+    fn refresh_jump(&mut self) {
+        if self.focus != Focus::Palette {
+            return;
+        }
+        let query = self.palette.text().trim().to_string();
+        let filter = self.jump.filter;
+        let indexed = self.search.as_ref().is_some_and(Search::is_ready);
+        if !self
+            .jump
+            .is_stale(&query, filter, indexed, self.chat_rows.len())
+        {
+            return;
+        }
+
+        // The index is only asked once the query is long enough to be worth a
+        // query, which is what keeps one letter from matching half the store.
+        let hits = if filter.wants_messages() && query.chars().count() >= search::MIN_QUERY {
+            let kind = filter.kind();
+            self.search
+                .as_mut()
+                .map(|search| search.query(&query, kind, search::QUERY_LIMIT))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let columns = self.palette_columns();
+        let mut jump = std::mem::take(&mut self.jump);
+        jump.rebuild(
+            &query,
+            filter,
+            indexed,
+            &self.chat_rows,
+            &hits,
+            Local::now(),
+            columns,
+        );
+        self.jump = jump;
+    }
+
+    /// Columns a palette result row has for a matched line.
+    fn palette_columns(&self) -> usize {
+        let width = self.panes.status.width.max(40);
+        crate::ui::palette::body_columns(Rect::new(0, 0, width, 1))
+    }
+
+    /// `Enter` in the palette: go where the selected row points.
+    fn jump_to_selected(&mut self) {
+        let Some(row) = self.jump.selected().cloned() else {
+            self.close_overlay();
+            return;
+        };
+        self.close_overlay();
+        match row.message_rowid {
+            Some(message_rowid) => self.open_message(row.chat_rowid, message_rowid),
+            None => {
+                self.open_chat_row(row.chat_rowid);
+                self.focus = Focus::Conversation;
+            }
+        }
+    }
+
+    /// Select `chat_rowid` in the list and open it, lifting a filter that
+    /// would otherwise be hiding it.
+    pub fn open_chat_row(&mut self, chat_rowid: i64) {
+        self.draft_target = None;
+        self.chat_filter = None;
+        self.refresh_anchored(true, Some(chat_rowid));
+    }
+
+    /// Open `chat_rowid` with `message_rowid` selected, loading pages upward
+    /// until the message is on the loaded page.
+    ///
+    /// A conversation loads from its newest end, so a hit deep in the history
+    /// costs one page query per hundred messages between here and there. That
+    /// is bounded: past [`JUMP_PAGES`] pages the jump gives up and says so
+    /// rather than reading the whole thread.
+    pub fn open_message(&mut self, chat_rowid: i64, message_rowid: i64) {
+        self.open_chat_row(chat_rowid);
+        if self.open_chat != Some(chat_rowid) {
+            self.status
+                .error("that conversation is no longer in the list");
+            return;
+        }
+        self.focus = Focus::Conversation;
+        for _ in 0..JUMP_PAGES {
+            if let Some(index) = self
+                .message_rows
+                .iter()
+                .position(|message| message.rowid == message_rowid)
+            {
+                self.messages.selected = index;
+                self.pending_bottom = false;
+                let viewport = self.conversation_height();
+                self.convo.reveal(&self.measured.heights, viewport, index);
+                return;
+            }
+            if self.load_older() == 0 {
+                break;
+            }
+        }
+        self.status
+            .toast("that message is further back than msgs will load");
+    }
+
+    /// `Ctrl+N` in the palette: address a message to what has been typed.
+    ///
+    /// An address you already have a thread with opens that thread; anything
+    /// else opens an empty conversation the composer can send into, which is
+    /// the only way to start one when the database is read-only.
+    fn start_new_chat(&mut self) {
+        if self.focus != Focus::Palette {
+            return;
+        }
+        let Some(address) = jump::looks_like_address(self.palette.text()) else {
+            self.status
+                .toast("type a phone number or email to start a new chat");
+            return;
+        };
+        self.close_overlay();
+
+        if let Some(rowid) = self
+            .chat_rows
+            .iter()
+            .find(|chat| chat_has_address(chat, &address))
+            .map(|chat| chat.rowid)
+        {
+            self.open_chat_row(rowid);
+            self.focus = Focus::Composer;
+            return;
+        }
+
+        self.draft_target = Some(Target {
+            guid: None,
+            identifier: Some(address),
+            service: Service::IMessage,
+        });
+        self.open_chat = None;
+        self.message_rows.clear();
+        self.messages.set_len(0);
+        self.convo = Scroll::default();
+        self.measured = Measured::default();
+        self.focus = Focus::Composer;
+        // The address is on screen in the header; it is not repeated here.
+        self.status.toast("new message — type it and press Enter");
+    }
+
+    /// Where the composer sends: the `Ctrl+N` draft, else the open chat.
+    fn outgoing_target(&self) -> Option<Target> {
+        self.draft_target
+            .clone()
+            .or_else(|| self.current_chat().map(Target::for_chat))
+    }
+
+    /// Leave a `Ctrl+N` draft, because the reader went somewhere real.
+    fn leave_draft(&mut self) {
+        self.draft_target = None;
     }
 
     fn toggle_chat_list(&mut self) {
@@ -1462,6 +1733,10 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: i64) {
+        if self.focus == Focus::ChatList {
+            // Moving through real conversations is leaving the draft behind.
+            self.leave_draft();
+        }
         match self.focus {
             Focus::Help => {
                 let next = i64::from(self.help_scroll) + delta;
@@ -1579,7 +1854,7 @@ impl App {
                     self.send_composed();
                 }
             }
-            Focus::Palette => self.not_yet("The jump palette arrives with search"),
+            Focus::Palette => self.jump_to_selected(),
             Focus::Conversation => self.focus = Focus::Composer,
             Focus::Help => self.close_overlay(),
         }
@@ -1769,6 +2044,7 @@ impl App {
                 && let Some(index) =
                     crate::ui::chat_list::Shape::of(self, rect.height).chat_at(position.y - rect.y)
             {
+                self.leave_draft();
                 self.chats.selected = index;
                 self.refresh_chat_view();
             }
@@ -1811,6 +2087,14 @@ impl App {
     /// Housekeeping between frames. Returns `true` if a redraw is needed.
     pub fn tick(&mut self) -> bool {
         let mut dirty = self.status.tick();
+        if let Some(search) = self.search.as_mut()
+            && search.poll()
+        {
+            dirty = true;
+            // Results that were built without an index are worth building
+            // again now that there is one.
+            self.refresh_jump();
+        }
         dirty |= self.absorb_replies();
         dirty |= self.reconcile_pending();
         if self.watcher.ready() {
@@ -1881,6 +2165,23 @@ fn echo_row(pending: &Pending) -> Message {
         other_handle: None,
         group_action: None,
     }
+}
+
+/// Whether `chat` is a conversation with exactly `address` on the other end.
+fn chat_has_address(chat: &Chat, address: &str) -> bool {
+    if chat.is_group {
+        return false;
+    }
+    if chat
+        .identifier
+        .as_deref()
+        .is_some_and(|id| id.eq_ignore_ascii_case(address))
+    {
+        return true;
+    }
+    chat.participants
+        .iter()
+        .any(|handle| handle.id.eq_ignore_ascii_case(address))
 }
 
 /// Whether a row that just arrived is close enough in time to be the message

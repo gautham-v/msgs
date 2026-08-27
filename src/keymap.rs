@@ -62,6 +62,21 @@ pub const BINDINGS: &[Binding] = &[
         scope: "chat list",
     },
     Binding {
+        keys: "/",
+        description: "open the jump palette",
+        scope: "conversation",
+    },
+    Binding {
+        keys: "Tab",
+        description: "cycle the filter: all / chats / messages / photos",
+        scope: "palette",
+    },
+    Binding {
+        keys: "Ctrl+N",
+        description: "new message to a typed number or address",
+        scope: "palette",
+    },
+    Binding {
         keys: "o",
         description: "open the selected attachment",
         scope: "conversation",
@@ -123,7 +138,7 @@ pub const SHORTCUT_BAR: &[(&str, &str)] = &[
     ("Tab", "focus list/convo"),
     ("↑↓", "select"),
     ("Enter", "open/send"),
-    ("Ctrl+K", "jump to chat"),
+    ("Ctrl+K", "jump / search"),
     ("o", "open attachment"),
     ("y", "copy"),
     ("?", "help"),
@@ -153,10 +168,23 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
 
     match focus {
         Focus::Help => help_keys(key),
-        // `Ctrl+N` is left unbound here on purpose: the jump palette claims it
-        // for "new message to <query>".
-        Focus::Palette | Focus::Composer => text_entry_keys(key, ctrl, alt, shift),
+        Focus::Palette => palette_keys(key, ctrl, alt, shift),
+        Focus::Composer => text_entry_keys(key, ctrl, alt, shift),
         Focus::ChatList | Focus::Conversation => navigation_keys(key, focus, shift),
+    }
+}
+
+/// The palette is a text field with two keys of its own: `Tab` cycles the
+/// filter instead of moving focus, and `Ctrl+N` addresses a new message.
+fn palette_keys(key: KeyEvent, ctrl: bool, alt: bool, shift: bool) -> Option<Action> {
+    if ctrl && key.code == KeyCode::Char('n') {
+        return Some(Action::NewChat);
+    }
+    match key.code {
+        KeyCode::Tab | KeyCode::BackTab => Some(Action::PaletteFilter),
+        KeyCode::PageUp => Some(Action::PageUp),
+        KeyCode::PageDown => Some(Action::PageDown),
+        _ => text_entry_keys(key, ctrl, alt, shift),
     }
 }
 
@@ -221,7 +249,8 @@ fn navigation_keys(key: KeyEvent, focus: Focus, shift: bool) -> Option<Action> {
         KeyCode::Char('G') => Some(Action::ToBottom),
         KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Char('?') => Some(Action::OpenHelp),
-        KeyCode::Char('/') => Some(Action::StartFilter),
+        KeyCode::Char('/') if focus == Focus::ChatList => Some(Action::StartFilter),
+        KeyCode::Char('/') => Some(Action::OpenPalette),
         KeyCode::Char('o') if focus == Focus::Conversation => Some(Action::OpenAttachment),
         KeyCode::Char('s') if focus == Focus::Conversation => Some(Action::SaveAttachment),
         KeyCode::Char('r') if focus == Focus::Conversation => Some(Action::QuoteReply),

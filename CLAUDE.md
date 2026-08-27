@@ -14,7 +14,8 @@ Rust + ratatui terminal client for iMessage on macOS.
 - `src/shell.rs` — the clipboard (`pbcopy`, then OSC 52) and the browser (`open`); the only two things msgs asks the rest of the machine to do
 - `src/send.rs` — outbound messages via `osascript` → Messages.app; tapbacks via `imsg`
 - `src/watch.rs` — live updates: `notify` on the directory `chat.db` lives in, debounced, with a 2s timer as the fallback; `App::on_db_change` does the re-reading
-- `src/search.rs` — FTS5 index kept next to the app (not inside chat.db)
+- `src/search.rs` — the FTS5 message index at `~/Library/Application Support/msgs/index.db` (never inside chat.db): a worker thread builds it, tops it up from the live-update stream by `ROWID`, and answers `MATCH` queries
+- `src/jump.rs` — what the `Ctrl+K` palette matches and shows: the filter, fuzzy chat/people matching (`nucleo-matcher`), and the result rows with their highlight ranges
 - `docs/mockups.html` — the design target; match it
 
 ## Rules
