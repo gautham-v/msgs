@@ -1,0 +1,334 @@
+//! Key bindings: the one place a `KeyEvent` turns into an [`Action`].
+//!
+//! Bindings are focus-sensitive — `j` moves the selection in a list but types a
+//! letter in the composer — so [`resolve`] takes the current [`Focus`] as well
+//! as the key. The same table drives the `?` help modal and the shortcuts bar,
+//! so the documented keys and the working keys cannot drift apart.
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::app::{Action, Focus};
+
+/// One row in the help modal.
+pub struct Binding {
+    /// Keys as the user should read them, e.g. `"Ctrl+K"`.
+    pub keys: &'static str,
+    /// What the key does.
+    pub description: &'static str,
+    /// Where the binding applies.
+    pub scope: &'static str,
+}
+
+/// Every binding, in the order the help modal lists them.
+pub const BINDINGS: &[Binding] = &[
+    Binding {
+        keys: "Tab",
+        description: "switch focus: chat list → conversation → composer",
+        scope: "global",
+    },
+    Binding {
+        keys: "↑ ↓ / k j",
+        description: "select chat or message",
+        scope: "list",
+    },
+    Binding {
+        keys: "Enter",
+        description: "open chat / send message",
+        scope: "global",
+    },
+    Binding {
+        keys: "PgUp PgDn",
+        description: "page through the conversation",
+        scope: "list",
+    },
+    Binding {
+        keys: "g / G",
+        description: "jump to top / bottom",
+        scope: "list",
+    },
+    Binding {
+        keys: "Ctrl+K",
+        description: "jump palette: chats, people, message search",
+        scope: "global",
+    },
+    Binding {
+        keys: "Ctrl+B",
+        description: "toggle the chat list",
+        scope: "global",
+    },
+    Binding {
+        keys: "/",
+        description: "filter chats by name",
+        scope: "chat list",
+    },
+    Binding {
+        keys: "o",
+        description: "open the selected attachment",
+        scope: "conversation",
+    },
+    Binding {
+        keys: "s",
+        description: "save the selected attachment",
+        scope: "conversation",
+    },
+    Binding {
+        keys: "r",
+        description: "quote the selected message in a reply",
+        scope: "conversation",
+    },
+    Binding {
+        keys: "Ctrl+R",
+        description: "react to the selected message",
+        scope: "conversation",
+    },
+    Binding {
+        keys: "y",
+        description: "copy the selected message",
+        scope: "conversation",
+    },
+    Binding {
+        keys: "Ctrl+A",
+        description: "attach a file",
+        scope: "composer",
+    },
+    Binding {
+        keys: "Alt+Enter",
+        description: "newline without sending (Shift+Enter where supported)",
+        scope: "composer",
+    },
+    Binding {
+        keys: "Esc",
+        description: "close the overlay / leave the composer",
+        scope: "global",
+    },
+    Binding {
+        keys: "?",
+        description: "this help",
+        scope: "global",
+    },
+    Binding {
+        keys: "q / Ctrl+C",
+        description: "quit",
+        scope: "global",
+    },
+];
+
+/// The condensed bar along the bottom of the screen: `(keys, label)` pairs.
+pub const SHORTCUT_BAR: &[(&str, &str)] = &[
+    ("Tab", "focus list/convo"),
+    ("↑↓", "select"),
+    ("Enter", "open/send"),
+    ("Ctrl+K", "jump to chat"),
+    ("o", "open attachment"),
+    ("y", "copy"),
+    ("?", "help"),
+];
+
+/// Map a key press to an action, given what currently has focus.
+///
+/// Returns `None` when the key is not bound in this context.
+#[must_use]
+pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    // Bindings that win everywhere, including while typing.
+    if ctrl {
+        match key.code {
+            KeyCode::Char('c') => return Some(Action::Quit),
+            KeyCode::Char('k') => return Some(Action::OpenPalette),
+            KeyCode::Char('b') => return Some(Action::ToggleChatList),
+            KeyCode::Char('a') => return Some(Action::Attach),
+            KeyCode::Char('r') => return Some(Action::React),
+            _ => {}
+        }
+    }
+
+    match focus {
+        Focus::Help => help_keys(key),
+        // `Ctrl+N` is left unbound here on purpose: the jump palette claims it
+        // for "new message to <query>".
+        Focus::Palette | Focus::Composer => text_entry_keys(key, ctrl, alt, shift),
+        Focus::ChatList | Focus::Conversation => navigation_keys(key, focus, shift),
+    }
+}
+
+fn help_keys(key: KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
+            Some(Action::Cancel)
+        }
+        KeyCode::Up | KeyCode::Char('k') => Some(Action::SelectPrev),
+        KeyCode::Down | KeyCode::Char('j') => Some(Action::SelectNext),
+        KeyCode::PageUp => Some(Action::PageUp),
+        KeyCode::PageDown => Some(Action::PageDown),
+        KeyCode::Home | KeyCode::Char('g') => Some(Action::ToTop),
+        KeyCode::End | KeyCode::Char('G') => Some(Action::ToBottom),
+        _ => None,
+    }
+}
+
+/// Keys for the composer, the palette input, and the chat-list filter box.
+fn text_entry_keys(key: KeyEvent, ctrl: bool, alt: bool, shift: bool) -> Option<Action> {
+    if ctrl {
+        return match key.code {
+            KeyCode::Char('u') => Some(Action::ClearLine),
+            KeyCode::Char('w') => Some(Action::DeleteWordBack),
+            _ => None,
+        };
+    }
+    match key.code {
+        KeyCode::Esc => Some(Action::Cancel),
+        // Shift+Enter only reaches us on terminals that speak the kitty
+        // keyboard protocol; Alt+Enter is the portable fallback.
+        KeyCode::Enter if alt || shift => Some(Action::Newline),
+        KeyCode::Enter => Some(Action::Activate),
+        KeyCode::Backspace => Some(Action::Backspace),
+        KeyCode::Delete => Some(Action::DeleteForward),
+        KeyCode::Left => Some(Action::CursorLeft),
+        KeyCode::Right => Some(Action::CursorRight),
+        KeyCode::Home => Some(Action::CursorHome),
+        KeyCode::End => Some(Action::CursorEnd),
+        KeyCode::Up => Some(Action::SelectPrev),
+        KeyCode::Down => Some(Action::SelectNext),
+        KeyCode::Tab => Some(Action::FocusNext),
+        KeyCode::BackTab => Some(Action::FocusPrev),
+        KeyCode::Char(c) => Some(Action::Insert(c)),
+        _ => None,
+    }
+}
+
+fn navigation_keys(key: KeyEvent, focus: Focus, shift: bool) -> Option<Action> {
+    match key.code {
+        KeyCode::Tab => Some(Action::FocusNext),
+        KeyCode::BackTab => Some(Action::FocusPrev),
+        KeyCode::Esc => Some(Action::Cancel),
+        KeyCode::Enter => Some(Action::Activate),
+        KeyCode::Up | KeyCode::Char('k') => Some(Action::SelectPrev),
+        KeyCode::Down | KeyCode::Char('j') => Some(Action::SelectNext),
+        KeyCode::PageUp => Some(Action::PageUp),
+        KeyCode::PageDown => Some(Action::PageDown),
+        KeyCode::Home => Some(Action::ToTop),
+        KeyCode::End => Some(Action::ToBottom),
+        KeyCode::Char('g') if !shift => Some(Action::ToTop),
+        KeyCode::Char('G') => Some(Action::ToBottom),
+        KeyCode::Char('q') => Some(Action::Quit),
+        KeyCode::Char('?') => Some(Action::OpenHelp),
+        KeyCode::Char('/') => Some(Action::StartFilter),
+        KeyCode::Char('o') if focus == Focus::Conversation => Some(Action::OpenAttachment),
+        KeyCode::Char('s') if focus == Focus::Conversation => Some(Action::SaveAttachment),
+        KeyCode::Char('r') if focus == Focus::Conversation => Some(Action::QuoteReply),
+        KeyCode::Char('y') if focus == Focus::Conversation => Some(Action::CopySelection),
+        KeyCode::Char('i') if focus == Focus::Conversation => Some(Action::FocusComposer),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn with(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_every_focus() {
+        for focus in [
+            Focus::ChatList,
+            Focus::Conversation,
+            Focus::Composer,
+            Focus::Palette,
+            Focus::Help,
+        ] {
+            let action = resolve(with(KeyCode::Char('c'), KeyModifiers::CONTROL), focus);
+            assert_eq!(action, Some(Action::Quit), "focus {focus:?}");
+        }
+    }
+
+    #[test]
+    fn q_quits_from_lists_but_types_in_the_composer() {
+        assert_eq!(
+            resolve(key(KeyCode::Char('q')), Focus::ChatList),
+            Some(Action::Quit)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Char('q')), Focus::Composer),
+            Some(Action::Insert('q'))
+        );
+    }
+
+    #[test]
+    fn vim_keys_navigate_lists_and_type_in_the_composer() {
+        assert_eq!(
+            resolve(key(KeyCode::Char('j')), Focus::Conversation),
+            Some(Action::SelectNext)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Char('j')), Focus::Palette),
+            Some(Action::Insert('j'))
+        );
+    }
+
+    #[test]
+    fn enter_sends_but_modified_enter_makes_a_newline() {
+        assert_eq!(
+            resolve(key(KeyCode::Enter), Focus::Composer),
+            Some(Action::Activate)
+        );
+        assert_eq!(
+            resolve(with(KeyCode::Enter, KeyModifiers::ALT), Focus::Composer),
+            Some(Action::Newline)
+        );
+        assert_eq!(
+            resolve(with(KeyCode::Enter, KeyModifiers::SHIFT), Focus::Composer),
+            Some(Action::Newline)
+        );
+    }
+
+    #[test]
+    fn overlays_open_from_anywhere() {
+        assert_eq!(
+            resolve(
+                with(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                Focus::Composer
+            ),
+            Some(Action::OpenPalette)
+        );
+        assert_eq!(
+            resolve(
+                with(KeyCode::Char('b'), KeyModifiers::CONTROL),
+                Focus::Palette
+            ),
+            Some(Action::ToggleChatList)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Char('?')), Focus::ChatList),
+            Some(Action::OpenHelp)
+        );
+    }
+
+    #[test]
+    fn conversation_only_keys_do_nothing_in_the_chat_list() {
+        assert_eq!(
+            resolve(key(KeyCode::Char('o')), Focus::Conversation),
+            Some(Action::OpenAttachment)
+        );
+        assert_eq!(resolve(key(KeyCode::Char('o')), Focus::ChatList), None);
+    }
+
+    #[test]
+    fn every_binding_row_is_filled_in() {
+        for binding in BINDINGS {
+            assert!(!binding.keys.is_empty());
+            assert!(!binding.description.is_empty());
+            assert!(!binding.scope.is_empty());
+        }
+        assert!(!SHORTCUT_BAR.is_empty());
+    }
+}

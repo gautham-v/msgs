@@ -1,0 +1,1024 @@
+//! Application state and the single `update` entry point that mutates it.
+//!
+//! Input handling is deliberately split in three: `keymap` turns a key into an
+//! [`Action`], [`App::update`] applies the action, and `ui` draws the result.
+//! Nothing else touches state, so behavior stays testable without a terminal.
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Position, Rect};
+
+use crate::config::Config;
+use crate::theme::Theme;
+use crate::ui::Panes;
+
+/// How long a toast stays on the status line.
+const TOAST_TTL: Duration = Duration::from_secs(2);
+/// Rows moved per wheel notch.
+const WHEEL_ROWS: i16 = 3;
+/// Tallest the composer grows before it scrolls internally.
+pub const COMPOSER_MAX_LINES: u16 = 6;
+
+/// Which pane or overlay currently receives keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    /// Left pane, the list of chats.
+    ChatList,
+    /// Right pane, the message blocks.
+    Conversation,
+    /// The send box under the conversation.
+    Composer,
+    /// The `Ctrl+K` jump palette, floating over everything.
+    Palette,
+    /// The `?` help modal.
+    Help,
+}
+
+impl Focus {
+    /// Overlays float above the panes and take all keys while open.
+    #[must_use]
+    pub const fn is_overlay(self) -> bool {
+        matches!(self, Self::Palette | Self::Help)
+    }
+}
+
+/// Everything the UI can be asked to do. Produced by `keymap` from a key press
+/// or by [`App::on_mouse`] from a click or wheel notch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// Leave the app.
+    Quit,
+    /// Move focus to the next pane.
+    FocusNext,
+    /// Move focus to the previous pane.
+    FocusPrev,
+    /// Move focus to a specific pane (mouse click).
+    FocusPane(Focus),
+    /// Jump straight to the send box.
+    FocusComposer,
+    /// Show or hide the chat list.
+    ToggleChatList,
+    /// Move the selection up one row.
+    SelectPrev,
+    /// Move the selection down one row.
+    SelectNext,
+    /// Move the selection up one page.
+    PageUp,
+    /// Move the selection down one page.
+    PageDown,
+    /// Jump to the first row.
+    ToTop,
+    /// Jump to the last row.
+    ToBottom,
+    /// Scroll the pane under the mouse by a signed number of rows.
+    Scroll(i16),
+    /// `Enter`: open the selected chat, or send the composed message.
+    Activate,
+    /// Open the jump palette.
+    OpenPalette,
+    /// Open the help modal.
+    OpenHelp,
+    /// `Esc`: close an overlay, clear a filter, or leave the composer.
+    Cancel,
+    /// Start filtering the chat list by name.
+    StartFilter,
+    /// Open the attachment on the selected message.
+    OpenAttachment,
+    /// Save the attachment on the selected message.
+    SaveAttachment,
+    /// Quote the selected message in the composer.
+    QuoteReply,
+    /// React to the selected message.
+    React,
+    /// Copy the selected message to the clipboard.
+    CopySelection,
+    /// Attach a file to the message being composed.
+    Attach,
+    /// Type a character into whatever text field has focus.
+    Insert(char),
+    /// Delete the character before the cursor.
+    Backspace,
+    /// Delete the character after the cursor.
+    DeleteForward,
+    /// Delete the word before the cursor.
+    DeleteWordBack,
+    /// Clear the whole text field.
+    ClearLine,
+    /// Insert a newline without sending.
+    Newline,
+    /// Move the text cursor left one character.
+    CursorLeft,
+    /// Move the text cursor right one character.
+    CursorRight,
+    /// Move the text cursor to the start of the field.
+    CursorHome,
+    /// Move the text cursor to the end of the field.
+    CursorEnd,
+}
+
+/// Whether `chat.db` could be opened. Filled in by the database layer.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DbStatus {
+    /// No database has been opened yet.
+    #[default]
+    NotOpened,
+    /// Open and readable.
+    Ready,
+    /// Could not be opened; the string is a short, path-only reason.
+    Unreadable(String),
+}
+
+/// How the app is learning about new messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WatcherStatus {
+    /// Not started.
+    #[default]
+    Off,
+    /// Watching `chat.db-wal` for changes.
+    Watching,
+    /// The watcher failed; falling back to a timer.
+    Polling,
+}
+
+/// A short-lived message on the status line.
+#[derive(Debug, Clone)]
+struct Toast {
+    text: String,
+    born: Instant,
+    is_error: bool,
+}
+
+/// The segments of the bottom status line.
+#[derive(Debug, Default)]
+pub struct Status {
+    /// State of `chat.db`.
+    pub db: DbStatus,
+    /// State of the live-update watcher.
+    pub watcher: WatcherStatus,
+    /// Whether Messages.app is running, once we have checked.
+    pub messages_app_running: Option<bool>,
+    /// Total unread messages across all chats.
+    pub unread_total: usize,
+    /// How many chats hold those unread messages.
+    pub unread_chats: usize,
+    /// Startup warnings (bad config keys, and so on).
+    pub warnings: Vec<String>,
+    toast: Option<Toast>,
+}
+
+impl Status {
+    /// Show a transient note on the status line.
+    pub fn toast(&mut self, text: impl Into<String>) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            born: Instant::now(),
+            is_error: false,
+        });
+    }
+
+    /// Show a transient failure on the status line.
+    pub fn error(&mut self, text: impl Into<String>) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            born: Instant::now(),
+            is_error: true,
+        });
+    }
+
+    /// The live toast, as `(text, is_error)`, if one has not expired.
+    #[must_use]
+    pub fn active_toast(&self) -> Option<(&str, bool)> {
+        self.toast
+            .as_ref()
+            .filter(|toast| toast.born.elapsed() < TOAST_TTL)
+            .map(|toast| (toast.text.as_str(), toast.is_error))
+    }
+
+    /// Drop an expired toast. Returns `true` if the screen needs a redraw.
+    fn tick(&mut self) -> bool {
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.born.elapsed() >= TOAST_TTL)
+        {
+            self.toast = None;
+            return true;
+        }
+        false
+    }
+}
+
+/// A vertically scrolling list of rows with one selected row.
+///
+/// Both panes use this: the chat list selects chats, the conversation selects
+/// message blocks. `len` is `0` until a data layer fills it in, and every
+/// method is a safe no-op at that size.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListPane {
+    /// Number of rows currently in the list.
+    pub len: usize,
+    /// Index of the selected row, always `< len` when `len > 0`.
+    pub selected: usize,
+    /// Index of the first visible row.
+    pub offset: usize,
+}
+
+impl ListPane {
+    /// Resize the list, keeping the selection in range.
+    pub fn set_len(&mut self, len: usize) {
+        self.len = len;
+        self.selected = self.selected.min(len.saturating_sub(1));
+        if len == 0 {
+            self.selected = 0;
+            self.offset = 0;
+        }
+    }
+
+    /// Move the selection by `delta` rows, clamped to the ends of the list.
+    pub fn move_by(&mut self, delta: i64) {
+        if self.len == 0 {
+            return;
+        }
+        let last = (self.len - 1) as i64;
+        let next = (self.selected as i64 + delta).clamp(0, last);
+        self.selected = next as usize;
+    }
+
+    /// Select the first row.
+    pub fn to_top(&mut self) {
+        self.selected = 0;
+        self.offset = 0;
+    }
+
+    /// Select the last row.
+    pub fn to_bottom(&mut self) {
+        self.selected = self.len.saturating_sub(1);
+    }
+
+    /// Scroll the viewport without moving the selection.
+    pub fn scroll_by(&mut self, delta: i64) {
+        let max_offset = self.len.saturating_sub(1) as i64;
+        self.offset = (self.offset as i64 + delta).clamp(0, max_offset) as usize;
+    }
+
+    /// Pull `offset` toward the selection so it stays visible in `height` rows.
+    pub fn scroll_into_view(&mut self, height: u16) {
+        let height = usize::from(height).max(1);
+        if self.selected < self.offset {
+            self.offset = self.selected;
+        } else if self.selected >= self.offset + height {
+            self.offset = self.selected - height + 1;
+        }
+        let max_offset = self.len.saturating_sub(height);
+        self.offset = self.offset.min(max_offset);
+    }
+
+    /// Select the row drawn at absolute terminal row `row` inside `area`.
+    /// Returns `true` if a row was hit.
+    pub fn select_at_row(&mut self, area: Rect, row: u16) -> bool {
+        if self.len == 0 || row < area.y || row >= area.y + area.height {
+            return false;
+        }
+        let index = self.offset + usize::from(row - area.y);
+        if index >= self.len {
+            return false;
+        }
+        self.selected = index;
+        true
+    }
+}
+
+/// A multi-line text field with a byte-offset cursor.
+///
+/// Used by the composer, the palette input, and the chat-list filter box.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TextField {
+    text: String,
+    cursor: usize,
+}
+
+impl TextField {
+    /// Build a field with the cursor at the end of `text`.
+    #[must_use]
+    pub fn from_text(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let cursor = text.len();
+        Self { text, cursor }
+    }
+
+    /// The current contents.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Byte offset of the cursor within [`Self::text`].
+    #[must_use]
+    pub const fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Whether the field is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// Insert a character at the cursor.
+    pub fn insert(&mut self, c: char) {
+        self.text.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    /// Delete the character before the cursor.
+    pub fn backspace(&mut self) {
+        if let Some(prev) = self.prev_boundary() {
+            self.text.replace_range(prev..self.cursor, "");
+            self.cursor = prev;
+        }
+    }
+
+    /// Delete the character after the cursor.
+    pub fn delete_forward(&mut self) {
+        if let Some(next) = self.next_boundary() {
+            self.text.replace_range(self.cursor..next, "");
+        }
+    }
+
+    /// Delete back to the start of the current word.
+    pub fn delete_word_back(&mut self) {
+        let head = &self.text[..self.cursor];
+        let trimmed = head.trim_end_matches(char::is_whitespace);
+        let start = trimmed
+            .rfind(char::is_whitespace)
+            .map_or(0, |index| index + 1);
+        self.text.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+
+    /// Empty the field.
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    /// Take the contents, leaving the field empty.
+    pub fn take(&mut self) -> String {
+        self.cursor = 0;
+        std::mem::take(&mut self.text)
+    }
+
+    /// Move the cursor one character left.
+    pub fn cursor_left(&mut self) {
+        if let Some(prev) = self.prev_boundary() {
+            self.cursor = prev;
+        }
+    }
+
+    /// Move the cursor one character right.
+    pub fn cursor_right(&mut self) {
+        if let Some(next) = self.next_boundary() {
+            self.cursor = next;
+        }
+    }
+
+    /// Move the cursor to the start of the field.
+    pub const fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Move the cursor to the end of the field.
+    pub const fn cursor_end(&mut self) {
+        self.cursor = self.text.len();
+    }
+
+    /// Number of newline-separated lines, at least one.
+    #[must_use]
+    pub fn line_count(&self) -> u16 {
+        let lines = self.text.split('\n').count();
+        u16::try_from(lines).unwrap_or(u16::MAX).max(1)
+    }
+
+    fn prev_boundary(&self) -> Option<usize> {
+        self.text[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+    }
+
+    fn next_boundary(&self) -> Option<usize> {
+        self.text[self.cursor..]
+            .chars()
+            .next()
+            .map(|c| self.cursor + c.len_utf8())
+    }
+}
+
+/// The whole application.
+pub struct App {
+    /// User config, as loaded at startup.
+    pub config: Config,
+    /// Colors, after config overrides.
+    pub theme: Theme,
+    /// Which pane has keyboard focus.
+    pub focus: Focus,
+    /// Where focus returns to when an overlay closes.
+    overlay_return: Focus,
+    /// Whether the chat list is shown (`Ctrl+B`).
+    pub show_chat_list: bool,
+    /// Whether mouse capture is on.
+    pub mouse_enabled: bool,
+    /// Path of the database being read, once one is chosen.
+    pub db_path: Option<PathBuf>,
+    /// Set to leave the event loop.
+    pub should_quit: bool,
+    /// Selection state of the chat list.
+    pub chats: ListPane,
+    /// Inline chat-list filter, active while `Some`.
+    pub chat_filter: Option<TextField>,
+    /// Selection state of the conversation.
+    pub messages: ListPane,
+    /// The send box.
+    pub composer: TextField,
+    /// The jump palette query.
+    pub palette: TextField,
+    /// Scroll offset of the help modal.
+    pub help_scroll: u16,
+    /// Status line state.
+    pub status: Status,
+    /// Rects from the last frame, for mouse hit-testing.
+    pub panes: Panes,
+    /// Last known mouse position, for the hover tint.
+    pub hover: Option<Position>,
+}
+
+impl App {
+    /// Build the app from a loaded config and any startup warnings.
+    #[must_use]
+    pub fn new(config: Config, mut warnings: Vec<String>) -> Self {
+        let mut theme = Theme::default();
+        warnings.extend(theme.apply_overrides(&config.theme));
+        let show_chat_list = config.show_chat_list;
+        let mouse_enabled = config.mouse;
+        let mut status = Status::default();
+        if let Some(first) = warnings.first() {
+            status.error(first.clone());
+        }
+        status.warnings = warnings;
+
+        Self {
+            config,
+            theme,
+            focus: Focus::ChatList,
+            overlay_return: Focus::ChatList,
+            show_chat_list,
+            mouse_enabled,
+            db_path: None,
+            should_quit: false,
+            chats: ListPane::default(),
+            chat_filter: None,
+            messages: ListPane::default(),
+            composer: TextField::default(),
+            palette: TextField::default(),
+            help_scroll: 0,
+            status,
+            panes: Panes::default(),
+            hover: None,
+        }
+    }
+
+    /// The focus `keymap` should resolve against.
+    ///
+    /// While the chat-list filter box is open the list pane behaves as a text
+    /// field, so letters type instead of navigating.
+    #[must_use]
+    pub fn key_focus(&self) -> Focus {
+        if self.focus == Focus::ChatList && self.chat_filter.is_some() {
+            Focus::Composer
+        } else {
+            self.focus
+        }
+    }
+
+    /// Panes that can hold focus right now, in `Tab` order.
+    fn focus_cycle(&self) -> Vec<Focus> {
+        let mut cycle = Vec::with_capacity(3);
+        if self.show_chat_list {
+            cycle.push(Focus::ChatList);
+        }
+        cycle.push(Focus::Conversation);
+        cycle.push(Focus::Composer);
+        cycle
+    }
+
+    fn cycle_focus(&mut self, forward: bool) {
+        let cycle = self.focus_cycle();
+        let current = cycle.iter().position(|f| *f == self.focus).unwrap_or(0);
+        let next = if forward {
+            (current + 1) % cycle.len()
+        } else {
+            (current + cycle.len() - 1) % cycle.len()
+        };
+        self.focus = cycle[next];
+    }
+
+    fn open_overlay(&mut self, overlay: Focus) {
+        if !self.focus.is_overlay() {
+            self.overlay_return = self.focus;
+        }
+        self.focus = overlay;
+    }
+
+    fn close_overlay(&mut self) {
+        self.help_scroll = 0;
+        self.palette.clear();
+        self.focus = self.overlay_return;
+    }
+
+    /// The text field that currently has focus, if any.
+    fn active_field(&mut self) -> Option<&mut TextField> {
+        match self.focus {
+            Focus::Composer => Some(&mut self.composer),
+            Focus::Palette => Some(&mut self.palette),
+            Focus::ChatList => self.chat_filter.as_mut(),
+            _ => None,
+        }
+    }
+
+    /// The list that currently has focus, if any.
+    fn active_list(&mut self) -> Option<&mut ListPane> {
+        match self.focus {
+            Focus::ChatList => Some(&mut self.chats),
+            Focus::Conversation => Some(&mut self.messages),
+            _ => None,
+        }
+    }
+
+    /// Apply one action. This is the only place app state changes.
+    pub fn update(&mut self, action: Action) {
+        match action {
+            Action::Quit => self.should_quit = true,
+            Action::FocusNext => self.cycle_focus(true),
+            Action::FocusPrev => self.cycle_focus(false),
+            Action::FocusPane(pane) => self.focus = pane,
+            Action::FocusComposer => self.focus = Focus::Composer,
+            Action::ToggleChatList => self.toggle_chat_list(),
+            Action::SelectPrev => self.move_selection(-1),
+            Action::SelectNext => self.move_selection(1),
+            Action::PageUp => self.move_selection(-i64::from(self.config.page_step)),
+            Action::PageDown => self.move_selection(i64::from(self.config.page_step)),
+            Action::ToTop => self.jump(true),
+            Action::ToBottom => self.jump(false),
+            Action::Scroll(delta) => self.scroll(i64::from(delta)),
+            Action::Activate => self.activate(),
+            Action::OpenPalette => self.open_overlay(Focus::Palette),
+            Action::OpenHelp => self.open_overlay(Focus::Help),
+            Action::Cancel => self.cancel(),
+            Action::StartFilter => self.start_filter(),
+            Action::Insert(c) => self.edit(|field| field.insert(c)),
+            Action::Backspace => self.backspace(),
+            Action::DeleteForward => self.edit(TextField::delete_forward),
+            Action::DeleteWordBack => self.edit(TextField::delete_word_back),
+            Action::ClearLine => self.edit(TextField::clear),
+            Action::Newline => self.edit(|field| field.insert('\n')),
+            Action::CursorLeft => self.edit(TextField::cursor_left),
+            Action::CursorRight => self.edit(TextField::cursor_right),
+            Action::CursorHome => self.edit(TextField::cursor_home),
+            Action::CursorEnd => self.edit(TextField::cursor_end),
+            Action::Attach => self.not_yet("Attaching files arrives with the composer"),
+            Action::OpenAttachment => self.not_yet("Attachments arrive with the attachment pass"),
+            Action::SaveAttachment => self.not_yet("Attachments arrive with the attachment pass"),
+            Action::QuoteReply => self.not_yet("Reply quoting arrives with the conversation pane"),
+            Action::React => self.not_yet("Tapbacks arrive with the imsg integration"),
+            Action::CopySelection => self.not_yet("Copy arrives with the conversation pane"),
+        }
+    }
+
+    fn toggle_chat_list(&mut self) {
+        self.show_chat_list = !self.show_chat_list;
+        if !self.show_chat_list {
+            self.chat_filter = None;
+            if self.focus == Focus::ChatList {
+                self.focus = Focus::Conversation;
+            }
+            if self.overlay_return == Focus::ChatList {
+                self.overlay_return = Focus::Conversation;
+            }
+        }
+    }
+
+    fn move_selection(&mut self, delta: i64) {
+        match self.focus {
+            Focus::Help => {
+                let next = i64::from(self.help_scroll) + delta;
+                self.help_scroll = u16::try_from(next.max(0)).unwrap_or(u16::MAX);
+            }
+            _ => {
+                if let Some(list) = self.active_list() {
+                    list.move_by(delta);
+                }
+            }
+        }
+    }
+
+    fn jump(&mut self, to_top: bool) {
+        if self.focus == Focus::Help {
+            self.help_scroll = 0;
+            return;
+        }
+        if let Some(list) = self.active_list() {
+            if to_top {
+                list.to_top();
+            } else {
+                list.to_bottom();
+            }
+        }
+    }
+
+    fn scroll(&mut self, delta: i64) {
+        if self.focus == Focus::Help {
+            let next = i64::from(self.help_scroll) + delta;
+            self.help_scroll = u16::try_from(next.max(0)).unwrap_or(u16::MAX);
+            return;
+        }
+        if let Some(list) = self.active_list() {
+            list.scroll_by(delta);
+        }
+    }
+
+    fn activate(&mut self) {
+        match self.focus {
+            Focus::ChatList => {
+                // Committing the filter keeps the narrowed list and hands keys
+                // back to navigation.
+                self.chat_filter = None;
+                self.focus = Focus::Conversation;
+            }
+            Focus::Composer => {
+                if self.composer.is_empty() {
+                    return;
+                }
+                self.not_yet("Sending arrives with the Messages.app bridge");
+            }
+            Focus::Palette => self.not_yet("The jump palette arrives with search"),
+            Focus::Conversation => self.focus = Focus::Composer,
+            Focus::Help => self.close_overlay(),
+        }
+    }
+
+    fn cancel(&mut self) {
+        match self.focus {
+            Focus::Help | Focus::Palette => self.close_overlay(),
+            Focus::ChatList => self.chat_filter = None,
+            Focus::Composer => self.focus = Focus::Conversation,
+            Focus::Conversation => {
+                if self.show_chat_list {
+                    self.focus = Focus::ChatList;
+                }
+            }
+        }
+    }
+
+    fn start_filter(&mut self) {
+        if !self.show_chat_list {
+            self.show_chat_list = true;
+        }
+        self.focus = Focus::ChatList;
+        self.chat_filter = Some(TextField::default());
+    }
+
+    fn edit(&mut self, apply: impl FnOnce(&mut TextField)) {
+        if let Some(field) = self.active_field() {
+            apply(field);
+        }
+    }
+
+    /// Backspace on an empty filter box closes it, which is what `Esc` would do.
+    fn backspace(&mut self) {
+        if self.focus == Focus::ChatList
+            && self.chat_filter.as_ref().is_some_and(TextField::is_empty)
+        {
+            self.chat_filter = None;
+            return;
+        }
+        self.edit(TextField::backspace);
+    }
+
+    fn not_yet(&mut self, what: &str) {
+        self.status.toast(format!("{what} — not wired up yet"));
+    }
+
+    /// Height the composer wants, borders included.
+    #[must_use]
+    pub fn composer_height(&self) -> u16 {
+        self.composer.line_count().clamp(1, COMPOSER_MAX_LINES) + 2
+    }
+
+    /// Route a mouse event to the pane under the pointer.
+    pub fn on_mouse(&mut self, event: MouseEvent) {
+        let position = Position::new(event.column, event.row);
+        self.hover = Some(position);
+        let target = self.pane_at(position);
+
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Clicks pass through to panes only while no overlay is up;
+                // an overlay swallows them so a stray click cannot act on the
+                // dimmed screen behind it.
+                if self.focus.is_overlay() {
+                    return;
+                }
+                if let Some(pane) = target {
+                    self.focus = pane;
+                    self.click(pane, position);
+                }
+            }
+            MouseEventKind::ScrollUp => self.wheel(target, -WHEEL_ROWS),
+            MouseEventKind::ScrollDown => self.wheel(target, WHEEL_ROWS),
+            _ => {}
+        }
+    }
+
+    /// Which pane covers `position`, per the last frame's layout.
+    fn pane_at(&self, position: Position) -> Option<Focus> {
+        if self
+            .panes
+            .chat_list
+            .is_some_and(|rect| rect.contains(position))
+        {
+            return Some(Focus::ChatList);
+        }
+        if self.panes.conversation.contains(position) {
+            return Some(Focus::Conversation);
+        }
+        if self.panes.composer.contains(position) {
+            return Some(Focus::Composer);
+        }
+        None
+    }
+
+    fn click(&mut self, pane: Focus, position: Position) {
+        if pane == Focus::ChatList {
+            if let Some(rect) = self.panes.chat_list_rows {
+                self.chats.select_at_row(rect, position.y);
+            }
+        } else if pane == Focus::Conversation {
+            self.messages
+                .select_at_row(self.panes.conversation, position.y);
+        }
+    }
+
+    /// Scroll the pane under the pointer, or the focused one if the pointer is
+    /// somewhere without a pane. The wheel never moves focus, so scrolling one
+    /// pane in passing does not change where the next key goes.
+    fn wheel(&mut self, target: Option<Focus>, delta: i16) {
+        let previous = self.focus;
+        if let Some(pane) = target
+            && !previous.is_overlay()
+        {
+            self.focus = pane;
+        }
+        self.update(Action::Scroll(delta));
+        self.focus = previous;
+    }
+
+    /// Housekeeping between frames. Returns `true` if a redraw is needed.
+    pub fn tick(&mut self) -> bool {
+        self.status.tick()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn app() -> App {
+        App::new(Config::default(), Vec::new())
+    }
+
+    #[test]
+    fn tab_cycles_panes_and_skips_a_hidden_chat_list() {
+        let mut app = app();
+        assert_eq!(app.focus, Focus::ChatList);
+        app.update(Action::FocusNext);
+        assert_eq!(app.focus, Focus::Conversation);
+        app.update(Action::FocusNext);
+        assert_eq!(app.focus, Focus::Composer);
+        app.update(Action::FocusNext);
+        assert_eq!(app.focus, Focus::ChatList);
+
+        app.update(Action::ToggleChatList);
+        assert_eq!(app.focus, Focus::Conversation);
+        app.update(Action::FocusNext);
+        app.update(Action::FocusNext);
+        assert_eq!(app.focus, Focus::Conversation);
+    }
+
+    #[test]
+    fn overlays_return_focus_where_it_was() {
+        let mut app = app();
+        app.update(Action::FocusNext);
+        app.update(Action::FocusNext);
+        assert_eq!(app.focus, Focus::Composer);
+
+        app.update(Action::OpenHelp);
+        assert_eq!(app.focus, Focus::Help);
+        app.update(Action::OpenPalette);
+        assert_eq!(app.focus, Focus::Palette);
+        app.update(Action::Cancel);
+        assert_eq!(app.focus, Focus::Composer);
+    }
+
+    #[test]
+    fn hiding_the_chat_list_moves_the_overlay_return_off_it() {
+        let mut app = app();
+        app.update(Action::OpenHelp);
+        app.update(Action::ToggleChatList);
+        app.update(Action::Cancel);
+        assert_eq!(app.focus, Focus::Conversation);
+    }
+
+    #[test]
+    fn selection_is_clamped_and_safe_on_an_empty_list() {
+        let mut app = app();
+        app.update(Action::SelectNext);
+        app.update(Action::ToBottom);
+        assert_eq!(app.chats.selected, 0);
+
+        app.chats.set_len(4);
+        app.update(Action::PageDown);
+        assert_eq!(app.chats.selected, 3);
+        app.update(Action::SelectPrev);
+        assert_eq!(app.chats.selected, 2);
+        app.update(Action::ToTop);
+        assert_eq!(app.chats.selected, 0);
+        app.update(Action::SelectPrev);
+        assert_eq!(app.chats.selected, 0);
+    }
+
+    #[test]
+    fn shrinking_a_list_keeps_the_selection_in_range() {
+        let mut list = ListPane::default();
+        list.set_len(10);
+        list.to_bottom();
+        assert_eq!(list.selected, 9);
+        list.set_len(3);
+        assert_eq!(list.selected, 2);
+        list.set_len(0);
+        assert_eq!(list.selected, 0);
+    }
+
+    #[test]
+    fn scroll_into_view_follows_the_selection_both_ways() {
+        let mut list = ListPane::default();
+        list.set_len(50);
+        list.selected = 20;
+        list.scroll_into_view(10);
+        assert_eq!(list.offset, 11);
+        list.selected = 5;
+        list.scroll_into_view(10);
+        assert_eq!(list.offset, 5);
+    }
+
+    #[test]
+    fn filter_box_swallows_letters_then_gives_them_back() {
+        let mut app = app();
+        assert_eq!(app.key_focus(), Focus::ChatList);
+        app.update(Action::StartFilter);
+        assert_eq!(app.key_focus(), Focus::Composer);
+
+        app.update(Action::Insert('p'));
+        app.update(Action::Insert('r'));
+        assert_eq!(app.chat_filter.as_ref().unwrap().text(), "pr");
+
+        app.update(Action::Backspace);
+        assert_eq!(app.chat_filter.as_ref().unwrap().text(), "p");
+        app.update(Action::Cancel);
+        assert!(app.chat_filter.is_none());
+        assert_eq!(app.key_focus(), Focus::ChatList);
+    }
+
+    #[test]
+    fn backspace_on_an_empty_filter_closes_it() {
+        let mut app = app();
+        app.update(Action::StartFilter);
+        app.update(Action::Backspace);
+        assert!(app.chat_filter.is_none());
+    }
+
+    #[test]
+    fn composer_grows_to_a_ceiling() {
+        let mut app = app();
+        app.update(Action::FocusPane(Focus::Composer));
+        assert_eq!(app.composer_height(), 3);
+        for _ in 0..3 {
+            app.update(Action::Newline);
+        }
+        assert_eq!(app.composer_height(), 6);
+        for _ in 0..20 {
+            app.update(Action::Newline);
+        }
+        assert_eq!(app.composer_height(), COMPOSER_MAX_LINES + 2);
+    }
+
+    #[test]
+    fn text_field_edits_respect_char_boundaries() {
+        let mut field = TextField::from_text("héllo 🌊");
+        field.backspace();
+        assert_eq!(field.text(), "héllo ");
+        field.cursor_home();
+        field.cursor_right();
+        field.delete_forward();
+        assert_eq!(field.text(), "hllo ");
+        field.cursor_end();
+        field.delete_word_back();
+        assert_eq!(field.text(), "");
+    }
+
+    #[test]
+    fn text_field_take_empties_it() {
+        let mut field = TextField::from_text("hi");
+        assert_eq!(field.take(), "hi");
+        assert!(field.is_empty());
+        assert_eq!(field.cursor(), 0);
+    }
+
+    #[test]
+    fn wheel_scrolls_the_pane_under_the_pointer_without_stealing_focus() {
+        let mut app = app();
+        app.messages.set_len(100);
+        app.panes.conversation = Rect::new(30, 1, 50, 20);
+        app.panes.chat_list = Some(Rect::new(0, 0, 30, 22));
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 40,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+
+        assert_eq!(
+            app.focus,
+            Focus::ChatList,
+            "focus must not follow the wheel"
+        );
+        assert_eq!(app.messages.offset, usize::try_from(WHEEL_ROWS).unwrap());
+    }
+
+    #[test]
+    fn clicking_a_pane_focuses_it_and_selects_the_row() {
+        let mut app = app();
+        app.messages.set_len(100);
+        app.panes.conversation = Rect::new(30, 1, 50, 20);
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 40,
+            row: 4,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.focus, Focus::Conversation);
+        assert_eq!(app.messages.selected, 3);
+    }
+
+    #[test]
+    fn an_open_overlay_swallows_clicks() {
+        let mut app = app();
+        app.panes.conversation = Rect::new(30, 1, 50, 20);
+        app.update(Action::OpenHelp);
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 40,
+            row: 4,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.focus, Focus::Help);
+    }
+
+    #[test]
+    fn config_theme_overrides_reach_the_app_and_bad_ones_warn() {
+        let (config, warnings) =
+            Config::parse("[theme]\naccent_me = \"#123456\"\nbogus = \"#fff\"");
+        let app = App::new(config, warnings);
+        assert_eq!(
+            app.theme.accent_me,
+            ratatui::style::Color::Rgb(0x12, 0x34, 0x56)
+        );
+        assert_eq!(app.status.warnings.len(), 1);
+        assert!(app.status.active_toast().is_some());
+    }
+
+    #[test]
+    fn quit_stops_the_loop() {
+        let mut app = app();
+        assert!(!app.should_quit);
+        app.update(Action::Quit);
+        assert!(app.should_quit);
+    }
+}
