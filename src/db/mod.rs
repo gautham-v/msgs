@@ -28,7 +28,7 @@ use imessage_database::util::dates::{get_local_time, get_offset};
 use rusqlite::{Connection, OpenFlags};
 
 pub use chat::{Chat, Preview};
-pub use handle::Handle;
+pub use handle::{Handle, Name};
 pub use message::{
     AttachmentKind, AttachmentRef, GroupAction, Message, Tapback, TapbackAction, TapbackKind,
     body_text,
@@ -417,7 +417,11 @@ fn connect(path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// `file:/percent/encoded/path?mode=ro`.
-fn read_only_uri(path: &Path) -> String {
+///
+/// [`crate::contacts`] opens the Contacts stores the same way, so the escaping
+/// lives here rather than being written twice.
+#[must_use]
+pub fn read_only_uri(path: &Path) -> String {
     let raw = path.to_string_lossy();
     let mut uri = String::with_capacity(raw.len() + 16);
     uri.push_str("file:");
@@ -449,15 +453,25 @@ fn is_lock_error(err: &rusqlite::Error) -> bool {
     }
 }
 
-/// A private copy of the database, removed when it is dropped.
+/// A private copy of a SQLite database and its WAL sidecars, removed when it is
+/// dropped.
+///
+/// Used for `chat.db` when Messages.app holds it, and by [`crate::contacts`]
+/// for a Contacts store that refuses a reader for the same reason. Whatever
+/// holds the connection must hold this too: dropping it deletes the files.
 #[derive(Debug)]
-struct Scratch {
+pub struct Scratch {
     dir: PathBuf,
     db: PathBuf,
 }
 
 impl Scratch {
-    fn new(source: &Path) -> Result<Self, DbError> {
+    /// Copy `source` and its sidecars somewhere private.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Copy`] if the directory or the copy cannot be made.
+    pub fn new(source: &Path) -> Result<Self, DbError> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
@@ -494,6 +508,12 @@ impl Scratch {
         }
 
         Ok(scratch)
+    }
+
+    /// The copy to open.
+    #[must_use]
+    pub fn db(&self) -> &Path {
+        &self.db
     }
 }
 

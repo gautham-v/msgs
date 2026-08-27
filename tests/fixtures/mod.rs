@@ -469,6 +469,105 @@ fn chat(
     .map(|_| ())
 }
 
+/// The addresses [`address_book`] invents names for, in the order it writes
+/// them. Every one of them is one of the fixture `chat.db` handles.
+pub const CONTACT_ALEX: (&str, &str, &str) = ("+1 (555) 000-0001", "Alex", "Nakamura");
+pub const CONTACT_BAILEY: (&str, &str, &str) = ("555-000-0002", "Bailey", "Okonkwo");
+pub const CONTACT_CASEY: (&str, &str, &str) = ("Casey@Example.Invalid", "Casey", "Lindqvist");
+
+/// Build a synthetic macOS Contacts store at `dir/AddressBook-v22.abcddb`.
+///
+/// The tables carry the column names Core Data actually uses, so the queries
+/// under test are the queries that will run against a real Mac — but every name
+/// and number in it is invented here, and no test ever opens
+/// `~/Library/Application Support/AddressBook`.
+///
+/// The numbers are deliberately written the way a person types them into
+/// Contacts — spaces, parentheses, a missing country code — rather than in the
+/// E.164 form `chat.db` stores, because joining those two is the whole job.
+pub fn address_book(dir: &Path) -> PathBuf {
+    std::fs::create_dir_all(dir).expect("contacts directory");
+    let path = dir.join("AddressBook-v22.abcddb");
+    let _ = std::fs::remove_file(&path);
+    let conn = Connection::open(&path).expect("open the contacts fixture");
+    conn.execute_batch(ADDRESS_BOOK_SCHEMA)
+        .expect("contacts schema");
+
+    let people = [CONTACT_ALEX, CONTACT_BAILEY, CONTACT_CASEY];
+    for (index, (address, first, last)) in people.into_iter().enumerate() {
+        let pk = i64::try_from(index).unwrap_or(0) + 1;
+        conn.execute(
+            "INSERT INTO ZABCDRECORD (Z_PK, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION)
+             VALUES (?1, ?2, ?3, NULL)",
+            rusqlite::params![pk, first, last],
+        )
+        .expect("insert a contact");
+        if address.contains('@') {
+            conn.execute(
+                "INSERT INTO ZABCDEMAILADDRESS (Z_PK, ZOWNER, ZADDRESS) VALUES (?1, ?2, ?3)",
+                rusqlite::params![pk, pk, address],
+            )
+            .expect("insert an email address");
+        } else {
+            conn.execute(
+                "INSERT INTO ZABCDPHONENUMBER (Z_PK, ZOWNER, ZFULLNUMBER) VALUES (?1, ?2, ?3)",
+                rusqlite::params![pk, pk, address],
+            )
+            .expect("insert a phone number");
+        }
+    }
+
+    // A business, which Contacts stores with no personal name at all.
+    conn.execute(
+        "INSERT INTO ZABCDRECORD (Z_PK, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION)
+         VALUES (99, NULL, NULL, 'Fixture Coffee')",
+        [],
+    )
+    .expect("insert an organization");
+    conn.execute(
+        "INSERT INTO ZABCDPHONENUMBER (Z_PK, ZOWNER, ZFULLNUMBER) VALUES (99, 99, '+15550000009')",
+        [],
+    )
+    .expect("insert the organization number");
+
+    drop(conn);
+    path
+}
+
+/// The slice of the Core Data schema the contacts queries touch.
+const ADDRESS_BOOK_SCHEMA: &str = "
+CREATE TABLE ZABCDRECORD (
+    Z_PK INTEGER PRIMARY KEY,
+    Z_ENT INTEGER,
+    Z_OPT INTEGER,
+    ZFIRSTNAME VARCHAR,
+    ZLASTNAME VARCHAR,
+    ZMIDDLENAME VARCHAR,
+    ZNICKNAME VARCHAR,
+    ZORGANIZATION VARCHAR
+);
+
+CREATE TABLE ZABCDPHONENUMBER (
+    Z_PK INTEGER PRIMARY KEY,
+    Z_ENT INTEGER,
+    Z_OPT INTEGER,
+    ZOWNER INTEGER,
+    ZISPRIMARY INTEGER,
+    ZFULLNUMBER VARCHAR,
+    ZLABEL VARCHAR
+);
+
+CREATE TABLE ZABCDEMAILADDRESS (
+    Z_PK INTEGER PRIMARY KEY,
+    Z_ENT INTEGER,
+    Z_OPT INTEGER,
+    ZOWNER INTEGER,
+    ZISPRIMARY INTEGER,
+    ZADDRESS VARCHAR,
+    ZLABEL VARCHAR
+);
+";
+
 /// Wrap `text` in the smallest blob `streamtyped::parse` will accept.
 ///
 /// Real blobs are a full `typedstream` archive; the fallback parser only looks

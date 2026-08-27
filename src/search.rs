@@ -464,10 +464,10 @@ fn run(
 pub fn open_index(path: &Path) -> Result<Connection, SearchError> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
-        private(dir, 0o700);
+        crate::private(dir, 0o700);
     }
     let conn = Connection::open(path)?;
-    private(path, 0o600);
+    crate::private(path, 0o600);
     conn.busy_timeout(std::time::Duration::from_millis(u64::from(BUSY_MS)))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -507,16 +507,6 @@ pub fn open_reader(path: &Path) -> Result<Connection, SearchError> {
     conn.busy_timeout(std::time::Duration::from_millis(u64::from(BUSY_MS)))?;
     Ok(conn)
 }
-
-/// Tighten a path's permissions so the index is readable only by its owner.
-#[cfg(unix)]
-fn private(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
-}
-
-#[cfg(not(unix))]
-fn private(_path: &Path, _mode: u32) {}
 
 /// Read everything `chat.db` has gained since the last pass into the index.
 ///

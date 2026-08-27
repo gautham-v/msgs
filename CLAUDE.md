@@ -16,12 +16,14 @@ Rust + ratatui terminal client for iMessage on macOS.
 - `src/send.rs` — outbound messages via `osascript` → Messages.app; tapbacks via `imsg`
 - `src/watch.rs` — live updates: `notify` on the directory `chat.db` lives in, debounced, with a 2s timer as the fallback; `App::on_db_change` does the re-reading
 - `src/search.rs` — the FTS5 message index at `~/Library/Application Support/msgs/index.db` (never inside chat.db): a worker thread builds it, tops it up from the live-update stream by `ROWID`, and answers `MATCH` queries
+- `src/contacts.rs` — names for handles: the macOS AddressBook stores read read-only, normalized phone/email keys, and the stamped cache at `~/Library/Application Support/msgs/contacts.json`; `Contacts::apply` hangs a `Name` on every `Handle`, which is how names reach every pane at once
 - `src/jump.rs` — what the `Ctrl+K` palette matches and shows: the filter, fuzzy chat/people matching (`nucleo-matcher`), and the result rows with their highlight ranges
 - `docs/mockups.html` — the design target; match it
 
 ## Rules
 - Never write to `chat.db`. Open it read-only (`?mode=ro` / `OpenFlags::SQLITE_OPEN_READ_ONLY`), and copy to a temp file if a lock blocks reads.
-- Message content is private. Do not print message bodies, phone numbers, or names to logs, test output, or commit messages. Tests use a fixture DB under `tests/fixtures/`, never the real one.
+- Message content is private. Do not print message bodies, phone numbers, or names to logs, test output, or commit messages. Tests use a fixture DB under `tests/fixtures/`, never the real one — including `fixtures::address_book`, the synthetic Contacts store; never the real `~/Library/Application Support/AddressBook`.
+- A person is named in one place: `Contacts::apply` fills `Handle::name`, and every pane reads `Handle::display_name` / `Handle::short_name`. Do not resolve a name inside a widget.
 - `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` must pass before a commit.
 - Keep the UI calm: no feature creep beyond the mockups.
 - A block's height and its drawing must come from one number. `ui::message::block` reserves rows for a picture from `Images::cells`, and `Images::render` draws into exactly those rows; never let the two compute a size separately.

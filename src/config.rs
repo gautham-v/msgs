@@ -32,6 +32,9 @@ pub struct Config {
     /// Draw pictures inline where the terminal can. `--no-images` overrides
     /// this to `false`.
     pub images: bool,
+    /// Read the macOS Contacts stores so handles become names.
+    /// `--no-contacts` overrides this to `false`.
+    pub contacts: bool,
     /// Per-slot color overrides, e.g. `accent_me = "#ff8800"`.
     #[serde(default)]
     pub theme: BTreeMap<String, String>,
@@ -45,6 +48,7 @@ impl Default for Config {
             page_step: DEFAULT_PAGE_STEP,
             mouse: true,
             images: true,
+            contacts: true,
             theme: BTreeMap::new(),
         }
     }
@@ -142,6 +146,7 @@ mod tests {
             chat_list_width = 24
             page_step = 5
             mouse = false
+            contacts = false
 
             [theme]
             accent_me = "#ff8800"
@@ -153,6 +158,7 @@ mod tests {
         assert_eq!(config.chat_list_width, 24);
         assert_eq!(config.page_step, 5);
         assert!(!config.mouse);
+        assert!(!config.contacts);
         assert_eq!(
             config.theme.get("accent_me").map(String::as_str),
             Some("#ff8800")

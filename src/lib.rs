@@ -7,6 +7,7 @@
 //!
 //! - [`app`] — state, actions, and the single `update` entry point
 //! - [`config`] — the optional `~/.config/msgs/config.toml`
+//! - [`contacts`] — names for handles, out of the macOS Contacts stores
 //! - [`db`] — read-only queries against `chat.db`
 //! - [`jump`] — what the `Ctrl+K` palette matches and shows
 //! - [`keymap`] — keys to actions, and the table the help modal renders
@@ -24,6 +25,7 @@
 
 pub mod app;
 pub mod config;
+pub mod contacts;
 pub mod db;
 pub mod jump;
 pub mod keymap;
@@ -35,7 +37,7 @@ pub mod theme;
 pub mod ui;
 pub mod watch;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The system message store: `~/Library/Messages/chat.db`.
 ///
@@ -48,6 +50,20 @@ pub fn default_db_path() -> PathBuf {
         .join("Messages")
         .join("chat.db")
 }
+
+/// Tighten a path's permissions so a file msgs owns is readable only by the
+/// person it belongs to.
+///
+/// The search index holds message bodies and the contacts cache holds names and
+/// numbers, so both are written `0600` inside a `0700` directory.
+#[cfg(unix)]
+pub(crate) fn private(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+pub(crate) fn private(_path: &Path, _mode: u32) {}
 
 #[cfg(test)]
 mod tests {

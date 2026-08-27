@@ -25,8 +25,9 @@ use ratatui::backend::CrosstermBackend;
 
 use msgs::app::{App, WatcherStatus};
 use msgs::config::Config;
+use msgs::contacts::Contacts;
 use msgs::db::{Db, Source};
-use msgs::{config, default_db_path, keymap, media, search, ui};
+use msgs::{config, contacts, default_db_path, keymap, media, search, ui};
 
 /// How long the loop waits for input before waking up to expire toasts.
 const TICK: Duration = Duration::from_millis(250);
@@ -58,6 +59,10 @@ struct Cli {
     /// Do not draw pictures inline; show every attachment as a chip.
     #[arg(long)]
     no_images: bool,
+
+    /// Do not read Contacts; show phone numbers and addresses instead of names.
+    #[arg(long)]
+    no_contacts: bool,
 }
 
 fn main() -> Result<()> {
@@ -75,6 +80,13 @@ fn main() -> Result<()> {
     // Read-only, and never fatal: a failure becomes the full-screen surface
     // that tells the reader how to grant Full Disk Access.
     app.open_db(cli.db.clone().unwrap_or_else(default_db_path));
+
+    // Names for the handles the database just handed over. Read-only, cached,
+    // and never fatal: a Mac that will not open its Contacts stores says so on
+    // the status line and shows numbers.
+    if !cli.no_contacts && app.config.contacts {
+        app.enable_contacts(Contacts::load());
+    }
 
     // The message index is msgs's own file, never `chat.db`. Building it runs
     // on its own thread and reports onto the status line.
@@ -289,6 +301,26 @@ fn check(cli: &Cli, warnings: &[String]) -> Result<()> {
         },
     );
 
+    // Counts and paths only: no name and no number reaches this report.
+    row(
+        "contacts",
+        &if cli.no_contacts {
+            "off (--no-contacts)".to_string()
+        } else {
+            let stores = contacts::default_store_dir()
+                .map(|dir| contacts::store_paths(&dir))
+                .unwrap_or_default();
+            let cache = contacts::default_cache_path()
+                .map_or_else(|| "no cache".to_string(), |path| path.display().to_string());
+            format!(
+                "{} stores · {} · {}",
+                stores.len(),
+                Contacts::load().status().summary(),
+                cache
+            )
+        },
+    );
+
     row(
         "config",
         &format!("{} — {config_state}", config_path.display()),
@@ -385,6 +417,7 @@ mod tests {
         assert!(cli.no_mouse);
         assert!(cli.no_index);
         assert!(cli.no_images);
+        assert!(!cli.no_contacts);
         assert!(!cli.check);
 
         let cli = Cli::parse_from(["msgs"]);
@@ -392,5 +425,6 @@ mod tests {
         assert!(!cli.no_mouse);
         assert!(!cli.no_index);
         assert!(!cli.no_images);
+        assert!(!cli.no_contacts);
     }
 }

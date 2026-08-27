@@ -93,10 +93,7 @@ fn placeholder(app: &App, attaching: bool, width: u16) -> String {
     // The name is content, so it is truncated to the box rather than allowed
     // to push the layout around.
     let room = usize::from(width.saturating_sub(PROMPT_WIDTH + 10)).max(8);
-    format!(
-        "message {}…",
-        super::format::truncate(&chat.fallback_title(), room)
-    )
+    format!("message {}…", super::format::truncate(&chat.title(), room))
 }
 
 /// Translate a byte offset into `(line, column)` in characters.

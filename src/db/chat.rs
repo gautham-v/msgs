@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Local};
 
+use super::handle::display_name;
 use super::{AttachmentKind, Db, DbError, GroupAction, Handle, MAX_PAGE, body_text, local_time};
 
 /// `chat.style` for a group conversation. Anything else is one-to-one.
@@ -109,36 +110,43 @@ impl Chat {
         self.is_pinned == Some(true)
     }
 
-    /// A name to show before contacts have been resolved: the group's own name
-    /// if it has one, then its participants, then its raw identifier.
+    /// What the chat is called: the group's own name if it has one, then its
+    /// participants, then its raw identifier.
     ///
-    /// The participant fallback is short handles — the local part of an email,
-    /// a spaced-out phone number — so an unnamed group reads as a list of
-    /// people rather than a list of addresses.
+    /// A conversation with one person is that person, written in full: `Sam
+    /// Rivera`, or a spaced-out number for somebody Contacts does not know. An
+    /// unnamed group is the short form of everybody in it — a first name once
+    /// [`crate::contacts`] has been over the row, and otherwise the local part
+    /// of an email or the number — so it reads as a list of people rather than
+    /// a list of addresses.
     #[must_use]
-    pub fn fallback_title(&self) -> String {
+    pub fn title(&self) -> String {
         if let Some(name) = self.display_name.as_deref().filter(|s| !s.is_empty()) {
             return name.to_string();
         }
-        if !self.participants.is_empty() {
-            return self
-                .participants
+        match self.participants.as_slice() {
+            [] => self
+                .identifier
+                .as_deref()
+                .map_or_else(|| self.guid.clone(), display_name),
+            [only] => only.display_name(),
+            many => many
                 .iter()
                 .map(Handle::short_name)
                 .collect::<Vec<_>>()
-                .join(", ");
+                .join(", "),
         }
-        self.identifier.clone().unwrap_or_else(|| self.guid.clone())
     }
 
     /// Whether `needle`, already lowercased, appears in anything the chat can
-    /// be found by: its name, its identifier, or a participant's address.
+    /// be found by: its name, its identifier, or a participant's name or
+    /// address.
     #[must_use]
     pub fn matches(&self, needle: &str) -> bool {
         if needle.is_empty() {
             return true;
         }
-        if self.fallback_title().to_lowercase().contains(needle) {
+        if self.title().to_lowercase().contains(needle) {
             return true;
         }
         if self
@@ -150,7 +158,7 @@ impl Chat {
         }
         self.participants
             .iter()
-            .any(|handle| handle.id.to_lowercase().contains(needle))
+            .any(|handle| handle.matches(needle))
     }
 }
 
@@ -349,11 +357,11 @@ impl Db {
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                Handle {
-                    rowid: row.get(1)?,
-                    id: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    service: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                },
+                Handle::new(
+                    row.get(1)?,
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                ),
             ))
         })?;
 
@@ -393,62 +401,46 @@ mod tests {
     fn a_named_group_shows_its_name() {
         let mut group = chat(1);
         group.display_name = Some("Weekend".to_string());
-        group.participants = vec![Handle {
-            rowid: 1,
-            id: "+15550000000".to_string(),
-            service: "iMessage".to_string(),
-        }];
-        assert_eq!(group.fallback_title(), "Weekend");
+        group.participants = vec![Handle::new(
+            1,
+            "+15550000000".to_string(),
+            "iMessage".to_string(),
+        )];
+        assert_eq!(group.title(), "Weekend");
     }
 
     #[test]
     fn an_unnamed_chat_falls_back_to_participants_then_the_identifier() {
         let mut unnamed = chat(2);
         unnamed.participants = vec![
-            Handle {
-                rowid: 1,
-                id: "a@example.com".to_string(),
-                service: "iMessage".to_string(),
-            },
-            Handle {
-                rowid: 2,
-                id: "b@example.com".to_string(),
-                service: "iMessage".to_string(),
-            },
+            Handle::new(1, "a@example.com".to_string(), "iMessage".to_string()),
+            Handle::new(2, "b@example.com".to_string(), "iMessage".to_string()),
         ];
-        assert_eq!(unnamed.fallback_title(), "a, b");
+        assert_eq!(unnamed.title(), "a, b");
 
         let empty = chat(3);
-        assert_eq!(empty.fallback_title(), "chat3");
+        assert_eq!(empty.title(), "chat3");
     }
 
     #[test]
     fn an_unnamed_group_reads_as_its_people_not_its_addresses() {
         let mut group = chat(5);
         group.participants = vec![
-            Handle {
-                rowid: 1,
-                id: "sam@example.invalid".to_string(),
-                service: "iMessage".to_string(),
-            },
-            Handle {
-                rowid: 2,
-                id: "+15550000000".to_string(),
-                service: "SMS".to_string(),
-            },
+            Handle::new(1, "sam@example.invalid".to_string(), "iMessage".to_string()),
+            Handle::new(2, "+15550000000".to_string(), "SMS".to_string()),
         ];
-        assert_eq!(group.fallback_title(), "sam, +1 (555) 000-0000");
+        assert_eq!(group.title(), "sam, +1 (555) 000-0000");
     }
 
     #[test]
     fn the_filter_matches_names_identifiers_and_addresses() {
         let mut named = chat(6);
         named.display_name = Some("Weekend Plans".to_string());
-        named.participants = vec![Handle {
-            rowid: 1,
-            id: "casey@example.invalid".to_string(),
-            service: "iMessage".to_string(),
-        }];
+        named.participants = vec![Handle::new(
+            1,
+            "casey@example.invalid".to_string(),
+            "iMessage".to_string(),
+        )];
 
         assert!(named.matches(""));
         assert!(named.matches("weekend"));

@@ -13,6 +13,7 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
 use crate::config::Config;
+use crate::contacts::Contacts;
 use crate::db::{AttachmentRef, Chat, Db, DbError, MAX_PAGE, Message, PAGE, Source};
 use crate::jump::{self, Jump};
 use crate::media::{self, Images};
@@ -566,6 +567,9 @@ pub struct App {
     /// encoded so far. [`Images::off`] until the terminal has been asked, which
     /// is how the tests and `--no-images` leave it.
     pub images: Images,
+    /// Names for handles. [`Contacts::empty`] until something reads the macOS
+    /// Contacts stores, which is how the tests run.
+    pub contacts: Contacts,
 }
 
 impl App {
@@ -626,6 +630,7 @@ impl App {
             new_below: 0,
             last_snapshot: None,
             images: Images::off(),
+            contacts: Contacts::empty(),
         }
     }
 
@@ -693,6 +698,25 @@ impl App {
         self.search = Some(Search::start(&db_path, index_path));
     }
 
+    /// Take the names read out of the macOS Contacts stores.
+    ///
+    /// Everything already loaded is re-resolved, so this can be called before or
+    /// after the database is opened. A store that could not be read arrives as
+    /// [`crate::contacts::Status::Unavailable`] and leaves one line in the
+    /// startup warnings; every handle then falls back to a pretty-printed
+    /// address.
+    pub fn enable_contacts(&mut self, contacts: Contacts) {
+        if let Some(warning) = contacts.status().warning() {
+            self.status.warnings.push(warning.clone());
+            if self.status.active_toast().is_none() {
+                self.status.error(warning);
+            }
+        }
+        self.contacts = contacts;
+        self.contacts.apply(&mut self.chat_rows);
+        self.measured.stale = true;
+    }
+
     /// Take the terminal's picture-drawing ability, once it has been asked.
     ///
     /// Until this is called nothing is drawn inline and every attachment is a
@@ -721,7 +745,10 @@ impl App {
             return;
         };
         match db.chats() {
-            Ok(chats) => {
+            Ok(mut chats) => {
+                // The one place names enter the app: every pane reads them off
+                // the participants.
+                self.contacts.apply(&mut chats);
                 self.status.unread_total = chats
                     .iter()
                     .map(|chat| usize::try_from(chat.unread_count).unwrap_or(0))
@@ -1023,6 +1050,7 @@ impl App {
                 pending: &self.pending,
                 now,
                 images: &self.images,
+                contacts: &self.contacts,
             };
             let one = |index: usize| message::block(&ctx, index, width).height();
             if prepended {

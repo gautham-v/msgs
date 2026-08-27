@@ -16,7 +16,7 @@ use chrono::{DateTime, Local};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::db::handle;
+use crate::contacts::Contacts;
 use crate::db::message::split_association;
 use crate::db::{AttachmentRef, Chat, GroupAction, Message, Tapback};
 use crate::media::{Images, NOT_DOWNLOADED};
@@ -124,6 +124,9 @@ pub struct Ctx<'a> {
     /// What the terminal can draw pictures with, and how big they come out.
     /// [`Images::off`] lays every attachment out as a chip.
     pub images: &'a Images,
+    /// Names for handles, for the senders and reactors who are not in the
+    /// participant list of the open chat.
+    pub contacts: &'a Contacts,
 }
 
 impl Ctx<'_> {
@@ -139,6 +142,10 @@ impl Ctx<'_> {
     /// is the green one; in a group everybody keeps the color their position in
     /// the participant list gives them, and that list is ordered by
     /// `handle.ROWID`, so a color follows a person across sessions.
+    ///
+    /// The position is taken by person, not by row: somebody who is in a group
+    /// twice — an Apple ID and a phone number, which Contacts calls one name —
+    /// gets one color for both.
     #[must_use]
     pub fn accent(&self, message: &Message) -> Color {
         if message.is_from_me {
@@ -158,9 +165,18 @@ impl Ctx<'_> {
         let Some((chat, rowid)) = self.chat.zip(handle_rowid) else {
             return 0;
         };
+        let Some(sender) = chat
+            .participants
+            .iter()
+            .find(|handle| handle.rowid == rowid)
+        else {
+            return 0;
+        };
+        // The first row that is the same person, which is that row itself
+        // unless Contacts has joined two addresses under one name.
         chat.participants
             .iter()
-            .position(|handle| handle.rowid == rowid)
+            .position(|handle| same_person(handle, sender))
             .unwrap_or(0)
     }
 
@@ -171,7 +187,7 @@ impl Ctx<'_> {
             return "You".to_string();
         }
         self.person(message.handle_rowid)
-            .or_else(|| message.handle.as_deref().map(handle::short_name))
+            .or_else(|| message.handle.as_deref().map(|id| self.contacts.short(id)))
             .unwrap_or_else(|| "Unknown".to_string())
     }
 
@@ -208,6 +224,15 @@ impl Ctx<'_> {
         let (_, guid) = split_association(raw)?;
         let index = *self.by_guid.get(guid)?;
         self.messages.get(index)
+    }
+}
+
+/// Whether two participant rows are the same person: the same name where
+/// Contacts knows one, and otherwise the same address.
+fn same_person(left: &crate::db::Handle, right: &crate::db::Handle) -> bool {
+    match (left.name.as_ref(), right.name.as_ref()) {
+        (Some(left), Some(right)) if !left.is_empty() && !right.is_empty() => left == right,
+        _ => left.id.eq_ignore_ascii_case(&right.id),
     }
 }
 
@@ -549,7 +574,7 @@ pub fn tapback_chips(ctx: &Ctx<'_>, message: &Message) -> Vec<String> {
                     || "You".to_string(),
                     |handle| {
                         ctx.person(group[0].handle_rowid)
-                            .unwrap_or_else(|| handle::short_name(handle))
+                            .unwrap_or_else(|| ctx.contacts.short(handle))
                     },
                 );
                 return format!("{glyph} {who}");
@@ -673,16 +698,16 @@ mod tests {
             style: if is_group { 43 } else { 45 },
             is_group,
             participants: vec![
-                Handle {
-                    rowid: 1,
-                    id: "alex@example.invalid".to_string(),
-                    service: "iMessage".to_string(),
-                },
-                Handle {
-                    rowid: 2,
-                    id: "bailey@example.invalid".to_string(),
-                    service: "iMessage".to_string(),
-                },
+                Handle::new(
+                    1,
+                    "alex@example.invalid".to_string(),
+                    "iMessage".to_string(),
+                ),
+                Handle::new(
+                    2,
+                    "bailey@example.invalid".to_string(),
+                    "iMessage".to_string(),
+                ),
             ],
             last_message_date: 0,
             last_message_rowid: 0,
@@ -699,6 +724,7 @@ mod tests {
         messages: Vec<Message>,
         by_guid: HashMap<String, usize>,
         images: crate::media::Images,
+        contacts: Contacts,
     }
 
     impl Fixture {
@@ -714,6 +740,7 @@ mod tests {
                 messages,
                 by_guid,
                 images: crate::media::Images::off(),
+                contacts: Contacts::empty(),
             }
         }
 
@@ -726,6 +753,7 @@ mod tests {
                 pending: &[],
                 now: now(),
                 images: &self.images,
+                contacts: &self.contacts,
             }
         }
     }

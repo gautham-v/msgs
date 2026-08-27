@@ -13,7 +13,7 @@ Early. See the GitHub issues for the build plan.
 ## Requirements
 
 - macOS 14+
-- Full Disk Access for your terminal (System Settings → Privacy & Security → Full Disk Access) so `chat.db` can be read — without it msgs starts and explains what to do instead of failing
+- Full Disk Access for your terminal (System Settings → Privacy & Security → Full Disk Access) so `chat.db` and your Contacts can be read — without it msgs starts and explains what to do instead of failing
 - Messages.app signed in (it is launched hidden in the background when you send; reading never needs it open)
 - Optional: [`imsg`](https://github.com/openclaw/imsg) on `$PATH` for sending tapback reactions
 
@@ -30,9 +30,10 @@ Flags:
 | `--db <PATH>` | read this database instead of `~/Library/Messages/chat.db` |
 | `--config <PATH>` | read this config file instead of the default |
 | `--no-mouse` | do not capture the mouse |
-| `--check` | print a readiness report (database, row counts, live updates, Messages.app, `osascript`, `imsg`, search index) and exit |
+| `--check` | print a readiness report (database, row counts, live updates, Messages.app, `osascript`, `imsg`, search index, contacts) and exit |
 | `--no-index` | do not build or use the full-text message index |
 | `--no-images` | do not draw pictures inline; show every attachment as a chip |
+| `--no-contacts` | do not read Contacts; show numbers and addresses instead of names |
 | `--version` | print the version |
 
 ## Keys
@@ -111,6 +112,44 @@ leaves) are dim italic lines without a rail, and days are separated by a header
 that sticks to the top edge as it scrolls. Because block heights are measured
 once per page rather than once per frame, only the blocks actually on screen are
 laid out, and a 25,000-message thread scrolls at the same speed as a short one.
+
+## Names
+
+`chat.db` stores phone numbers and email addresses and nothing else, so every
+name on screen comes out of Contacts. macOS keeps that as a set of SQLite files
+under `~/Library/Application Support/AddressBook` — one at the top level and one
+per account under `Sources/` — and msgs reads all of them the same way it reads
+`chat.db`: read-only, with a scratch copy when a lock refuses a reader, and
+never a write.
+
+Matching is by normalized address. An email is lowercased; a phone number is
+reduced to `+` and its digits and gains the country code that a number saved as
+`(415) 555-0132` is missing, so it lands on the `+14155550132` the message
+database stores. Behind that sits an index on the last ten digits, which catches
+a number saved without its country code in a country where the code is not `1`,
+and which declines to answer when two different people share those digits.
+
+A name reaches every pane at once, because it is attached to the participants of
+a chat and the chat list, the conversation header, the group sender labels, the
+preview prefixes, and the jump palette all read it from there. A conversation
+with one person is titled with their whole name, `Sam Rivera`; an unnamed group
+is titled with everybody's first name; a message in a group is labelled with the
+sender's first name. The header keeps the address beside the name, because that
+is the thing the name is hiding. Somebody who is not in Contacts is written
+`+1 (415) 555-0132` rather than `+14155550132`, and a contact with no personal
+name — a business — is called by its organization.
+
+Somebody who is in a group twice, at a phone number and at an Apple ID, is one
+person to Contacts and gets one accent color for both.
+
+The result is cached at `~/Library/Application Support/msgs/contacts.json`
+alongside the sizes and modification times of the files it was built from, `0600`
+inside a `0700` directory. A launch that changes nothing costs one `stat` per
+store; a contact added since the last launch moves a stamp and rebuilds the map.
+If the stores cannot be read at all — no Full Disk Access, or no Contacts on this
+Mac — the status line says so once, and every handle falls back to its
+pretty-printed address. `--no-contacts`, or `contacts = false` in the config,
+turns the whole thing off.
 
 ## Live updates
 
@@ -198,6 +237,7 @@ chat_list_width = 30     # columns, 18–60, never more than half the screen
 page_step = 10           # rows moved by PageUp / PageDown
 mouse = true             # --no-mouse overrides this
 images = true            # draw pictures inline; --no-images overrides this
+contacts = true          # read Contacts for names; --no-contacts overrides this
 
 [theme]
 # Any color slot, as "#rrggbb", "#rgb", or an ANSI index 0–255.

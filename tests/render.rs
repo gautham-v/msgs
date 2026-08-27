@@ -552,11 +552,11 @@ fn message(rowid: i64, from_me: bool, handle_rowid: i64, text: &str, minutes: i6
 }
 
 fn handle(rowid: i64) -> Handle {
-    Handle {
+    Handle::new(
         rowid,
-        id: format!("someone{rowid}@example.invalid"),
-        service: "iMessage".to_string(),
-    }
+        format!("someone{rowid}@example.invalid"),
+        "iMessage".to_string(),
+    )
 }
 
 /// An app with one open conversation, focused on it and scrolled to the newest

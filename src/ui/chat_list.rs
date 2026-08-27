@@ -275,7 +275,7 @@ fn name_line<'a>(
         name_width -= time_width;
     }
 
-    let name = truncate(&chat.fallback_title(), name_width);
+    let name = truncate(&chat.title(), name_width);
     let padding = name_width.saturating_sub(width(&name));
 
     let mut spans = vec![

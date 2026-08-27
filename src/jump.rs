@@ -18,7 +18,6 @@ use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::app::ListPane;
-use crate::db::handle::short_name;
 use crate::db::{Chat, local_time};
 use crate::search::{self, Hit};
 use crate::ui::format::{relative_time, single_line};
@@ -272,7 +271,7 @@ impl Jump {
         let mut buffer = Vec::new();
         let mut indices = Vec::new();
         for (position, chat) in chats.iter().enumerate() {
-            let title = chat.fallback_title();
+            let title = chat.title();
             indices.clear();
             buffer.clear();
             let haystack = Utf32Str::new(&title, &mut buffer);
@@ -296,13 +295,20 @@ impl Jump {
     }
 }
 
-/// Whether anybody in `chat` has an address the pattern matches.
+/// Whether anybody in `chat` has a name or an address the pattern matches.
+///
+/// A named group does not put its people in its title, so this is what finds
+/// the conversation you are in with somebody by typing their name.
 fn participant_matches(pattern: &Pattern, matcher: &mut Matcher, chat: &Chat) -> bool {
     let mut buffer = Vec::new();
     chat.participants.iter().any(|handle| {
-        buffer.clear();
-        let haystack = Utf32Str::new(&handle.id, &mut buffer);
-        pattern.score(haystack, matcher).is_some()
+        let mut hit = false;
+        for candidate in [handle.id.clone(), handle.display_name()] {
+            buffer.clear();
+            let haystack = Utf32Str::new(&candidate, &mut buffer);
+            hit = hit || pattern.score(haystack, matcher).is_some();
+        }
+        hit
     })
 }
 
@@ -317,7 +323,7 @@ fn chat_row(chat: &Chat, label_hits: Vec<(usize, usize)>) -> Row {
         kind: Kind::Chat,
         chat_rowid: chat.rowid,
         message_rowid: None,
-        label: chat.fallback_title(),
+        label: chat.title(),
         label_hits,
         body: String::new(),
         body_hits: Vec::new(),
@@ -358,7 +364,7 @@ fn message_row(
         if hit.is_from_me {
             Some("You".to_string())
         } else {
-            hit.handle.as_deref().map(short_name)
+            hit.handle.as_deref().map(|id| sender_name(chat, id))
         }
     } else if hit.is_from_me {
         Some("You".to_string())
@@ -389,7 +395,7 @@ fn message_row(
         },
         chat_rowid: hit.chat_rowid,
         message_rowid: Some(hit.message_rowid),
-        label: chat.fallback_title(),
+        label: chat.title(),
         label_hits: Vec::new(),
         body: format!("{head}{line}"),
         body_hits: hits
@@ -398,6 +404,21 @@ fn message_row(
             .collect(),
         meta: local_time(hit.date).map_or_else(String::new, |when| relative_time(now, when)),
     }
+}
+
+/// What to call whoever sent a message, given only their address.
+///
+/// The chat's participants are the first place to look, because they are the
+/// rows [`crate::contacts`] has already resolved; anybody who is somehow not
+/// among them falls back to their address.
+fn sender_name(chat: &Chat, address: &str) -> String {
+    chat.participants
+        .iter()
+        .find(|handle| handle.id.eq_ignore_ascii_case(address))
+        .map_or_else(
+            || crate::db::handle::short_name(address),
+            crate::db::Handle::short_name,
+        )
 }
 
 /// Consecutive character indices, as half-open ranges.

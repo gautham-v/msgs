@@ -271,7 +271,7 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let left = match app.selected_chat() {
         Some(chat) => Line::from(vec![
             Span::styled(
-                format!(" {}", truncate(&chat.fallback_title(), title_room(area))),
+                format!(" {}", truncate(&chat.title(), title_room(area))),
                 Style::new()
                     .fg(theme.text_primary)
                     .add_modifier(Modifier::BOLD),
@@ -324,8 +324,12 @@ fn title_room(area: Rect) -> usize {
     usize::from(area.width).saturating_sub(2) / 2
 }
 
-/// `· iMessage · +1 (650) 555-0198` for one person, `· iMessage · 6 people` for
-/// a group — as much of it as is true.
+/// `· iMessage · +1 (650) 555-0198` for one person, `· iMessage · 6 people`
+/// for a group — as much of it as is true.
+///
+/// This is the address half of the header, deliberately: the title beside it
+/// already says the name, so repeating it here would waste the row. The
+/// address is the thing a name hides and the header is where you go to see it.
 #[must_use]
 pub fn subtitle(chat: &Chat) -> String {
     let mut parts = Vec::new();
@@ -335,7 +339,7 @@ pub fn subtitle(chat: &Chat) -> String {
     if chat.is_group {
         parts.push(format!("{} people", chat.participants.len()));
     } else if let Some(handle) = chat.participants.first() {
-        parts.push(handle.display_name());
+        parts.push(crate::db::handle::display_name(&handle.id));
     } else if let Some(id) = chat.identifier.as_deref().filter(|id| !id.is_empty()) {
         parts.push(crate::db::handle::display_name(id));
     }
@@ -403,6 +407,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
         pending: &app.pending,
         now,
         images: &app.images,
+        contacts: &app.contacts,
     };
     let heights = &app.measured.heights;
     let body = Rect {
