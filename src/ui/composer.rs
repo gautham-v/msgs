@@ -16,17 +16,27 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     }
     let theme = &app.theme;
     let focused = app.focus == Focus::Composer;
+    let attaching = app.attach_prompt.as_ref();
+    let field = attaching.unwrap_or(&app.composer);
 
-    let block = Block::new()
+    let mut block = Block::new()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme.border_for(focused)))
         .style(Style::new().bg(theme.bg_base));
+    if attaching.is_some() {
+        block = block.title_top(Line::from(Span::styled(
+            " attach ",
+            Style::new()
+                .fg(theme.accent_me)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let text = app.composer.text();
-    let (cursor_row, cursor_column) = cursor_cell(text, app.composer.cursor());
+    let text = field.text();
+    let (cursor_row, cursor_column) = cursor_cell(text, field.cursor());
     // Keep the cursor line visible once the draft is taller than the box.
     let scroll = cursor_row.saturating_sub(usize::from(inner.height).saturating_sub(1));
 
@@ -35,7 +45,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(vec![
             Span::styled(PROMPT, Style::new().fg(theme.accent_me)),
             Span::styled(
-                "message…",
+                placeholder(app, attaching.is_some(), inner.width),
                 Style::new().fg(theme.gray).add_modifier(Modifier::ITALIC),
             ),
         ]));
@@ -71,6 +81,24 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 const PROMPT: &str = "› ";
 const PROMPT_WIDTH: u16 = 2;
 
+/// The dim line shown in an empty box: `message Priya…`, or what the path
+/// prompt is waiting for.
+fn placeholder(app: &App, attaching: bool, width: u16) -> String {
+    if attaching {
+        return "path to a file — ~ works…".to_string();
+    }
+    let Some(chat) = app.current_chat() else {
+        return "message…".to_string();
+    };
+    // The name is content, so it is truncated to the box rather than allowed
+    // to push the layout around.
+    let room = usize::from(width.saturating_sub(PROMPT_WIDTH + 10)).max(8);
+    format!(
+        "message {}…",
+        super::format::truncate(&chat.fallback_title(), room)
+    )
+}
+
 /// Translate a byte offset into `(line, column)` in characters.
 fn cursor_cell(text: &str, cursor: usize) -> (usize, usize) {
     let head = &text[..cursor.min(text.len())];
@@ -85,11 +113,14 @@ pub fn render_info_row(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let hints: &[(&str, &str)] = match app.focus {
+        Focus::Composer if app.attach_prompt.is_some() => {
+            &[("Enter", "attach and send"), ("Esc", "cancel")]
+        }
         Focus::Composer => &[
             ("Enter", "send"),
             ("Alt+Enter", "newline"),
             ("Ctrl+A", "attach"),
-            ("Esc", "back"),
+            ("Ctrl+R", "react to selected"),
         ],
         Focus::ChatList => &[
             ("Enter", "open"),

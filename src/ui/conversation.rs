@@ -388,6 +388,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
         chat: app.selected_chat(),
         messages: &app.message_rows,
         by_guid: &app.measured.by_guid,
+        pending: &app.pending,
         now,
     };
     let heights = &app.measured.heights;

@@ -901,3 +901,99 @@ fn five_thousand_messages_lay_out_only_what_is_on_screen() {
     );
     assert!(app.convo.top < 5000);
 }
+
+// ---------------------------------------------------------------------------
+// The composer and the send path. Every test below puts an inert outbox on the
+// app first, so the whole path runs and nothing is ever handed to Messages.app.
+// ---------------------------------------------------------------------------
+
+use msgs::send::{Delivery, Outbox, SendError};
+
+/// An app with one chat open and an outbox that records instead of sending.
+fn ready_to_send() -> App {
+    let mut app = with_conversation(false, 1, vec![message(1, false, 1, "yes!! 7?", 30)]);
+    app.outbox = Outbox::inert();
+    app.update(Action::FocusPane(Focus::Composer));
+    app
+}
+
+#[test]
+fn an_empty_composer_names_the_chat_it_will_send_to() {
+    let mut app = with_chats(vec![chat(1, "Fixture Chat", 2, "last line")]);
+    app.update(Action::FocusPane(Focus::Composer));
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "message Fixture Chat…"));
+    assert!(contains(&buffer, "Enter send"), "the hints from the mockup");
+    assert!(contains(&buffer, "Ctrl+A attach"));
+}
+
+#[test]
+fn enter_sends_the_draft_and_the_block_says_it_is_on_its_way() {
+    let mut app = ready_to_send();
+    type_text(&mut app, "on my way in 20");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "on my way in 20"), "the echo is drawn");
+    assert!(contains(&buffer, "Sending…"));
+    assert!(!contains(&buffer, "› on my way"), "the box is empty again");
+    assert_eq!(app.pending.len(), 1);
+
+    // Messages takes it: the note goes, the block stays.
+    app.outbox.answer(app.pending[0].id, Ok(()));
+    app.tick();
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "on my way in 20"));
+    assert!(!contains(&buffer, "Sending…"));
+}
+
+#[test]
+fn a_refused_send_says_why_on_the_block_and_gives_the_draft_back() {
+    let mut app = ready_to_send();
+    type_text(&mut app, "on my way in 20");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    app.outbox.answer(
+        app.pending[0].id,
+        Err(SendError::Script("Messages is not signed in".to_string())),
+    );
+    app.tick();
+
+    let buffer = frame(&mut app, 140, 34);
+    assert!(contains(&buffer, "Failed — Messages is not signed in"));
+    assert!(
+        contains(&buffer, "› on my way in 20"),
+        "the draft came back"
+    );
+    assert_eq!(
+        app.pending[0].state,
+        Delivery::Failed("Messages is not signed in".to_string())
+    );
+}
+
+#[test]
+fn ctrl_a_turns_the_composer_into_a_path_prompt() {
+    let mut app = ready_to_send();
+    type_text(&mut app, "look at this");
+    press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "attach"), "the box says what it wants");
+    assert!(contains(&buffer, "path to a file"));
+    assert!(!contains(&buffer, "look at this"), "the draft is put aside");
+
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "look at this"), "and comes back");
+    assert_eq!(app.focus, Focus::Composer);
+}
+
+#[test]
+fn r_quotes_the_selected_message_and_moves_to_the_composer() {
+    let mut app = with_conversation(false, 1, vec![message(1, false, 1, "yes!! 7?", 30)]);
+    app.outbox = Outbox::inert();
+    press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+
+    assert_eq!(app.focus, Focus::Composer);
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "> yes!! 7?"));
+}

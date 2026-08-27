@@ -9,6 +9,7 @@ mod fixtures;
 use msgs::app::{Action, App, DbStatus};
 use msgs::config::Config;
 use msgs::db::{AttachmentKind, Db, GroupAction, Source, TapbackKind};
+use msgs::send::{Delivery, Pending};
 
 fn db() -> Db {
     Db::open(&fixtures::database()).expect("open the fixture read-only")
@@ -500,4 +501,86 @@ fn a_selected_message_can_be_read_back_for_copying() {
     assert_eq!(selected.rowid, fixtures::MSG_UNREAD);
     assert!(!selected.is_from_me);
     assert!(selected.text.is_some());
+}
+
+#[test]
+fn an_echo_is_retired_when_its_own_row_shows_up_in_the_database() {
+    let mut app = App::new(Config::default(), Vec::new());
+    app.open_db(fixtures::database());
+    app.update(Action::SelectNext);
+    assert_eq!(app.open_chat, Some(fixtures::CHAT_DIRECT));
+    assert_eq!(app.message_rows.len(), 4);
+
+    // The fixture's own outgoing row carries a file. Rewind the page to just
+    // before it and stand an echo of it in its place, which is exactly the
+    // state the app is in between pressing Enter and Messages committing the
+    // row.
+    let sent = app
+        .message_rows
+        .iter()
+        .find(|message| message.rowid == fixtures::MSG_PHOTO)
+        .expect("the outgoing row");
+    let (date, guid) = (sent.date, sent.guid.clone());
+    app.message_rows
+        .retain(|message| message.rowid < fixtures::MSG_PHOTO);
+    app.messages.set_len(app.message_rows.len());
+    app.pending.push(Pending::new(
+        0,
+        fixtures::CHAT_DIRECT,
+        "📎 photo.png".to_string(),
+        true,
+        date,
+    ));
+    // An echo in another conversation must not be claimed by this one's rows.
+    app.pending.push(Pending::new(
+        1,
+        fixtures::CHAT_GROUP,
+        "📎 photo.png".to_string(),
+        true,
+        date,
+    ));
+
+    assert!(app.tick(), "the arriving rows change the screen");
+    assert_eq!(app.pending.len(), 1);
+    assert_eq!(app.pending[0].chat_rowid, fixtures::CHAT_GROUP);
+    // The real rows are back, and the retired echo is not among them.
+    assert_eq!(app.message_rows.len(), 4);
+    assert!(app.message_rows.iter().any(|message| message.guid == guid));
+    assert!(
+        !app.message_rows
+            .iter()
+            .any(|message| message.guid.starts_with(msgs::send::PENDING_PREFIX)),
+        "no echo is left standing in this chat"
+    );
+}
+
+#[test]
+fn an_echo_whose_row_never_arrives_stops_being_a_send_in_progress() {
+    let mut app = App::new(Config::default(), Vec::new());
+    app.open_db(fixtures::database());
+    let open = app.open_chat.expect("an open chat");
+    app.pending.push(Pending::new(
+        0,
+        open,
+        "nothing in the fixture matches this".to_string(),
+        false,
+        msgs::db::raw_time(chrono::Local::now()),
+    ));
+    // Reopening the conversation puts the echo back on the end of the page.
+    app.load_conversation(open);
+    assert!(
+        app.message_rows
+            .last()
+            .is_some_and(|message| message.guid.starts_with(msgs::send::PENDING_PREFIX))
+    );
+
+    app.tick();
+    assert_eq!(app.pending.len(), 1, "nothing claimed it");
+    assert_eq!(app.pending[0].state, Delivery::Sending);
+    // The echo still stands at the end of the conversation.
+    assert!(
+        app.message_rows
+            .last()
+            .is_some_and(|message| message.guid.starts_with(msgs::send::PENDING_PREFIX))
+    );
 }

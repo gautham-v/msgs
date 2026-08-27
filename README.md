@@ -30,7 +30,7 @@ Flags:
 | `--db <PATH>` | read this database instead of `~/Library/Messages/chat.db` |
 | `--config <PATH>` | read this config file instead of the default |
 | `--no-mouse` | do not capture the mouse |
-| `--check` | print a readiness report (database, row counts, Messages.app, `imsg`) and exit |
+| `--check` | print a readiness report (database, row counts, Messages.app, `osascript`, `imsg`) and exit |
 | `--version` | print the version |
 
 ## Keys
@@ -49,7 +49,7 @@ Flags:
 | `Ctrl+R` | react to selected message |
 | `y` | copy selected message |
 | `Ctrl+L` | open the first link in the selected message |
-| `Ctrl+A` | attach a file |
+| `Ctrl+A` | attach a file to the open conversation |
 | `Alt+Enter` | newline in the composer (`Shift+Enter` where the terminal supports it) |
 | `Esc` | close an overlay / leave the composer |
 | `?` | help |
@@ -83,6 +83,29 @@ Pinned conversations are shown as their own section when the database records
 pinning. macOS keeps that in Messages.app's preferences rather than in
 `chat.db`, so on every current system the list is one flat run of chats,
 newest first.
+
+## Sending
+
+`chat.db` is read-only, so outbound messages go the only supported way: an
+AppleScript handed to `osascript`, which asks Messages.app to send. The
+conversation is addressed by its `chat.guid` first — the exact thread you are
+looking at, group or not — and a one-to-one chat falls back to the handle on
+the other end of it. iMessage and SMS threads each ask for their own service.
+Messages.app is `launch`ed, never `activate`d, so it starts hidden and does not
+take the screen from your terminal.
+
+Every value that reaches the script is escaped for an AppleScript string
+literal, so quotes, backslashes, and newlines in a message cannot end the
+literal they live in, and errors coming back have their quoted parts stripped
+before they reach the status line — the quoted part is usually a phone number.
+
+Pressing `Enter` puts the message on screen immediately, marked `· Sending…`,
+and runs `osascript` on its own thread so the UI never blocks on it. When the
+real row shows up in `chat.db` the echo is replaced by it. A refused send is
+marked `· Failed` with the reason, and the text goes back in the composer.
+
+`Ctrl+A` asks for a path — `~` is expanded — and sends that file to the open
+conversation.
 
 ## Config
 

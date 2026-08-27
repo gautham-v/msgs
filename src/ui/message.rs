@@ -19,6 +19,7 @@ use ratatui::text::{Line, Span};
 use crate::db::handle;
 use crate::db::message::split_association;
 use crate::db::{AttachmentRef, Chat, GroupAction, Message, Tapback};
+use crate::send::{Delivery, Pending};
 use crate::theme::Theme;
 use crate::ui::format::{bytes, clock, day_label, find_links, single_line, truncate, width, wrap};
 
@@ -91,6 +92,9 @@ pub struct Ctx<'a> {
     pub messages: &'a [Message],
     /// `message.guid` to index in [`Ctx::messages`], for quoted replies.
     pub by_guid: &'a HashMap<String, usize>,
+    /// Messages sent but not yet read back out of `chat.db`, so their blocks
+    /// can say so.
+    pub pending: &'a [Pending],
     /// The clock, passed in so day labels are testable.
     pub now: DateTime<Local>,
 }
@@ -151,6 +155,21 @@ impl Ctx<'_> {
             .iter()
             .find(|handle| handle.rowid == rowid)
             .map(crate::db::Handle::short_name)
+    }
+
+    /// What a block says about a message that has not reached `chat.db` yet:
+    /// the `· Sending…` note, or the reason it failed.
+    #[must_use]
+    fn pending_note(&self, message: &Message) -> Option<(String, Color)> {
+        let pending = self
+            .pending
+            .iter()
+            .find(|pending| pending.guid == message.guid)?;
+        match &pending.state {
+            Delivery::Sending => Some(("· Sending…".to_string(), self.theme.gray_dim)),
+            Delivery::Sent => None,
+            Delivery::Failed(reason) => Some((format!("· Failed — {reason}"), self.theme.error)),
+        }
     }
 
     /// The message a reply quotes, when it is on the loaded page.
@@ -363,8 +382,20 @@ fn meta_lines(ctx: &Ctx<'_>, message: &Message, room: usize) -> Vec<Line<'static
         truncate(&meta, room),
         Style::new().fg(theme.gray),
     )];
-    let mut used = width(&meta);
+    let mut used = width(&meta).min(room);
     let mut lines = Vec::new();
+
+    // `· Sending…` rides on the end of the meta line rather than taking a row
+    // of its own, so a block does not change height when the send lands.
+    if let Some((note, color)) = ctx.pending_note(message) {
+        let room_left = room.saturating_sub(used + 1);
+        if room_left > 0 {
+            let note = truncate(&note, room_left);
+            used += width(&note) + 1;
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(note, Style::new().fg(color)));
+        }
+    }
 
     for chip in chips {
         let cells = width(&chip) + 3;
@@ -593,6 +624,7 @@ mod tests {
                 chat: Some(&self.chat),
                 messages: &self.messages,
                 by_guid: &self.by_guid,
+                pending: &[],
                 now: now(),
             }
         }

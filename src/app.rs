@@ -14,6 +14,7 @@ use ratatui::layout::{Position, Rect};
 
 use crate::config::Config;
 use crate::db::{Chat, Db, DbError, Message, PAGE};
+use crate::send::{self, Delivery, Outbox, Outgoing, Pending, SendError, Target};
 use crate::theme::Theme;
 use crate::ui::Panes;
 use crate::ui::conversation::{Hits, Measured, Scroll};
@@ -25,6 +26,16 @@ const TOAST_TTL: Duration = Duration::from_secs(2);
 const WHEEL_ROWS: i16 = 3;
 /// Tallest the composer grows before it scrolls internally.
 pub const COMPOSER_MAX_LINES: u16 = 6;
+/// How often a sent message is looked for in `chat.db`.
+const RECONCILE_EVERY: Duration = Duration::from_millis(400);
+/// How long a sent message is looked for before the echo is left to stand on
+/// its own. Messages has taken it by then; only the database is behind.
+const RECONCILE_FOR: Duration = Duration::from_secs(20);
+/// How far back of a sent message's own clock a database row may be and still
+/// be that message. Messages timestamps what it sends, not what msgs typed.
+const RECONCILE_SLACK: i64 = 120;
+/// Longest quoted line `r` puts in the composer.
+const QUOTE_LIMIT: usize = 80;
 
 /// Which pane or overlay currently receives keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -482,6 +493,23 @@ pub struct App {
     pub messages: ListPane,
     /// The send box.
     pub composer: TextField,
+    /// The `Ctrl+A` path prompt, which takes the composer's place while it is
+    /// open.
+    pub attach_prompt: Option<TextField>,
+    /// Messages sent but not yet read back out of `chat.db`, oldest first.
+    /// They are drawn as ordinary blocks at the end of the open conversation.
+    pub pending: Vec<Pending>,
+    /// Sends currently out with `osascript`.
+    ///
+    /// Public so a test can put an [`Outbox::inert`] one in its place and drive
+    /// the whole send path without anything leaving the machine.
+    pub outbox: Outbox,
+    /// Ids handed to [`App::outbox`], so every echo has a distinct one.
+    next_send: u64,
+    /// When the pending echoes were last looked for in the database.
+    last_reconcile: Option<Instant>,
+    /// When the oldest unreconciled echo was sent.
+    reconcile_since: Option<Instant>,
     /// The jump palette query.
     pub palette: TextField,
     /// Scroll offset of the help modal.
@@ -534,6 +562,12 @@ impl App {
             chat_filter: None,
             messages: ListPane::default(),
             composer: TextField::default(),
+            attach_prompt: None,
+            pending: Vec::new(),
+            outbox: Outbox::new(),
+            next_send: 0,
+            last_reconcile: None,
+            reconcile_since: None,
             palette: TextField::default(),
             help_scroll: 0,
             status,
@@ -714,8 +748,11 @@ impl App {
         self.messages.to_bottom();
         self.measured = Measured::default();
         self.convo = Scroll::default();
+        // Echoes for this chat go back on the end of the page they belong to.
+        self.sync_pending_rows();
         // The newest message goes to the bottom edge, which needs a pane
         // height; the next frame has one.
+        self.messages.to_bottom();
         self.pending_bottom = true;
     }
 
@@ -799,6 +836,7 @@ impl App {
                 chat: self.selected_chat(),
                 messages: &self.message_rows,
                 by_guid: &by_guid,
+                pending: &self.pending,
                 now,
             };
             let one = |index: usize| message::block(&ctx, index, width).height();
@@ -847,6 +885,260 @@ impl App {
                 0
             }
         }
+    }
+
+    /// `chat.ROWID` of the conversation the composer sends to.
+    ///
+    /// The open one, or — before a database has ever been read, which is how
+    /// the render tests drive it — whatever the chat list has selected.
+    #[must_use]
+    pub fn current_chat_rowid(&self) -> Option<i64> {
+        self.open_chat
+            .or_else(|| self.selected_chat().map(|chat| chat.rowid))
+    }
+
+    /// The conversation the composer sends to.
+    #[must_use]
+    pub fn current_chat(&self) -> Option<&Chat> {
+        let rowid = self.current_chat_rowid()?;
+        self.chat_rows.iter().find(|chat| chat.rowid == rowid)
+    }
+
+    /// `Enter` in the composer: hand the draft to Messages and echo it.
+    ///
+    /// The echo goes up first and the send runs on its own thread, because
+    /// `osascript` takes long enough to answer that doing it here would freeze
+    /// the UI mid-keystroke.
+    fn send_composed(&mut self) {
+        if self.composer.text().trim().is_empty() {
+            return;
+        }
+        let Some(target) = self.current_chat().map(Target::for_chat) else {
+            self.status.error("no conversation selected");
+            return;
+        };
+        let text = self.composer.take();
+        self.start_send(&target, text.clone(), Outgoing::Text(text), false);
+    }
+
+    /// `Ctrl+A`, once a path has been typed: send that file.
+    fn send_attachment(&mut self) {
+        let raw = self
+            .attach_prompt
+            .as_ref()
+            .map(|prompt| prompt.text().trim().to_string())
+            .unwrap_or_default();
+        if raw.is_empty() {
+            self.attach_prompt = None;
+            return;
+        }
+        let path = expand_path(&raw);
+        if !path.is_file() {
+            // The path is something the user typed, not message content, so
+            // naming it back is what makes the error useful. The prompt keeps
+            // what was typed, so a typo can be fixed rather than retyped.
+            self.status
+                .error(format!("no file at {}", crate::ui::home_relative(&path)));
+            return;
+        }
+        let Some(target) = self.current_chat().map(Target::for_chat) else {
+            self.status.error("no conversation selected");
+            return;
+        };
+        let label = path.file_name().map_or_else(
+            || "attachment".to_string(),
+            |name| name.to_string_lossy().to_string(),
+        );
+        self.attach_prompt = None;
+        self.start_send(&target, format!("📎 {label}"), Outgoing::File(path), true);
+    }
+
+    /// Put an echo on screen and start the send behind it.
+    fn start_send(&mut self, target: &Target, echo: String, what: Outgoing, is_file: bool) {
+        if !target.is_addressable() {
+            self.status.error(SendError::NoTarget.to_string());
+            return;
+        }
+        let Some(chat_rowid) = self.current_chat_rowid() else {
+            self.status.error("no conversation selected");
+            return;
+        };
+        let id = self.next_send;
+        self.next_send += 1;
+        self.pending.push(Pending::new(
+            id,
+            chat_rowid,
+            echo,
+            is_file,
+            crate::db::raw_time(Local::now()),
+        ));
+        self.outbox.send(id, target.clone(), what);
+        self.reconcile_since.get_or_insert_with(Instant::now);
+        self.last_reconcile = None;
+        self.sync_pending_rows();
+        // You just sent something: the transcript goes to the bottom to show it.
+        self.messages.to_bottom();
+        self.pending_bottom = true;
+    }
+
+    /// Rebuild the echo rows at the end of the loaded page.
+    ///
+    /// The echoes are ordinary [`Message`] rows carrying a synthetic GUID, so
+    /// the measuring, the scrolling, and the drawing treat them exactly like
+    /// anything read out of the database.
+    fn sync_pending_rows(&mut self) {
+        self.message_rows
+            .retain(|message| !message.guid.starts_with(send::PENDING_PREFIX));
+        let Some(chat_rowid) = self.current_chat_rowid() else {
+            return;
+        };
+        let echoes: Vec<Message> = self
+            .pending
+            .iter()
+            .filter(|pending| pending.chat_rowid == chat_rowid)
+            .map(echo_row)
+            .collect();
+        self.message_rows.extend(echoes);
+        self.messages.set_len(self.message_rows.len());
+    }
+
+    /// Take the answers to the sends that have come back.
+    ///
+    /// Returns `true` if anything changed on screen.
+    fn absorb_replies(&mut self) -> bool {
+        let replies = self.outbox.drain();
+        if replies.is_empty() {
+            return false;
+        }
+        for reply in replies {
+            let Some(pending) = self
+                .pending
+                .iter_mut()
+                .find(|pending| pending.id == reply.id)
+            else {
+                continue;
+            };
+            match reply.result {
+                Ok(()) => {
+                    pending.state = Delivery::Sent;
+                    self.status.messages_app_running = Some(true);
+                }
+                Err(err) => {
+                    let reason = err.to_string();
+                    let text = pending.text.clone();
+                    let is_file = pending.is_file;
+                    pending.state = Delivery::Failed(reason.clone());
+                    if matches!(err, SendError::NotAvailable) {
+                        self.status.messages_app_running = Some(false);
+                    }
+                    // The draft is not lost: it goes back in the composer so
+                    // the same keystroke sends it again.
+                    if !is_file && self.composer.is_empty() {
+                        self.composer = TextField::from_text(text);
+                    }
+                    self.status.error(format!("could not send — {reason}"));
+                }
+            }
+        }
+        self.sync_pending_rows();
+        true
+    }
+
+    /// Look for the sent messages in `chat.db` and drop the echoes that have
+    /// arrived for real.
+    ///
+    /// Returns `true` if anything changed on screen.
+    fn reconcile_pending(&mut self) -> bool {
+        if self.pending.is_empty() {
+            self.reconcile_since = None;
+            return false;
+        }
+        // A failed send stands until the user does something about it; nothing
+        // is coming for it.
+        if self
+            .pending
+            .iter()
+            .all(|pending| matches!(pending.state, Delivery::Failed(_)))
+        {
+            self.reconcile_since = None;
+            return false;
+        }
+        let waited = self.reconcile_since.map(|since| since.elapsed());
+        if waited.is_some_and(|waited| waited > RECONCILE_FOR) {
+            // Messages took it; the database is simply behind, or is being read
+            // from a snapshot copy. The echo stays, without the note.
+            for pending in &mut self.pending {
+                if pending.state == Delivery::Sending {
+                    pending.state = Delivery::Sent;
+                }
+            }
+            self.reconcile_since = None;
+            self.sync_pending_rows();
+            return true;
+        }
+        if self
+            .last_reconcile
+            .is_some_and(|last| last.elapsed() < RECONCILE_EVERY)
+        {
+            return false;
+        }
+        self.last_reconcile = Some(Instant::now());
+        self.pull_new_messages()
+    }
+
+    /// Read whatever `chat.db` has gained at the end of the open conversation,
+    /// and retire the echoes it accounts for.
+    fn pull_new_messages(&mut self) -> bool {
+        let Some(chat_rowid) = self.open_chat else {
+            return false;
+        };
+        let Some(db) = self.db.as_ref() else {
+            return false;
+        };
+        let newest = self
+            .message_rows
+            .iter()
+            .filter(|message| !message.guid.starts_with(send::PENDING_PREFIX))
+            .map(|message| message.rowid)
+            .max()
+            .unwrap_or(0);
+        let Ok(arrived) = db.messages_after(chat_rowid, newest, PAGE) else {
+            return false;
+        };
+        if arrived.is_empty() {
+            return false;
+        }
+
+        let mut claimed: Vec<u64> = Vec::new();
+        for message in &arrived {
+            let sent = message.date;
+            let Some(pending) = self.pending.iter().find(|pending| {
+                pending.chat_rowid == chat_rowid
+                    && !claimed.contains(&pending.id)
+                    && !matches!(pending.state, Delivery::Failed(_))
+                    && recent_enough(pending.date, sent)
+                    && pending.matches(message)
+            }) else {
+                continue;
+            };
+            claimed.push(pending.id);
+        }
+        self.pending
+            .retain(|pending| !claimed.contains(&pending.id));
+        if self.pending.is_empty() {
+            self.reconcile_since = None;
+        }
+
+        // Insert the real rows before the echoes that are still standing.
+        self.message_rows
+            .retain(|message| !message.guid.starts_with(send::PENDING_PREFIX));
+        self.message_rows.extend(arrived);
+        self.sync_pending_rows();
+        self.messages.to_bottom();
+        self.pending_bottom = true;
+        // The chat list's preview line and ordering moved with it.
+        self.reload_chats();
+        true
     }
 
     /// The focus `keymap` should resolve against.
@@ -898,9 +1190,12 @@ impl App {
     }
 
     /// The text field that currently has focus, if any.
+    ///
+    /// The attachment prompt sits in front of the composer while it is open, so
+    /// the same keys type into it.
     fn active_field(&mut self) -> Option<&mut TextField> {
         match self.focus {
-            Focus::Composer => Some(&mut self.composer),
+            Focus::Composer => Some(self.attach_prompt.as_mut().unwrap_or(&mut self.composer)),
             Focus::Palette => Some(&mut self.palette),
             Focus::ChatList => self.chat_filter.as_mut(),
             _ => None,
@@ -947,10 +1242,10 @@ impl App {
             Action::CursorRight => self.edit(TextField::cursor_right),
             Action::CursorHome => self.edit(TextField::cursor_home),
             Action::CursorEnd => self.edit(TextField::cursor_end),
-            Action::Attach => self.not_yet("Attaching files arrives with the composer"),
+            Action::Attach => self.start_attach(),
             Action::OpenAttachment => self.not_yet("Attachments arrive with the attachment pass"),
             Action::SaveAttachment => self.not_yet("Attachments arrive with the attachment pass"),
-            Action::QuoteReply => self.not_yet("Reply quoting arrives with the composer"),
+            Action::QuoteReply => self.quote_reply(),
             Action::React => self.not_yet("Tapbacks arrive with the imsg integration"),
             Action::CopySelection => self.copy_selection(),
             Action::OpenLink => self.open_selected_link(),
@@ -1085,10 +1380,11 @@ impl App {
                 self.focus = Focus::Conversation;
             }
             Focus::Composer => {
-                if self.composer.is_empty() {
-                    return;
+                if self.attach_prompt.is_some() {
+                    self.send_attachment();
+                } else {
+                    self.send_composed();
                 }
-                self.not_yet("Sending arrives with the Messages.app bridge");
             }
             Focus::Palette => self.not_yet("The jump palette arrives with search"),
             Focus::Conversation => self.focus = Focus::Composer,
@@ -1100,7 +1396,13 @@ impl App {
         match self.focus {
             Focus::Help | Focus::Palette => self.close_overlay(),
             Focus::ChatList => self.chat_filter = None,
-            Focus::Composer => self.focus = Focus::Conversation,
+            Focus::Composer => {
+                // The attachment prompt is a layer in front of the composer, so
+                // `Esc` closes it and leaves the draft where it was.
+                if self.attach_prompt.take().is_none() {
+                    self.focus = Focus::Conversation;
+                }
+            }
             Focus::Conversation => {
                 if self.show_chat_list {
                     self.focus = Focus::ChatList;
@@ -1117,18 +1419,55 @@ impl App {
         self.chat_filter = Some(TextField::default());
     }
 
+    /// `Ctrl+A`: ask for a path, in the composer's place.
+    fn start_attach(&mut self) {
+        if self.focus.is_overlay() {
+            return;
+        }
+        self.focus = Focus::Composer;
+        self.attach_prompt.get_or_insert_with(TextField::default);
+    }
+
+    /// `r`: open a reply by quoting what is selected.
+    ///
+    /// Messages has no in-thread reply that AppleScript can reach, so the quote
+    /// is a `>` line in the draft — the same thing you would type by hand.
+    fn quote_reply(&mut self) {
+        let Some(message) = self.selected_message() else {
+            self.status.error("no message selected");
+            return;
+        };
+        let quoted = crate::ui::format::single_line(&copyable(message));
+        if quoted.is_empty() {
+            self.status.toast("nothing to quote in that message");
+            return;
+        }
+        let quoted = crate::ui::format::truncate(&quoted, QUOTE_LIMIT);
+        let draft = self.composer.take();
+        self.composer = TextField::from_text(format!("> {quoted}\n{draft}"));
+        self.attach_prompt = None;
+        self.focus = Focus::Composer;
+    }
+
     fn edit(&mut self, apply: impl FnOnce(&mut TextField)) {
         if let Some(field) = self.active_field() {
             apply(field);
         }
     }
 
-    /// Backspace on an empty filter box closes it, which is what `Esc` would do.
+    /// Backspace on an empty filter box or path prompt closes it, which is what
+    /// `Esc` would do.
     fn backspace(&mut self) {
         if self.focus == Focus::ChatList
             && self.chat_filter.as_ref().is_some_and(TextField::is_empty)
         {
             self.chat_filter = None;
+            return;
+        }
+        if self.focus == Focus::Composer
+            && self.attach_prompt.as_ref().is_some_and(TextField::is_empty)
+        {
+            self.attach_prompt = None;
             return;
         }
         self.edit(TextField::backspace);
@@ -1182,7 +1521,7 @@ impl App {
     /// Height the composer wants, borders included.
     #[must_use]
     pub fn composer_height(&self) -> u16 {
-        self.composer.line_count().clamp(1, COMPOSER_MAX_LINES) + 2
+        self.composer_lines().clamp(1, COMPOSER_MAX_LINES) + 2
     }
 
     /// Route a mouse event to the pane under the pointer.
@@ -1271,8 +1610,82 @@ impl App {
 
     /// Housekeeping between frames. Returns `true` if a redraw is needed.
     pub fn tick(&mut self) -> bool {
-        self.status.tick()
+        let mut dirty = self.status.tick();
+        dirty |= self.absorb_replies();
+        dirty |= self.reconcile_pending();
+        dirty
     }
+
+    /// Height the composer's contents want, borders excluded.
+    #[must_use]
+    fn composer_lines(&self) -> u16 {
+        self.attach_prompt
+            .as_ref()
+            .map_or_else(|| self.composer.line_count(), TextField::line_count)
+    }
+}
+
+/// The optimistic echo of `pending`, as a message row.
+///
+/// Its `ROWID` is above anything `chat.db` can hold, so it sorts to the end of
+/// the page, and its GUID carries [`send::PENDING_PREFIX`], so it can always be
+/// told apart from a real row.
+fn echo_row(pending: &Pending) -> Message {
+    Message {
+        rowid: i64::MAX - i64::try_from(pending.id).unwrap_or(0),
+        guid: pending.guid.clone(),
+        chat_rowid: pending.chat_rowid,
+        handle_rowid: None,
+        handle: None,
+        service: None,
+        is_from_me: true,
+        is_read: false,
+        date: pending.date,
+        date_delivered: 0,
+        date_read: 0,
+        date_edited: 0,
+        is_edited: false,
+        text: Some(pending.text.clone()),
+        subject: None,
+        attachments: Vec::new(),
+        reply_to_guid: None,
+        thread_originator_guid: None,
+        tapbacks: Vec::new(),
+        item_type: 0,
+        group_action_type: 0,
+        group_title: None,
+        other_handle: None,
+        group_action: None,
+    }
+}
+
+/// Whether a row that just arrived is close enough in time to be the message
+/// that was sent. Unreadable timestamps do not disqualify anything.
+fn recent_enough(echoed: i64, arrived: i64) -> bool {
+    let (Some(echoed), Some(arrived)) = (
+        crate::db::unix_seconds(echoed),
+        crate::db::unix_seconds(arrived),
+    ) else {
+        return true;
+    };
+    (arrived - echoed).abs() <= RECONCILE_SLACK
+}
+
+/// Expand a leading `~` and make the path absolute, the way a shell would.
+#[must_use]
+fn expand_path(raw: &str) -> PathBuf {
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'');
+    let expanded = if trimmed == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(trimmed))
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        dirs::home_dir().map_or_else(|| PathBuf::from(trimmed), |home| home.join(rest))
+    } else {
+        PathBuf::from(trimmed)
+    };
+    if expanded.is_absolute() {
+        return expanded;
+    }
+    std::env::current_dir().map_or(expanded.clone(), |cwd| cwd.join(expanded))
 }
 
 /// What `y` puts on the clipboard: the body, or the names of what was sent when
@@ -1556,6 +1969,246 @@ mod tests {
         );
         assert_eq!(app.status.warnings.len(), 1);
         assert!(app.status.active_toast().is_some());
+    }
+
+    /// A one-to-one chat with an invented address, and an outbox that records
+    /// sends instead of running them. Nothing in these tests reaches
+    /// `osascript`, so nothing leaves the machine.
+    fn app_with_chat() -> App {
+        let mut app = app();
+        app.outbox = Outbox::inert();
+        app.chat_rows = vec![Chat {
+            rowid: 1,
+            guid: "iMessage;-;+15550000000".to_string(),
+            identifier: Some("+15550000000".to_string()),
+            display_name: None,
+            service: Some("iMessage".to_string()),
+            style: 45,
+            is_group: false,
+            participants: Vec::new(),
+            last_message_date: 0,
+            last_message_rowid: 0,
+            preview: None,
+            message_count: 0,
+            unread_count: 0,
+            is_pinned: None,
+        }];
+        app.refresh_chat_view();
+        app.focus = Focus::Composer;
+        app
+    }
+
+    fn compose(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.update(Action::Insert(c));
+        }
+    }
+
+    #[test]
+    fn enter_hands_the_draft_to_messages_and_echoes_it_at_once() {
+        let mut app = app_with_chat();
+        compose(&mut app, "on my way");
+        app.update(Action::Activate);
+
+        assert!(app.composer.is_empty(), "the draft leaves the box");
+        assert_eq!(app.pending.len(), 1);
+        assert_eq!(app.pending[0].state, Delivery::Sending);
+
+        let echo = app.message_rows.last().expect("an echo block");
+        assert!(echo.is_from_me);
+        assert!(echo.guid.starts_with(send::PENDING_PREFIX));
+        assert_eq!(app.messages.len, 1);
+
+        // Addressed by chat guid, as text, on the chat's own service.
+        let recorded = app.outbox.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, app.pending[0].id);
+        assert_eq!(
+            recorded[0].1.guid.as_deref(),
+            Some("iMessage;-;+15550000000")
+        );
+        assert_eq!(recorded[0].2, Outgoing::Text("on my way".to_string()));
+    }
+
+    #[test]
+    fn an_empty_or_blank_draft_sends_nothing() {
+        let mut app = app_with_chat();
+        app.update(Action::Activate);
+        compose(&mut app, "   ");
+        app.update(Action::Activate);
+        assert!(app.pending.is_empty());
+        assert!(app.outbox.recorded().is_empty());
+    }
+
+    #[test]
+    fn a_send_with_no_conversation_open_says_so_instead_of_sending() {
+        let mut app = app();
+        app.outbox = Outbox::inert();
+        app.focus = Focus::Composer;
+        compose(&mut app, "hello?");
+        app.update(Action::Activate);
+        assert!(app.pending.is_empty());
+        assert!(app.outbox.recorded().is_empty());
+        assert_eq!(
+            app.composer.text(),
+            "hello?",
+            "the draft is not thrown away"
+        );
+    }
+
+    #[test]
+    fn a_send_that_lands_keeps_the_echo_and_drops_the_note() {
+        let mut app = app_with_chat();
+        compose(&mut app, "on my way");
+        app.update(Action::Activate);
+
+        app.outbox.answer(app.pending[0].id, Ok(()));
+        assert!(app.tick(), "the answer changes the screen");
+        assert_eq!(app.pending[0].state, Delivery::Sent);
+        assert_eq!(app.status.messages_app_running, Some(true));
+        assert!(app.composer.is_empty());
+    }
+
+    #[test]
+    fn a_refused_send_is_marked_failed_and_gives_the_draft_back() {
+        let mut app = app_with_chat();
+        compose(&mut app, "on my way");
+        app.update(Action::Activate);
+
+        app.outbox.answer(
+            app.pending[0].id,
+            Err(SendError::Script("Messages refused it".to_string())),
+        );
+        assert!(app.tick());
+
+        assert_eq!(
+            app.pending[0].state,
+            Delivery::Failed("Messages refused it".to_string())
+        );
+        assert_eq!(app.composer.text(), "on my way", "the draft comes back");
+        let (_, is_error) = app.status.active_toast().expect("a toast");
+        assert!(is_error);
+        // Nothing is coming for a failed send, so nothing keeps polling.
+        assert!(!app.tick());
+    }
+
+    #[test]
+    fn echoes_follow_their_own_conversation() {
+        let mut app = app_with_chat();
+        compose(&mut app, "on my way");
+        app.update(Action::Activate);
+        assert_eq!(app.message_rows.len(), 1);
+
+        // A different chat's page has no echo on it.
+        app.chats.selected = 0;
+        app.pending[0].chat_rowid = 99;
+        app.sync_pending_rows();
+        assert!(app.message_rows.is_empty());
+    }
+
+    #[test]
+    fn ctrl_a_asks_for_a_path_and_escape_leaves_the_draft_alone() {
+        let mut app = app_with_chat();
+        compose(&mut app, "look at this");
+        app.update(Action::Attach);
+        assert!(app.attach_prompt.is_some());
+        assert_eq!(app.focus, Focus::Composer);
+
+        compose(&mut app, "/tmp/x");
+        assert_eq!(app.attach_prompt.as_ref().expect("prompt").text(), "/tmp/x");
+        assert_eq!(
+            app.composer.text(),
+            "look at this",
+            "the draft is untouched"
+        );
+
+        app.update(Action::Cancel);
+        assert!(app.attach_prompt.is_none());
+        assert_eq!(app.focus, Focus::Composer, "Esc closes the prompt only");
+        assert_eq!(app.composer.text(), "look at this");
+    }
+
+    #[test]
+    fn a_path_that_is_not_a_file_is_refused_and_kept_for_fixing() {
+        let mut app = app_with_chat();
+        app.update(Action::Attach);
+        compose(&mut app, "/nonexistent/msgs-test/nothing.png");
+        app.update(Action::Activate);
+
+        assert!(app.pending.is_empty());
+        assert!(app.outbox.recorded().is_empty());
+        assert!(app.attach_prompt.is_some(), "the typed path survives");
+        let (_, is_error) = app.status.active_toast().expect("a toast");
+        assert!(is_error);
+    }
+
+    #[test]
+    fn attaching_a_real_file_sends_it_and_echoes_its_name() {
+        let path = std::env::temp_dir().join(format!("msgs-attach-{}.txt", std::process::id()));
+        std::fs::write(&path, b"fixture").expect("write a scratch file");
+
+        let mut app = app_with_chat();
+        app.update(Action::Attach);
+        compose(&mut app, &path.to_string_lossy());
+        app.update(Action::Activate);
+
+        assert!(app.attach_prompt.is_none());
+        assert_eq!(app.pending.len(), 1);
+        assert!(app.pending[0].is_file);
+        let echo = app.message_rows.last().expect("an echo block");
+        assert_eq!(
+            echo.text.as_deref(),
+            Some(format!("📎 {}", path.file_name().unwrap().to_string_lossy()).as_str())
+        );
+        assert_eq!(
+            app.outbox.recorded()[0].2,
+            Outgoing::File(path.clone()),
+            "the file goes out as a file"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn r_quotes_the_selected_message_into_the_composer() {
+        let mut app = app_with_chat();
+        app.message_rows = vec![echo_row(&Pending::new(
+            0,
+            1,
+            "dinner tonight?".to_string(),
+            false,
+            0,
+        ))];
+        app.messages.set_len(1);
+        app.pending.clear();
+        app.focus = Focus::Conversation;
+
+        app.update(Action::QuoteReply);
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.composer.text(), "> dinner tonight?\n");
+        // The cursor is on the empty line under the quote, ready to type.
+        assert_eq!(app.composer.cursor(), app.composer.text().len());
+    }
+
+    #[test]
+    fn a_tilde_path_expands_and_a_relative_one_is_made_absolute() {
+        let home = dirs::home_dir().expect("a home directory");
+        assert_eq!(expand_path("~"), home);
+        assert_eq!(expand_path("~/Pictures/x.png"), home.join("Pictures/x.png"));
+        assert_eq!(
+            expand_path("\"/tmp/quoted.png\""),
+            PathBuf::from("/tmp/quoted.png")
+        );
+        assert!(expand_path("relative.png").is_absolute());
+    }
+
+    #[test]
+    fn only_a_row_from_about_the_same_moment_can_be_the_echo() {
+        let now = crate::db::raw_time(Local::now());
+        assert!(recent_enough(now, now));
+        assert!(recent_enough(now, now + 60_000_000_000));
+        assert!(!recent_enough(now, now - 600_000_000_000));
+        // A timestamp of zero means "never", which disqualifies nothing.
+        assert!(recent_enough(0, now));
     }
 
     #[test]

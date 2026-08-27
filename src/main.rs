@@ -209,6 +209,14 @@ fn check(cli: &Cli, warnings: &[String]) -> Result<()> {
     );
 
     row(
+        "osascript",
+        &which("osascript").map_or_else(
+            || "not on PATH — sending will not work".to_string(),
+            |path| path.display().to_string(),
+        ),
+    );
+
+    row(
         "imsg",
         &which("imsg").map_or_else(
             || "not on PATH — tapbacks will be unavailable".to_string(),

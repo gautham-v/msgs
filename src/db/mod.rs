@@ -71,6 +71,16 @@ pub fn unix_seconds(raw: i64) -> Option<i64> {
     Some(seconds + *APPLE_EPOCH_OFFSET)
 }
 
+/// Convert local time to a raw Messages timestamp.
+///
+/// The inverse of [`local_time`], for the rows msgs invents itself: the
+/// optimistic echo of a message that has been sent but is not in `chat.db`
+/// yet. Nothing built this way is ever written to the database.
+#[must_use]
+pub fn raw_time(when: DateTime<Local>) -> i64 {
+    (when.timestamp() - *APPLE_EPOCH_OFFSET).saturating_mul(1_000_000_000)
+}
+
 /// Why the database could not be read.
 ///
 /// Every variant carries at most a path, never anything out of the database.
