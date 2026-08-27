@@ -6,9 +6,64 @@ Built with Rust + [ratatui](https://ratatui.rs). Visual grammar borrowed from Gr
 
 Design mockups: [`docs/mockups.html`](docs/mockups.html).
 
+```
+ / search chats…             │ Alex Nakamura · iMessage · +1 (555) 000-0001    4 msgs · 1 photo
+ ● Fixture Group 5/18/22  1  │──────────────────────────────────────────────────────────────────
+   Bailey: named the conver… │ May 18, 2022
+▌● Alex Nakamura 5/18/22  1  │ ▌  first fixture message
+▌  still unread              │ ▌  00:29  😂  Alex   ❤️  You
+   iMessage;-;+15550000009   │ ▌  recovered from the typedstream
+                             │ ▌  00:30
+                             │ ▌  ┄ 📷  photo.png · 2.0 KB · (not downloaded on this Mac) ┄
+                             │ ▌  00:31 · Read 00:33
+                             │ ▌  still unread
+                             │ ▌  00:34
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │╭────────────────────────────────────────────────────────────────╮
+                             ││› message Alex Nakamura…                                        │
+                             │╰────────────────────────────────────────────────────────────────╯
+                             │ o open · s save · y copy · Ctrl+R react
+────────────────────────────────────────────────────────────────────────────────────────────────
+ Messages.app unknown  │  2 unread in 2 chats  │  watching chat.db
+ Tab focus list/convo · ↑↓ select · Enter open/send · Ctrl+K jump / search · o open attachment ·
+```
+
+That frame is drawn by the real widgets, at 96×26, against the synthetic
+fixture under `tests/fixtures/` — every name, number, and body in it is
+invented, because a picture of a terminal is the one thing that would carry
+somebody's messages into a repository. `tests/screenshot.rs` regenerates it
+(`TZ=UTC UPDATE_SCREENSHOT=1 cargo test --test screenshot` — the clocks in a
+transcript are drawn in the local zone) and fails when the app stops drawing
+what is printed above.
+
 ## Status
 
-Early. See the GitHub issues for the build plan.
+Working. Everything below is shipped; [Limitations](#limitations) is the
+honest list of what msgs cannot do.
+
+## Install
+
+```
+cargo install --path .        # from a clone, into ~/.cargo/bin
+brew install --HEAD --build-from-source packaging/msgs.rb
+```
+
+Both build the release profile: whole-program optimization, one codegen unit,
+stripped — a 4 MB binary that starts in under a tenth of a second on a
+200,000-message database.
+
+`packaging/msgs.rb` is a Homebrew formula stub rather than a live tap: the URL
+and checksum in it are placeholders until a `v*` tag is pushed, at which point
+`.github/workflows/release.yml` builds a universal (arm64 + x86_64) binary,
+attaches `msgs-<version>-macos-universal.tar.gz` and its `.sha256` to the
+release, and prints the checksum to paste into the formula.
 
 ## Requirements
 
@@ -348,8 +403,95 @@ participant0 = "#7ec699" # participant0–participant3: stable group-chat accent
 border_active = "#5ea8ff"
 ```
 
+Every key, what it does, and what overrides it:
+
+| Key | Default | Range | Meaning |
+|---|---|---|---|
+| `show_chat_list` | `true` | bool | show the chat list on startup; `Ctrl+B` toggles it at runtime |
+| `chat_list_width` | `30` | 18–60 columns | width of the chat list, never more than half the screen |
+| `page_step` | `10` | ≥ 1 rows | rows moved by `PageUp` / `PageDown`, and × 3 by one wheel notch |
+| `mouse` | `true` | bool | capture the mouse; `--no-mouse` overrides it to `false` |
+| `images` | `true` | bool | draw pictures inline; `--no-images` overrides it to `false` |
+| `contacts` | `true` | bool | read Contacts for names; `--no-contacts` overrides it to `false` |
+| `[theme]` | — | color per slot | any slot below, as `"#rrggbb"`, `"#rgb"`, or an ANSI index `0`–`255` |
+
 Slots: `bg_base`, `bg_light`, `bg_dark`, `bg_highlight`, `bg_hover`, `accent_me`, `accent_them`,
 `participant0`–`participant3`, `text_primary`, `text_secondary`, `gray`, `gray_dim`, `system`,
 `fuzzy`, `border`, `border_active`, `error`.
 
+A value out of range is clamped and said on the status line; an unknown key,
+a bad color, or TOML that will not parse is a warning under `NOTES` in the help
+modal and defaults are used. Nothing in the file can stop msgs from starting.
+
 The chat list hides itself below 90 columns regardless of `show_chat_list`.
+
+## Speed
+
+Everything is measured against `tests/fixtures`' own 200,000-message database —
+invented, never a copy of anybody's `chat.db` — by `tests/perf.rs`, which
+asserts the budgets rather than just printing them. On an M-series laptop, in
+the release profile:
+
+| | Budget | Measured |
+|---|---|---|
+| Cold start: open the database, load the chat list, open the newest thread, draw | 300 ms | ~93 ms |
+| A keystroke, laid out and drawn, in a 100,000-message thread | 16.6 ms (60 fps) | ~0.17 ms |
+| A page of 100 messages at the newest end / 50,000 back | 25 ms | ~0.8 ms / ~2.6 ms |
+| Resident memory after opening and paging through that thread | 150 MB | ~19 MB |
+
+The shape behind those numbers: the chat list is four queries whatever its
+length, a conversation is read a page at a time from the newest end so a
+25,000-message thread opens as fast as a short one, block heights are measured
+once per page rather than once per frame, and only the blocks on screen are laid
+out. The search index, the contacts read, the HEIC conversions, and the
+Messages.app probe all run on their own threads, so none of them is on the path
+between a keystroke and a frame.
+
+## Limitations
+
+Some of these are macOS's and some are msgs's, and it is worth knowing which:
+
+- **No typing indicators.** They are never written to `chat.db` — they only
+  exist inside Messages.app — so there is nothing to read.
+- **Messages.app's badge and read flags cannot be cleared.** `chat.db` is
+  read-only and there is no supported way in. Opening a chat clears msgs's own
+  badge, kept in `seen.json`; the Dock badge is Messages.app's own.
+- **No editing and no unsending.** AppleScript cannot do either. An edit or an
+  unsend made on another device is read the way any other change is, but msgs
+  does not mark an edited message as edited.
+- **Reactions need [`imsg`](https://github.com/steipete/imsg)**, and taking one
+  back, or sending an arbitrary emoji as one, needs its bridge — which macOS
+  will not load while System Integrity Protection is on. Every reaction is
+  *read* and drawn regardless.
+- **Sending needs Messages.app** signed in and `osascript` available. msgs
+  launches it hidden; it never takes the screen.
+- **No pinned conversations.** macOS keeps pinning in Messages.app's
+  preferences rather than in `chat.db`, so the list is one flat run of chats.
+- **Search pages back 10,000 messages.** A hit further back than that opens the
+  conversation and says so instead of reading the whole thread.
+- **Attachments that never reached this Mac stay chips.** msgs reads files; it
+  cannot ask iCloud for one. HEIC needs `sips`, which macOS ships.
+- **No group management** — no renaming, no adding or removing people — and no
+  deleting a message or a thread. Group events are read and drawn.
+- **macOS 14+ only**, with Full Disk Access for the terminal msgs runs in.
+  Without it msgs starts and explains what to do rather than failing.
+
+## Development
+
+```
+cargo test                                    # unit, render, database, live, search, perf
+cargo test --release --test perf -- --nocapture   # the budgets above, with their numbers
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+TZ=UTC UPDATE_SCREENSHOT=1 cargo test --test screenshot   # redraw the frame above
+```
+
+The suite builds its own synthetic fixtures under `tests/fixtures/` on first
+run — a small one, a 100,000-message one, and the 200,000-message one the perf
+budgets are stated against — and every one of them is invented here. No test
+opens `~/Library/Messages/chat.db` or the real Contacts stores, and nothing in
+the repository holds a real name, number, or message.
+
+`.github/workflows/ci.yml` runs all four on macOS for every push and pull
+request; `.github/workflows/release.yml` builds the universal binary on a `v*`
+tag. `packaging/msgs.rb` is the Homebrew formula that installs it.

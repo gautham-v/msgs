@@ -154,6 +154,165 @@ fn build_large(path: &Path) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// How many messages [`perf_database`] invents: the size the perf budgets in
+/// `tests/perf.rs` are stated against.
+pub const PERF_MESSAGES: i64 = 200_000;
+
+/// How many chats those messages are spread across.
+pub const PERF_CHATS: i64 = 60;
+
+/// The chat holding half of [`PERF_MESSAGES`], so a page can be measured
+/// against a thread far deeper than any page it loads.
+pub const PERF_DEEP_CHAT: i64 = 1;
+
+/// Two hundred thousand invented messages across [`PERF_CHATS`] chats.
+///
+/// The shape a busy Mac has after a decade: one enormous thread, dozens of
+/// smaller ones interleaved with it, a scattering of photos, and some unread.
+/// Built once into `tests/fixtures/perf.db` (gitignored) exactly the way the
+/// other two fixtures are — every body, number, and name is invented here and
+/// nothing is ever copied out of a real store.
+pub fn perf_database() -> PathBuf {
+    static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("perf.db");
+            if path.exists() {
+                return path;
+            }
+            let staging = path.with_extension(format!("db.building-{}", std::process::id()));
+            let _ = std::fs::remove_file(&staging);
+            build_perf(&staging).expect("build the perf fixture database");
+            std::fs::rename(&staging, &path).expect("move the perf fixture into place");
+            path
+        })
+        .clone()
+}
+
+/// Which chat message `n` of the perf fixture belongs to: every other message
+/// lands in the deep thread, and the rest go round the other chats.
+fn perf_chat_of(n: i64) -> i64 {
+    if n % 2 == 0 {
+        PERF_DEEP_CHAT
+    } else {
+        2 + (n / 2) % (PERF_CHATS - 1)
+    }
+}
+
+/// Fill a database with [`PERF_MESSAGES`] invented bodies across
+/// [`PERF_CHATS`] chats.
+fn build_perf(path: &Path) -> rusqlite::Result<()> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch("PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF;")?;
+    conn.execute_batch(SCHEMA)?;
+
+    // One handle per chat, plus three that sit in every group, so a person can
+    // be in more than one conversation the way a real address book is.
+    let shared = PERF_CHATS + 1..=PERF_CHATS + 3;
+    for rowid in 1..=PERF_CHATS + 3 {
+        handle(&conn, rowid, &format!("+1555{rowid:07}"), "iMessage")?;
+    }
+    for rowid in 1..=PERF_CHATS {
+        let group = rowid % 5 == 0;
+        let (style, name) = if group {
+            (43, Some(format!("Fixture Group {rowid}")))
+        } else {
+            (45, None)
+        };
+        chat(
+            &conn,
+            rowid,
+            &format!("iMessage;{};perf{rowid:04}", if group { '+' } else { '-' }),
+            style,
+            name.as_deref(),
+        )?;
+        conn.execute(
+            "INSERT INTO chat_handle_join (chat_id, handle_id) VALUES (?1, ?2)",
+            (rowid, rowid),
+        )?;
+        if group {
+            for handle_id in shared.clone() {
+                conn.execute(
+                    "INSERT INTO chat_handle_join (chat_id, handle_id) VALUES (?1, ?2)",
+                    (rowid, handle_id),
+                )?;
+            }
+        }
+    }
+
+    const WORDS: [&str; 8] = [
+        "morning", "dinner", "later", "office", "train", "coffee", "tomorrow", "photos",
+    ];
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut insert = tx.prepare(
+            "INSERT INTO message (ROWID, guid, text, handle_id, service, is_from_me, is_read,
+                                  date, date_delivered, cache_has_attachments,
+                                  associated_message_type, item_type)
+             VALUES (?1, ?2, ?3, ?4, 'iMessage', ?5, ?6, ?7, ?8, ?9, 0, 0)",
+        )?;
+        let mut join = tx.prepare(
+            "INSERT INTO chat_message_join (chat_id, message_id, message_date) VALUES (?1, ?2, ?3)",
+        )?;
+        let mut attach = tx.prepare(
+            "INSERT INTO attachment (ROWID, guid, original_guid, filename, uti, mime_type,
+                                     transfer_name, total_bytes, transfer_state,
+                                     is_sticker, hide_attachment)
+             VALUES (?1, ?2, ?2, ?3, 'public.png', 'image/png', ?4, 4096, 5, 0, 0)",
+        )?;
+        let mut attach_join = tx.prepare(
+            "INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (?1, ?2)",
+        )?;
+
+        let mut attachments = 0i64;
+        for n in 1..=PERF_MESSAGES {
+            let chat_id = perf_chat_of(n);
+            let from_me = n % 3 == 0;
+            let photo = n % 500 == 0;
+            let body = if photo {
+                "\u{FFFC}".to_string()
+            } else {
+                format!(
+                    "{} {} {n}",
+                    WORDS[(n as usize) % WORDS.len()],
+                    WORDS[(n as usize / 3) % WORDS.len()]
+                )
+            };
+            // A scattering of incoming messages nobody has read, so the unread
+            // totals and their badges have something to add up.
+            let read = from_me || n % 997 != 0;
+            insert.execute(rusqlite::params![
+                n,
+                guid(n),
+                body,
+                if from_me { 0 } else { chat_id },
+                i64::from(from_me),
+                i64::from(read),
+                BASE + n * SECOND,
+                if from_me { BASE + n * SECOND } else { 0 },
+                i64::from(photo),
+            ])?;
+            join.execute(rusqlite::params![chat_id, n, BASE + n * SECOND])?;
+            if photo {
+                attachments += 1;
+                attach.execute(rusqlite::params![
+                    attachments,
+                    format!("PERF-ATTACH-{attachments}"),
+                    format!("~/Library/Messages/Attachments/perf/photo-{attachments}.png"),
+                    format!("photo-{attachments}.png"),
+                ])?;
+                attach_join.execute(rusqlite::params![n, attachments])?;
+            }
+        }
+    }
+    tx.commit()?;
+    conn.execute_batch("ANALYZE;")?;
+    Ok(())
+}
+
 /// Create the schema and fill it with invented conversations.
 fn build(path: &Path) -> rusqlite::Result<()> {
     let conn = Connection::open(path)?;
@@ -674,4 +833,14 @@ CREATE TABLE message_attachment_join (
     attachment_id INTEGER REFERENCES attachment (ROWID) ON DELETE CASCADE,
     UNIQUE (message_id, attachment_id)
 );
+
+-- The indexes macOS keeps on its own store, under the names it uses. A query
+-- plan measured here is then the plan that runs against the real database.
+CREATE INDEX chat_message_join_idx_message_id ON chat_message_join (message_id);
+CREATE INDEX chat_message_join_idx_chat_id ON chat_message_join (chat_id, message_date);
+CREATE INDEX message_idx_date ON message (date);
+CREATE INDEX message_idx_handle_id ON message (handle_id);
+CREATE INDEX message_idx_associated_message ON message (associated_message_guid);
+CREATE INDEX message_attachment_join_idx_message_id ON message_attachment_join (message_id);
+CREATE INDEX chat_handle_join_idx_handle_id ON chat_handle_join (handle_id);
 ";

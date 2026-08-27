@@ -2,6 +2,13 @@
 name = "msgs"
 version = "0.1.0"
 edition = "2024"
+description = "A terminal client for iMessage on macOS"
+repository = "https://github.com/gautham-v/msgs"
+readme = "README.md"
+keywords = ["imessage", "macos", "tui", "ratatui", "terminal"]
+categories = ["command-line-utilities"]
+# `cargo install --path .` and the release workflow both build this binary.
+default-run = "msgs"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -23,3 +30,22 @@ unicode-width = "0.2.2"
 
 [dev-dependencies]
 image = { version = "0.25.8", default-features = false, features = ["jpeg", "png"] }
+
+# What `cargo install --path .` and the release workflow build. Whole-program
+# optimization across one codegen unit, because a frame is drawn from a dozen
+# small modules and the scroll arithmetic wants them inlined into each other;
+# the debug info goes because nothing ships a symbolicated backtrace. Panics
+# keep unwinding on purpose: the hook installed in `main` restores the terminal
+# on the way out, so a crash lands on a usable screen rather than inside the
+# alternate one.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"
+
+# The perf tests measure real work, so their dependencies are optimized even
+# when the test binary itself is a debug build: an unoptimized SQLite and an
+# unoptimized image decoder measure the compiler, not msgs.
+[profile.test.package."*"]
+opt-level = 2

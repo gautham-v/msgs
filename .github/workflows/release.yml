@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build (for a dry run; nothing is published)
+        required: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  universal:
+    name: Universal macOS binary
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain and both macOS targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-release-
+
+      # The release profile in Cargo.toml is what both halves are built with:
+      # lto, one codegen unit, stripped.
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Fuse them into one binary
+        id: package
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          name="msgs-${version}-macos-universal"
+          mkdir -p "dist/${name}"
+          lipo -create -output "dist/${name}/msgs" \
+            target/aarch64-apple-darwin/release/msgs \
+            target/x86_64-apple-darwin/release/msgs
+          lipo -info "dist/${name}/msgs"
+          chmod +x "dist/${name}/msgs"
+          cp README.md "dist/${name}/README.md"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          shasum -a 256 "dist/${name}.tar.gz" | tee "dist/${name}.tar.gz.sha256"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      # The binary has to run on the runner it was built on, which is the
+      # Apple silicon half of the fused file. `--check` is read-only and prints
+      # paths and counts only, so it is safe to run anywhere.
+      - name: Smoke-test the fused binary
+        run: |
+          "dist/${{ steps.package.outputs.name }}/msgs" --version
+          "dist/${{ steps.package.outputs.name }}/msgs" --check
+
+      - name: Upload the artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+      # Only a pushed tag publishes. A manual run builds and uploads the
+      # artifact above and stops there.
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "msgs ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            "dist/${{ steps.package.outputs.name }}.tar.gz" \
+            "dist/${{ steps.package.outputs.name }}.tar.gz.sha256"
+          echo "Paste the checksum above into packaging/msgs.rb before tapping it."

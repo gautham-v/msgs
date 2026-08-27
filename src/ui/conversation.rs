@@ -13,7 +13,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block as BlockWidget, Paragraph};
+use ratatui::widgets::{Block as BlockWidget, Clear, Paragraph};
 
 use std::collections::HashMap;
 
@@ -594,13 +594,18 @@ fn render_sticky_day(
         return;
     };
     let theme = &app.theme;
+    let rect = Rect { height: 1, ..area };
+    // The row underneath usually holds a message, and can hold the separator
+    // this label is standing in for; a paragraph only paints the cells its own
+    // text reaches, so the row is cleared before the label goes onto it.
+    frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw(" "),
             Span::styled(day_label(now, when), Style::new().fg(theme.text_secondary)),
         ]))
         .style(Style::new().bg(theme.bg_light)),
-        Rect { height: 1, ..area },
+        rect,
     );
 }
 

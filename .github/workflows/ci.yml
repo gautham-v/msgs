@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch replaces the run in flight.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # The README frame in docs/screenshot.txt has clocks in it, and a transcript
+  # is drawn in the local zone. Runners are UTC already; this says so.
+  TZ: UTC
+
+jobs:
+  check:
+    # msgs is macOS-only — it reads chat.db and shells out to osascript, sips,
+    # and pbcopy — so the only runner that can build and test it is macOS.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build
+
+      # The suite builds its own synthetic fixtures on first run, including the
+      # 200k-message database the perf budgets are measured against. Nothing
+      # here reads ~/Library/Messages/chat.db: the runner has no such file, and
+      # no test would open it if it did.
+      - name: Test
+        run: cargo test
+
+      # The budgets in tests/perf.rs are stated for an optimized build, which
+      # is what ships. A runner is slower and noisier than a laptop, so this is
+      # allowed to fail the same way a flaky benchmark is: it reports, and the
+      # release is not blocked on it.
+      - name: Perf budgets (release)
+        continue-on-error: true
+        run: cargo test --release --test perf -- --nocapture
+
+      - name: Readiness report runs without a database
+        run: cargo run -- --check

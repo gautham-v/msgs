@@ -20,13 +20,18 @@ Rust + ratatui terminal client for iMessage on macOS.
 - `src/contacts.rs` — names for handles: the macOS AddressBook stores read read-only, normalized phone/email keys, and the stamped cache at `~/Library/Application Support/msgs/contacts.json`; `Contacts::apply` hangs a `Name` on every `Handle`, which is how names reach every pane at once
 - `src/jump.rs` — what the `Ctrl+K` palette matches and shows: the filter, fuzzy chat/people matching (`nucleo-matcher`), and the result rows with their highlight ranges
 - `docs/mockups.html` — the design target; match it
+- `docs/screenshot.txt` — the frame the README embeds, written by `tests/screenshot.rs` from the synthetic fixture (`TZ=UTC UPDATE_SCREENSHOT=1 cargo test --test screenshot` regenerates it, and it also checks the block embedded in the README); never a frame of a real `chat.db`
+- `tests/perf.rs` — the budgets, against `fixtures::perf_database` (200k invented messages): cold start under 300ms, a keystroke-to-frame under 16.6ms, a page under 25ms, under 150MB resident. Stated for `--release`; a debug run gets `SLACK`× the number
+- `packaging/msgs.rb` — Homebrew formula stub; URL and sha256 are placeholders until a `v*` tag is pushed
+- `.github/workflows/` — `ci.yml` (fmt, clippy, build, test, `--check` on macOS) and `release.yml` (both targets, `lipo` into a universal binary, tarball plus checksum on a `v*` tag)
 
 ## Rules
 - Never write to `chat.db`. Open it read-only (`?mode=ro` / `OpenFlags::SQLITE_OPEN_READ_ONLY`), and copy to a temp file if a lock blocks reads.
 - Message content is private. Do not print message bodies, phone numbers, or names to logs, test output, or commit messages. Tests use a fixture DB under `tests/fixtures/`, never the real one — including `fixtures::address_book`, the synthetic Contacts store; never the real `~/Library/Application Support/AddressBook`.
 - A person is named in one place: `Contacts::apply` fills `Handle::name`, and every pane reads `Handle::display_name` / `Handle::short_name`. Do not resolve a name inside a widget.
 - Unread is counted in one place too: `Chat::unread_count` is the database's own answer and never moves, `Seen::apply` is the only thing that writes `Chat::unread`, and every badge, dot, and status-line total reads that. Messages.app's read flags and Dock badge cannot be cleared from here — say so rather than pretending otherwise.
-- `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` must pass before a commit.
+- `cargo build`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check` must pass before a commit.
+- The release profile is what ships and what the perf numbers are stated against: `lto`, one codegen unit, stripped, and panics still unwinding so the hook in `main` can put the terminal back.
 - Keep the UI calm: no feature creep beyond the mockups.
 - Nothing at startup is fatal. A failure becomes a warning on `Status::warnings`, which is toasted once and then listed under `NOTES` in the help modal; an unreadable `chat.db` becomes `App::db_error` and the full-screen `ui::db_error` surface, never an exit.
 - `Focus::DbError` is never assigned to `App::focus`. `App::key_focus` reports it while `db_error` is set and no overlay is up, which is how the first-run surface gets its own keys without disturbing the pane focus the app goes back to.
