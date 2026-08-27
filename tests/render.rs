@@ -4,12 +4,16 @@
 //! same three pieces the event loop drives — `keymap::resolve`, `App::update`,
 //! and `ui::draw` — and read the resulting cell buffer back.
 //!
-//! No message database is involved: at this stage the panes render their empty
-//! states, and nothing here touches `chat.db`.
+//! No message database is involved: the panes render their empty states, and
+//! nothing here touches `chat.db`. The two database tests below use a path that
+//! does not exist and a hand-built error value, never a real store.
+
+use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use msgs::app::{Action, App, Focus};
 use msgs::config::Config;
+use msgs::db::DbError;
 use msgs::{keymap, ui};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -210,4 +214,49 @@ fn theme_overrides_from_config_reach_the_rendered_cells() {
         ratatui::style::Color::Rgb(0xff, 0x00, 0x00),
         "the focused composer border should use the overridden color"
     );
+}
+
+#[test]
+fn an_unreadable_database_replaces_the_panes_with_an_explanation() {
+    let mut app = app();
+    app.open_db(PathBuf::from("/nonexistent/msgs/chat.db"));
+
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "no message database here"), "headline");
+    assert!(contains(&buffer, "--db <PATH>"), "what to do about it");
+    assert!(contains(&buffer, "q quit"), "the way out");
+    assert!(!contains(&buffer, "search chats"), "panes are gone");
+    assert_eq!(app.panes.chat_list, None);
+
+    // Help still opens over the explanation.
+    press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+    assert!(contains(&frame(&mut app, 120, 34), "Esc close"));
+}
+
+#[test]
+fn a_blocked_database_names_full_disk_access_and_the_settings_path() {
+    let mut app = app();
+    app.db_error = Some(DbError::PermissionDenied(PathBuf::from(
+        "/Users/someone/Library/Messages/chat.db",
+    )));
+
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "cannot read your messages"), "headline");
+    assert!(contains(&buffer, "Full Disk Access"), "what is missing");
+    assert!(
+        contains(&buffer, "Privacy & Security"),
+        "where to turn it on"
+    );
+}
+
+#[test]
+fn the_error_screen_survives_every_terminal_size() {
+    let mut app = app();
+    app.open_db(PathBuf::from("/nonexistent/msgs/chat.db"));
+    for width in [10u16, 40, 120, 240] {
+        for height in [1u16, 3, 8, 34] {
+            let buffer = frame(&mut app, width, height);
+            assert_eq!(buffer.area.width, width);
+        }
+    }
 }

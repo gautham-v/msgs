@@ -25,6 +25,7 @@ use ratatui::backend::CrosstermBackend;
 
 use msgs::app::App;
 use msgs::config::Config;
+use msgs::db::{Db, Source};
 use msgs::{config, default_db_path, keymap, ui};
 
 /// How long the loop waits for input before waking up to expire toasts.
@@ -60,10 +61,12 @@ fn main() -> Result<()> {
     }
 
     let mut app = App::new(config, warnings);
-    app.db_path = Some(cli.db.clone().unwrap_or_else(default_db_path));
     if cli.no_mouse {
         app.mouse_enabled = false;
     }
+    // Read-only, and never fatal: a failure becomes the full-screen surface
+    // that tells the reader how to grant Full Disk Access.
+    app.open_db(cli.db.clone().unwrap_or_else(default_db_path));
 
     install_panic_hook();
     let mut terminal = setup_terminal(app.mouse_enabled)?;
@@ -157,22 +160,41 @@ fn install_panic_hook() {
 fn check(cli: &Cli, warnings: &[String]) -> Result<()> {
     println!("msgs {}", env!("CARGO_PKG_VERSION"));
 
-    let db = cli.db.clone().unwrap_or_else(default_db_path);
-    let (db_state, hint) = match std::fs::File::open(&db) {
-        Ok(_) => ("readable", None),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => ("not found", None),
-        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => (
-            "permission denied",
-            Some(
-                "grant Full Disk Access to your terminal: \
-                 System Settings → Privacy & Security → Full Disk Access",
-            ),
-        ),
-        Err(_) => ("unreadable", None),
-    };
-    row("chat.db", &format!("{} — {db_state}", db.display()));
-    if let Some(hint) = hint {
-        row("", hint);
+    let path = cli.db.clone().unwrap_or_else(default_db_path);
+    match Db::open(&path) {
+        Ok(db) => {
+            let where_from = match db.source() {
+                Source::Live => "readable",
+                Source::Copy => "readable via a scratch copy (the live file is locked)",
+            };
+            row("chat.db", &format!("{} — {where_from}", path.display()));
+            // Row counts only. Nothing here reads a message body or a handle.
+            match db.counts() {
+                Ok(counts) => row(
+                    "rows",
+                    &format!(
+                        "{} chats · {} messages · {} handles · {} attachments",
+                        counts.chats, counts.messages, counts.handles, counts.attachments
+                    ),
+                ),
+                Err(err) => row("rows", &format!("unavailable — {}", err.summary())),
+            }
+            match db.unread_totals() {
+                Ok((total, chats)) => row("unread", &format!("{total} in {chats} chats")),
+                Err(err) => row("unread", &format!("unavailable — {}", err.summary())),
+            }
+        }
+        Err(err) => {
+            row(
+                "chat.db",
+                &format!("{} — {}", path.display(), err.summary()),
+            );
+            if let Some(hint) = err.hint() {
+                for line in hint.lines() {
+                    row("", line.trim());
+                }
+            }
+        }
     }
 
     let messages_app = [

@@ -1,3 +1,6 @@
 /target
 *.db-journal
 .DS_Store
+tests/fixtures/*.db
+tests/fixtures/*.db-wal
+tests/fixtures/*.db-shm

@@ -8,9 +8,12 @@
 pub mod chat_list;
 pub mod composer;
 pub mod conversation;
+pub mod db_error;
 pub mod help;
 pub mod palette;
 pub mod status;
+
+use std::path::Path;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -159,6 +162,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         area,
     );
 
+    // An unreadable database means there are no panes worth drawing; say what
+    // went wrong instead, and leave the layout empty so stray clicks hit
+    // nothing.
+    if app.db_error.is_some() {
+        app.panes = Panes::default();
+        let app: &App = app;
+        if let Some(err) = app.db_error.as_ref() {
+            db_error::render(frame, app, area, err);
+        }
+        // Overlays still open over it, so `?` and `Ctrl+K` are not dead keys
+        // that leave focus somewhere invisible.
+        match app.focus {
+            Focus::Palette => palette::render(frame, app, area),
+            Focus::Help => help::render(frame, app, area),
+            _ => {}
+        }
+        return;
+    }
+
     if let (Some(list), Some(rows)) = (panes.chat_list, panes.chat_list_rows) {
         chat_list::render(frame, app, list, rows);
     }
@@ -180,6 +202,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Focus::Palette => palette::render(frame, app, area),
         Focus::Help => help::render(frame, app, area),
         _ => {}
+    }
+}
+
+/// A path with the home directory written as `~`, for showing on screen.
+#[must_use]
+pub fn home_relative(path: &Path) -> String {
+    let shown = path.display().to_string();
+    let Some(home) = dirs::home_dir() else {
+        return shown;
+    };
+    let home = home.display().to_string();
+    if home.is_empty() {
+        return shown;
+    }
+    match shown.strip_prefix(&home) {
+        Some(rest) => format!("~{rest}"),
+        None => shown,
     }
 }
 

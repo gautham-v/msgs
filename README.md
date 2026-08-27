@@ -13,7 +13,7 @@ Early. See the GitHub issues for the build plan.
 ## Requirements
 
 - macOS 14+
-- Full Disk Access for your terminal (System Settings → Privacy & Security → Full Disk Access) so `chat.db` can be read
+- Full Disk Access for your terminal (System Settings → Privacy & Security → Full Disk Access) so `chat.db` can be read — without it msgs starts and explains what to do instead of failing
 - Messages.app signed in (it is launched hidden in the background when you send; reading never needs it open)
 - Optional: [`imsg`](https://github.com/openclaw/imsg) on `$PATH` for sending tapback reactions
 
@@ -30,7 +30,7 @@ Flags:
 | `--db <PATH>` | read this database instead of `~/Library/Messages/chat.db` |
 | `--config <PATH>` | read this config file instead of the default |
 | `--no-mouse` | do not capture the mouse |
-| `--check` | print a readiness report (database, Full Disk Access, Messages.app, `imsg`) and exit |
+| `--check` | print a readiness report (database, row counts, Messages.app, `imsg`) and exit |
 | `--version` | print the version |
 
 ## Keys
@@ -53,6 +53,17 @@ Flags:
 | `Esc` | close an overlay / leave the composer |
 | `?` | help |
 | `q` / `Ctrl+C` | quit |
+
+## Reading
+
+`chat.db` is only ever opened read-only: `SQLITE_OPEN_READ_ONLY`, a `?mode=ro`
+URI, and `PRAGMA query_only`. Nothing in msgs can write to it. macOS keeps the
+database in WAL mode, so if a read is refused because Messages.app holds the
+file, msgs copies `chat.db` and its `-wal` / `-shm` sidecars to a scratch
+directory, reads the copy, and deletes the copy on exit.
+
+Conversations load a page at a time from the newest end, so opening a thread
+with 25,000 messages in it costs the same as opening a short one.
 
 ## Config
 

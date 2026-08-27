@@ -11,6 +11,7 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
 use crate::config::Config;
+use crate::db::{Chat, Db, DbError, Message, PAGE};
 use crate::theme::Theme;
 use crate::ui::Panes;
 
@@ -432,6 +433,15 @@ pub struct App {
     pub mouse_enabled: bool,
     /// Path of the database being read, once one is chosen.
     pub db_path: Option<PathBuf>,
+    /// The open, read-only database, once one has been opened.
+    pub db: Option<Db>,
+    /// Why the database could not be opened. While this is set the UI shows a
+    /// full-screen explanation instead of the panes.
+    pub db_error: Option<DbError>,
+    /// The chat list as read from the database, newest first.
+    pub chat_rows: Vec<Chat>,
+    /// The open conversation's loaded page of messages, oldest first.
+    pub message_rows: Vec<Message>,
     /// Set to leave the event loop.
     pub should_quit: bool,
     /// Selection state of the chat list.
@@ -476,6 +486,10 @@ impl App {
             show_chat_list,
             mouse_enabled,
             db_path: None,
+            db: None,
+            db_error: None,
+            chat_rows: Vec::new(),
+            message_rows: Vec::new(),
             should_quit: false,
             chats: ListPane::default(),
             chat_filter: None,
@@ -486,6 +500,95 @@ impl App {
             status,
             panes: Panes::default(),
             hover: None,
+        }
+    }
+
+    /// Open `path` read-only and load the chat list from it.
+    ///
+    /// Failure is not fatal: the error is kept on [`App::db_error`] and the UI
+    /// renders it full-screen instead of the panes, so a terminal without Full
+    /// Disk Access gets an explanation rather than an empty app.
+    pub fn open_db(&mut self, path: PathBuf) {
+        self.db_path = Some(path.clone());
+        match Db::open(&path) {
+            Ok(db) => {
+                self.status.db = DbStatus::Ready;
+                self.db_error = None;
+                self.db = Some(db);
+                self.reload_chats();
+            }
+            Err(err) => {
+                self.status.db = DbStatus::Unreadable(err.summary());
+                self.db = None;
+                self.db_error = Some(err);
+                self.chat_rows.clear();
+                self.message_rows.clear();
+            }
+        }
+    }
+
+    /// Re-read the chat list and the unread totals on the status line.
+    pub fn reload_chats(&mut self) {
+        let Some(db) = self.db.as_ref() else {
+            return;
+        };
+        match db.chats() {
+            Ok(chats) => {
+                self.status.unread_total = chats
+                    .iter()
+                    .map(|chat| usize::try_from(chat.unread_count).unwrap_or(0))
+                    .sum();
+                self.status.unread_chats = chats.iter().filter(|chat| chat.is_unread()).count();
+                self.chat_rows = chats;
+            }
+            Err(err) => {
+                self.status.error(format!("chat list: {}", err.summary()));
+            }
+        }
+    }
+
+    /// The chat under the chat-list selection.
+    #[must_use]
+    pub fn selected_chat(&self) -> Option<&Chat> {
+        self.chat_rows.get(self.chats.selected)
+    }
+
+    /// Load the newest page of `chat_rowid` into [`App::message_rows`].
+    pub fn load_conversation(&mut self, chat_rowid: i64) {
+        let Some(db) = self.db.as_ref() else {
+            return;
+        };
+        match db.messages_before(chat_rowid, None, PAGE) {
+            Ok(messages) => self.message_rows = messages,
+            Err(err) => {
+                self.message_rows.clear();
+                self.status.error(format!("messages: {}", err.summary()));
+            }
+        }
+    }
+
+    /// Prepend the page of messages above the ones already loaded.
+    ///
+    /// Returns how many rows were added, so the caller can stop asking once the
+    /// top of the conversation is reached.
+    pub fn load_older_messages(&mut self) -> usize {
+        let Some(db) = self.db.as_ref() else {
+            return 0;
+        };
+        let Some(oldest) = self.message_rows.first() else {
+            return 0;
+        };
+        let (chat_rowid, before) = (oldest.chat_rowid, oldest.rowid);
+        match db.messages_before(chat_rowid, Some(before), PAGE) {
+            Ok(older) => {
+                let added = older.len();
+                self.message_rows.splice(0..0, older);
+                added
+            }
+            Err(err) => {
+                self.status.error(format!("messages: {}", err.summary()));
+                0
+            }
         }
     }
 

@@ -7,6 +7,7 @@
 //!
 //! - [`app`] — state, actions, and the single `update` entry point
 //! - [`config`] — the optional `~/.config/msgs/config.toml`
+//! - [`db`] — read-only queries against `chat.db`
 //! - [`keymap`] — keys to actions, and the table the help modal renders
 //! - [`theme`] — named color slots
 //! - [`ui`] — layout and drawing
@@ -16,6 +17,7 @@
 
 pub mod app;
 pub mod config;
+pub mod db;
 pub mod keymap;
 pub mod theme;
 pub mod ui;
