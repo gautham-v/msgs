@@ -1,0 +1,740 @@
+//! Pictures in the transcript, and the files behind the chips.
+//!
+//! Three separate jobs live here, kept apart on purpose:
+//!
+//! - [`fit`] is pure arithmetic: how many cells a picture of a given pixel size
+//!   is allowed to cover. [`super::ui::message::block`] calls it through
+//!   [`Images::cells`] to reserve rows, so a block's height is decided by the
+//!   same number the drawing uses and the two can never disagree.
+//! - [`Images`] is the cache: what a picture measures, and — once it has been
+//!   on screen — the encoded protocol data for it. Terminals that speak the
+//!   kitty graphics protocol get real pixels; everything else falls back to
+//!   unicode half-blocks, which every terminal can draw.
+//! - [`convert`] and [`save_to_downloads`] are the two file-system errands:
+//!   HEIC through `sips` into a cached JPEG, and `s` copying an attachment out
+//!   to `~/Downloads`.
+//!
+//! Nothing here logs a filename or reads a message body. The bytes go from
+//! `~/Library/Messages/Attachments` to the screen and nowhere else, and the one
+//! copy msgs ever makes is the one the reader asked for by pressing `s`.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Sender, channel};
+
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Rect, Size};
+use ratatui::widgets::Widget;
+use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
+use ratatui_image::{FontSize, Resize};
+
+use crate::db::AttachmentRef;
+
+/// The tallest an inline picture is ever drawn, in rows.
+pub const MAX_ROWS: u16 = 10;
+/// The widest an inline picture is ever drawn, in columns. Wide terminals would
+/// otherwise blow a photo up to the whole pane.
+pub const MAX_COLS: u16 = 48;
+/// What a block says when the bytes never made it to this Mac.
+pub const NOT_DOWNLOADED: &str = "(not downloaded on this Mac)";
+
+/// Pictures bigger than this are left as a chip rather than decoded. A photo
+/// out of a phone is a few megabytes; a hundred-megabyte file is something
+/// else, and decoding it would stall the frame.
+const MAX_DECODE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How many encoded pictures are kept at once. Measured sizes are kept forever
+/// — they are two numbers each, and dropping one would change a block's height
+/// under the reader — but the encoded pixels behind them are evicted oldest
+/// first, so a long scroll through a photo thread does not grow without bound.
+const MAX_ENCODED: usize = 32;
+
+/// How the terminal is drawing pictures, for `--check` and the status line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// Inline images are switched off.
+    Off,
+    /// The kitty graphics protocol: real pixels.
+    Kitty,
+    /// iTerm2's inline-image escape.
+    Iterm2,
+    /// Sixels.
+    Sixel,
+    /// Unicode half-blocks, which any terminal can draw.
+    Halfblocks,
+}
+
+impl Backend {
+    /// The word `--check` prints.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Kitty => "kitty graphics protocol",
+            Self::Iterm2 => "iTerm2 inline images",
+            Self::Sixel => "sixels",
+            Self::Halfblocks => "unicode half-blocks",
+        }
+    }
+
+    /// Whether pictures are drawn at all.
+    #[must_use]
+    pub const fn is_on(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+/// Whether a file is one `sips` has to turn into a JPEG first.
+///
+/// The `image` crate cannot read HEIC, which is what an iPhone camera sends.
+#[must_use]
+pub fn needs_conversion(attachment: &AttachmentRef) -> bool {
+    let heic = |text: &str| {
+        let lower = text.to_ascii_lowercase();
+        lower.contains("heic") || lower.contains("heif")
+    };
+    attachment.mime_type.as_deref().is_some_and(heic)
+        || attachment.uti.as_deref().is_some_and(heic)
+        || attachment.filename.as_deref().is_some_and(heic)
+}
+
+/// Where converted pictures are kept: `~/Library/Caches/msgs/attachments`.
+///
+/// `None` when there is no home directory to put it under.
+#[must_use]
+pub fn cache_dir() -> Option<PathBuf> {
+    Some(dirs::cache_dir()?.join("msgs").join("attachments"))
+}
+
+/// The cached JPEG a HEIC attachment converts to.
+///
+/// Named after the attachment's `guid`, which is what `chat.db` guarantees to
+/// be unique and stable, so a second session reuses the first one's work.
+#[must_use]
+pub fn converted_path(attachment: &AttachmentRef) -> Option<PathBuf> {
+    let stem: String = attachment
+        .guid
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    if stem.is_empty() {
+        return None;
+    }
+    Some(cache_dir()?.join(format!("{stem}.jpg")))
+}
+
+/// Turn `source` into a JPEG at `target` with `sips`, the converter macOS ships.
+///
+/// Does nothing when the target is already there, so this is cheap to call
+/// again. Returns whether a readable JPEG now exists.
+pub fn convert(source: &Path, target: &Path) -> bool {
+    if target.is_file() {
+        return true;
+    }
+    let Some(dir) = target.parent() else {
+        return false;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    private(dir, 0o700);
+    let ran = Command::new("sips")
+        .arg("-s")
+        .arg("format")
+        .arg("jpeg")
+        .arg(source)
+        .arg("--out")
+        .arg(target)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match ran {
+        Ok(status) if status.success() => {
+            private(target, 0o600);
+            target.is_file()
+        }
+        _ => false,
+    }
+}
+
+/// Copy an attachment into `~/Downloads`, without overwriting anything.
+///
+/// A name already taken gets ` (2)`, ` (3)`, and so on before the extension,
+/// the way a browser download does.
+///
+/// # Errors
+///
+/// Returns the underlying [`std::io::Error`] when the directory cannot be made
+/// or the copy fails, and a `NotFound` error when there is no home directory.
+pub fn save_to_downloads(source: &Path) -> std::io::Result<PathBuf> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory"))?;
+    let dir = dirs::download_dir().unwrap_or_else(|| home.join("Downloads"));
+    std::fs::create_dir_all(&dir)?;
+    let name = source
+        .file_name()
+        .map_or_else(|| "attachment".to_string(), |n| n.to_string_lossy().into());
+    let target = free_name(&dir, &name);
+    std::fs::copy(source, &target)?;
+    Ok(target)
+}
+
+/// The first name in `dir` that nothing is using yet.
+fn free_name(dir: &Path, name: &str) -> PathBuf {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => (stem, format!(".{extension}")),
+        _ => (name, String::new()),
+    };
+    for n in 2..1000 {
+        let candidate = dir.join(format!("{stem} ({n}){extension}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(name)
+}
+
+#[cfg(unix)]
+fn private(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn private(_path: &Path, _mode: u32) {}
+
+/// How many cells a picture of `pixels` covers at `font`, never more than
+/// `max_cols` × `max_rows`, and never stretched.
+///
+/// This mirrors what `ratatui-image` does when it fits an image into an area,
+/// so the rows a block reserves are the rows the picture actually fills.
+/// `None` for a degenerate size, which is how a corrupt header comes back.
+#[must_use]
+pub fn fit(pixels: (u32, u32), font: FontSize, max_cols: u16, max_rows: u16) -> Option<(u16, u16)> {
+    let (width, height) = pixels;
+    if width == 0 || height == 0 || max_cols == 0 || max_rows == 0 {
+        return None;
+    }
+    let cell_width = u32::from(font.width.max(1));
+    let cell_height = u32::from(font.height.max(1));
+    let cells = |w: u32, h: u32| {
+        (
+            u16::try_from(w.div_ceil(cell_width))
+                .unwrap_or(u16::MAX)
+                .max(1),
+            u16::try_from(h.div_ceil(cell_height))
+                .unwrap_or(u16::MAX)
+                .max(1),
+        )
+    };
+
+    let natural = cells(width, height);
+    if natural.0 <= max_cols && natural.1 <= max_rows {
+        return Some(natural);
+    }
+    let room_width = (u32::from(max_cols) * cell_width).min(width);
+    let room_height = (u32::from(max_rows) * cell_height).min(height);
+    let ratio = f64::min(
+        f64::from(room_width) / f64::from(width),
+        f64::from(room_height) / f64::from(height),
+    );
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let scaled = (
+        ((f64::from(width) * ratio).round() as u32).max(1),
+        ((f64::from(height) * ratio).round() as u32).max(1),
+    );
+    let fitted = cells(scaled.0, scaled.1);
+    Some((fitted.0.min(max_cols), fitted.1.min(max_rows)))
+}
+
+/// What the cache knows about one attachment.
+enum Entry {
+    /// The size is known; the protocol data has not been built yet.
+    Sized(Size),
+    /// Ready to draw.
+    Ready(Size, Box<SlicedProtocol>),
+    /// Not a picture msgs can draw. It stays a chip.
+    Unusable,
+}
+
+impl Entry {
+    const fn size(&self) -> Option<Size> {
+        match self {
+            Self::Sized(size) | Self::Ready(size, _) => Some(*size),
+            Self::Unusable => None,
+        }
+    }
+}
+
+/// The key an entry is filed under: the attachment, and the pane width it was
+/// measured for. A resized terminal re-measures rather than drawing a stale
+/// picture at the wrong size.
+type Key = (i64, u16);
+
+/// Pictures, measured once and encoded once.
+///
+/// Held by the app and consulted from two places that must agree: the layout,
+/// which asks [`Images::cells`] how many rows to leave, and the drawing, which
+/// asks [`Images::render`] to put the picture in them. Both take `&self` —
+/// the cache is behind a [`RefCell`] — because drawing a frame only ever has a
+/// shared borrow of the app.
+pub struct Images {
+    backend: Backend,
+    picker: Option<Picker>,
+    entries: RefCell<HashMap<Key, Entry>>,
+    /// HEIC conversions handed to the worker, so none is queued twice.
+    queued: RefCell<Vec<i64>>,
+    /// Encoded pictures in the order they were encoded, for eviction.
+    encoded: RefCell<Vec<Key>>,
+    jobs: Option<Sender<(PathBuf, PathBuf)>>,
+    /// Set by the worker when a conversion lands, so the app knows to measure
+    /// the page again and let the picture in.
+    arrived: Arc<AtomicBool>,
+}
+
+impl Default for Images {
+    fn default() -> Self {
+        Self::off()
+    }
+}
+
+impl std::fmt::Debug for Images {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Images")
+            .field("backend", &self.backend)
+            .field("cached", &self.entries.borrow().len())
+            .finish()
+    }
+}
+
+impl Images {
+    /// A cache that draws nothing, which is what the tests and `--no-images`
+    /// use.
+    #[must_use]
+    pub fn off() -> Self {
+        Self {
+            backend: Backend::Off,
+            picker: None,
+            entries: RefCell::new(HashMap::new()),
+            queued: RefCell::new(Vec::new()),
+            encoded: RefCell::new(Vec::new()),
+            jobs: None,
+            arrived: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Ask the terminal what it can draw, and take the best of it.
+    ///
+    /// This writes a query to stdout and reads the reply, so it must run after
+    /// the alternate screen is entered and before any key is read. Terminals
+    /// that answer nothing fall back to half-blocks.
+    #[must_use]
+    pub fn detect() -> Self {
+        let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+        Self::with_picker(picker)
+    }
+
+    /// A cache that draws with unicode half-blocks, which ask nothing of the
+    /// terminal. This is what the tests use, and what any terminal without a
+    /// graphics protocol falls back to.
+    #[must_use]
+    pub fn halfblocks() -> Self {
+        Self::with_picker(Picker::halfblocks())
+    }
+
+    /// Build a cache around an already-made picker, which is what the tests do.
+    #[must_use]
+    pub fn with_picker(picker: Picker) -> Self {
+        let backend = match picker.protocol_type() {
+            ProtocolType::Kitty => Backend::Kitty,
+            ProtocolType::Iterm2 => Backend::Iterm2,
+            ProtocolType::Sixel => Backend::Sixel,
+            ProtocolType::Halfblocks => Backend::Halfblocks,
+        };
+        let arrived = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = channel::<(PathBuf, PathBuf)>();
+        let flag = Arc::clone(&arrived);
+        // `sips` is a process launch per picture. It happens off the UI thread
+        // so a thread full of photos never stalls a keystroke; the flag is how
+        // the finished work gets back onto the screen.
+        let spawned = std::thread::Builder::new()
+            .name("msgs-convert".to_string())
+            .spawn(move || {
+                while let Ok((source, target)) = receiver.recv() {
+                    if convert(&source, &target) {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                }
+            })
+            .is_ok();
+
+        Self {
+            backend,
+            picker: Some(picker),
+            entries: RefCell::new(HashMap::new()),
+            queued: RefCell::new(Vec::new()),
+            encoded: RefCell::new(Vec::new()),
+            jobs: spawned.then_some(sender),
+            arrived,
+        }
+    }
+
+    /// How pictures are being drawn.
+    #[must_use]
+    pub const fn backend(&self) -> Backend {
+        self.backend
+    }
+
+    /// Whether a conversion finished since this was last asked, which is the
+    /// signal to measure the page again.
+    pub fn take_arrived(&self) -> bool {
+        self.arrived.swap(false, Ordering::SeqCst)
+    }
+
+    /// How many cells `attachment` gets, at a body `room` columns wide.
+    ///
+    /// `None` means it is not drawn inline and stays a chip: not a picture, not
+    /// downloaded, a format nothing here can read, or a HEIC whose conversion
+    /// has not finished yet.
+    #[must_use]
+    pub fn cells(&self, attachment: &AttachmentRef, room: u16) -> Option<(u16, u16)> {
+        if !self.backend.is_on() || !attachment.is_image() || attachment.hide_attachment {
+            return None;
+        }
+        let key = (attachment.rowid, room);
+        if let Some(entry) = self.entries.borrow().get(&key) {
+            return entry.size().map(|size| (size.width, size.height));
+        }
+        let entry = self.measure(attachment, room);
+        let size = entry.size();
+        self.entries.borrow_mut().insert(key, entry);
+        size.map(|size| (size.width, size.height))
+    }
+
+    /// Work out an attachment's size, converting or queueing a conversion first
+    /// where one is needed.
+    fn measure(&self, attachment: &AttachmentRef, room: u16) -> Entry {
+        let Some(picker) = self.picker.as_ref() else {
+            return Entry::Unusable;
+        };
+        let Some(source) = attachment.path().filter(|path| path.is_file()) else {
+            return Entry::Unusable;
+        };
+        if std::fs::metadata(&source).is_ok_and(|meta| meta.len() > MAX_DECODE_BYTES) {
+            return Entry::Unusable;
+        }
+        let readable = if needs_conversion(attachment) {
+            let Some(target) = converted_path(attachment) else {
+                return Entry::Unusable;
+            };
+            if !target.is_file() {
+                self.queue(attachment.rowid, source, target);
+                // Not a failure: the chip stands in until the JPEG lands.
+                return Entry::Unusable;
+            }
+            target
+        } else {
+            source
+        };
+        let Ok(dimensions) = image::ImageReader::open(&readable)
+            .map_err(image::ImageError::IoError)
+            .and_then(image::ImageReader::into_dimensions)
+        else {
+            return Entry::Unusable;
+        };
+        let columns = room.min(MAX_COLS);
+        match fit(dimensions, picker.font_size(), columns, MAX_ROWS) {
+            Some((width, height)) => Entry::Sized(Size::new(width, height)),
+            None => Entry::Unusable,
+        }
+    }
+
+    /// Hand one HEIC to the converter thread, at most once per attachment.
+    fn queue(&self, rowid: i64, source: PathBuf, target: PathBuf) {
+        let Some(jobs) = self.jobs.as_ref() else {
+            return;
+        };
+        let mut queued = self.queued.borrow_mut();
+        if queued.contains(&rowid) {
+            return;
+        }
+        if jobs.send((source, target)).is_ok() {
+            queued.push(rowid);
+        }
+    }
+
+    /// Forget every attachment that came back undrawable, so the next measure
+    /// looks again.
+    ///
+    /// Called when the converter reports something landed. The list of what has
+    /// already been handed to the converter is deliberately kept, so a
+    /// conversion that failed is not asked for over and over.
+    pub fn reconsider(&self) {
+        self.entries
+            .borrow_mut()
+            .retain(|_, entry| !matches!(entry, Entry::Unusable));
+    }
+
+    /// How many pictures are currently encoded, for the eviction test.
+    #[cfg(test)]
+    fn encoded_count(&self) -> usize {
+        self.entries
+            .borrow()
+            .values()
+            .filter(|entry| matches!(entry, Entry::Ready(..)))
+            .count()
+    }
+
+    /// Draw `attachment` into `area`, with its top edge `offset` rows below the
+    /// top of `area` — negative when it has scrolled off the top.
+    ///
+    /// `room` is the body width [`Images::cells`] was asked with, which is what
+    /// the picture is filed under; passing a different one would draw nothing.
+    ///
+    /// Encoding happens here, the first time a picture is actually on screen,
+    /// so opening a thread full of photos only costs the ones being looked at.
+    pub fn render(
+        &self,
+        buffer: &mut Buffer,
+        area: Rect,
+        offset: i16,
+        attachment: &AttachmentRef,
+        room: u16,
+    ) {
+        let key = (attachment.rowid, room);
+        self.encode(attachment, key);
+        let entries = self.entries.borrow();
+        let Some(Entry::Ready(_, protocol)) = entries.get(&key) else {
+            return;
+        };
+        SlicedImage::new(protocol, SignedPosition::from((0, offset))).render(area, buffer);
+    }
+
+    /// Turn a measured picture into protocol data, once.
+    fn encode(&self, attachment: &AttachmentRef, key: Key) {
+        let size = match self.entries.borrow().get(&key) {
+            Some(Entry::Sized(size)) => *size,
+            _ => return,
+        };
+        let Some(picker) = self.picker.as_ref() else {
+            return;
+        };
+        let source = if needs_conversion(attachment) {
+            converted_path(attachment).filter(|path| path.is_file())
+        } else {
+            attachment.path().filter(|path| path.is_file())
+        };
+        let decoded = source
+            .and_then(|path| image::ImageReader::open(path).ok())
+            .and_then(|reader| reader.with_guessed_format().ok())
+            .and_then(|reader| reader.decode().ok());
+        let entry = decoded
+            .and_then(|image| {
+                SlicedProtocol::new_with_resize(picker, image, size, Resize::Fit(None)).ok()
+            })
+            .map_or(Entry::Unusable, |protocol| {
+                Entry::Ready(protocol.size(), Box::new(protocol))
+            });
+        let ready = matches!(entry, Entry::Ready(..));
+        self.entries.borrow_mut().insert(key, entry);
+        if ready {
+            self.encoded.borrow_mut().push(key);
+            self.evict();
+        }
+    }
+
+    /// Drop the oldest encoded pictures back to their measured size, so the
+    /// rows they occupy stay the same and only the pixels go.
+    fn evict(&self) {
+        let mut encoded = self.encoded.borrow_mut();
+        let mut entries = self.entries.borrow_mut();
+        while encoded.len() > MAX_ENCODED {
+            let oldest = encoded.remove(0);
+            if let Some(Entry::Ready(size, _)) = entries.get(&oldest) {
+                let size = *size;
+                entries.insert(oldest, Entry::Sized(size));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attachment(mime: &str, name: &str) -> AttachmentRef {
+        AttachmentRef {
+            rowid: 1,
+            guid: "A-1".to_string(),
+            message_rowid: 1,
+            filename: Some(format!("~/Library/Messages/Attachments/x/{name}")),
+            mime_type: Some(mime.to_string()),
+            uti: None,
+            transfer_name: Some(name.to_string()),
+            total_bytes: 1024,
+            transfer_state: 5,
+            is_sticker: false,
+            hide_attachment: false,
+        }
+    }
+
+    const FONT: FontSize = FontSize::new(10, 20);
+
+    #[test]
+    fn a_small_picture_keeps_its_natural_size() {
+        assert_eq!(fit((100, 200), FONT, 40, MAX_ROWS), Some((10, 10)));
+        assert_eq!(fit((45, 21), FONT, 40, MAX_ROWS), Some((5, 2)));
+    }
+
+    #[test]
+    fn a_tall_picture_is_capped_at_ten_rows_and_keeps_its_aspect() {
+        let (columns, rows) = fit((3024, 4032), FONT, 48, MAX_ROWS).expect("a size");
+        assert_eq!(rows, MAX_ROWS);
+        // Ten rows is 200 pixels tall, and 3:4 makes that 150 pixels wide,
+        // which is fifteen ten-pixel columns.
+        assert_eq!(columns, 15);
+    }
+
+    #[test]
+    fn a_wide_picture_is_capped_by_the_pane() {
+        let (columns, rows) = fit((4000, 1000), FONT, 20, MAX_ROWS).expect("a size");
+        assert_eq!(columns, 20);
+        assert!((1..=MAX_ROWS).contains(&rows), "{rows} rows");
+    }
+
+    #[test]
+    fn a_degenerate_size_is_not_drawn() {
+        assert_eq!(fit((0, 100), FONT, 40, 10), None);
+        assert_eq!(fit((100, 0), FONT, 40, 10), None);
+        assert_eq!(fit((100, 100), FONT, 0, 10), None);
+    }
+
+    #[test]
+    fn only_heic_goes_through_sips() {
+        assert!(needs_conversion(&attachment("image/heic", "IMG.HEIC")));
+        assert!(needs_conversion(&attachment("image/heif", "IMG.heif")));
+        assert!(!needs_conversion(&attachment("image/jpeg", "IMG.jpg")));
+        assert!(!needs_conversion(&attachment("image/png", "shot.png")));
+    }
+
+    #[test]
+    fn a_converted_picture_is_named_after_its_guid() {
+        let mut source = attachment("image/heic", "IMG.HEIC");
+        source.guid = "AB/CD-12".to_string();
+        let path = converted_path(&source).expect("a cache path");
+        assert!(path.ends_with("AB-CD-12.jpg"));
+        assert!(path.to_string_lossy().contains("msgs"));
+    }
+
+    #[test]
+    fn a_cache_that_is_off_draws_nothing() {
+        let images = Images::off();
+        assert_eq!(images.backend(), Backend::Off);
+        assert!(!images.backend().is_on());
+        assert_eq!(images.cells(&attachment("image/png", "shot.png"), 40), None);
+    }
+
+    #[test]
+    fn a_missing_file_stays_a_chip() {
+        let images = Images::halfblocks();
+        assert!(images.backend().is_on());
+        // The fixture path does not exist, so there is nothing to draw.
+        assert_eq!(images.cells(&attachment("image/png", "shot.png"), 40), None);
+        // A file that is not a picture is never even looked at.
+        assert_eq!(
+            images.cells(&attachment("application/pdf", "a.pdf"), 40),
+            None
+        );
+    }
+
+    /// A real PNG on disk, so the decode path is exercised rather than mocked.
+    /// Nothing here touches `chat.db` or the real attachment store.
+    fn png(tag: &str, width: u32, height: u32) -> (PathBuf, AttachmentRef) {
+        let dir = std::env::temp_dir().join(format!("msgs-media-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp directory");
+        let path = dir.join("shot.png");
+        let buffer =
+            image::ImageBuffer::from_pixel(width, height, image::Rgba::<u8>([90, 140, 190, 255]));
+        image::DynamicImage::from(buffer)
+            .save(&path)
+            .expect("a written png");
+        let mut attachment = attachment("image/png", "shot.png");
+        attachment.filename = Some(path.display().to_string());
+        (dir, attachment)
+    }
+
+    #[test]
+    fn a_picture_on_disk_is_measured_once_and_then_drawn() {
+        let (dir, attachment) = png("draw", 100, 100);
+        let images = Images::halfblocks();
+        // The half-blocks picker uses ten-by-twenty cells, so a hundred-pixel
+        // square is ten columns and five rows.
+        assert_eq!(images.cells(&attachment, 40), Some((10, 5)));
+        // A second ask is the cache, not another decode.
+        assert_eq!(images.cells(&attachment, 40), Some((10, 5)));
+
+        let blank = Buffer::empty(Rect::new(0, 0, 40, 8));
+        let mut buffer = blank.clone();
+        images.render(&mut buffer, Rect::new(0, 0, 40, 8), 0, &attachment, 40);
+        assert_ne!(buffer, blank, "the picture reached the buffer");
+        // Only the ten-by-five block it was measured at, and nothing below it.
+        for y in 5..8 {
+            for x in 0..40 {
+                assert_eq!(buffer[(x, y)], blank[(x, y)], "row {y} is not the picture");
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_picture_wider_than_the_pane_is_brought_down_to_it() {
+        let (dir, attachment) = png("wide", 400, 100);
+        let images = Images::halfblocks();
+        let (columns, rows) = images.cells(&attachment, 12).expect("a size");
+        assert!(columns <= 12, "{columns} columns");
+        assert!(rows <= MAX_ROWS, "{rows} rows");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_so_many_pictures_stay_encoded_and_the_rest_keep_their_size() {
+        let (dir, attachment) = png("evict", 60, 40);
+        let images = Images::halfblocks();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 4));
+        // Every width is its own cache entry, which is the cheapest way to
+        // make more encoded pictures than the cap allows.
+        for room in 20..20 + u16::try_from(MAX_ENCODED).unwrap_or(0) + 8 {
+            assert!(images.cells(&attachment, room).is_some());
+            images.render(&mut buffer, Rect::new(0, 0, 20, 4), 0, &attachment, room);
+        }
+        assert_eq!(images.encoded_count(), MAX_ENCODED);
+        // The sizes survive eviction, so no block changes height.
+        for room in 20..20 + u16::try_from(MAX_ENCODED).unwrap_or(0) + 8 {
+            assert!(images.cells(&attachment, room).is_some());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_free_name_steps_around_what_is_already_there() {
+        let dir = std::env::temp_dir().join(format!("msgs-free-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp directory");
+        assert_eq!(free_name(&dir, "a.png"), dir.join("a.png"));
+        std::fs::write(dir.join("a.png"), b"x").expect("a file");
+        assert_eq!(free_name(&dir, "a.png"), dir.join("a (2).png"));
+        std::fs::write(dir.join("a (2).png"), b"x").expect("a file");
+        assert_eq!(free_name(&dir, "a.png"), dir.join("a (3).png"));
+        assert_eq!(free_name(&dir, "noext"), dir.join("noext"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -29,6 +29,9 @@ pub struct Config {
     pub page_step: u16,
     /// Capture the mouse. `--no-mouse` overrides this to `false`.
     pub mouse: bool,
+    /// Draw pictures inline where the terminal can. `--no-images` overrides
+    /// this to `false`.
+    pub images: bool,
     /// Per-slot color overrides, e.g. `accent_me = "#ff8800"`.
     #[serde(default)]
     pub theme: BTreeMap<String, String>,
@@ -41,6 +44,7 @@ impl Default for Config {
             chat_list_width: DEFAULT_CHAT_LIST_WIDTH,
             page_step: DEFAULT_PAGE_STEP,
             mouse: true,
+            images: true,
             theme: BTreeMap::new(),
         }
     }

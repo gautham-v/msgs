@@ -11,7 +11,8 @@ Rust + ratatui terminal client for iMessage on macOS.
 - `src/keymap.rs` — focus-sensitive key → `Action`; `BINDINGS` also feeds the help modal and shortcuts bar
 - `src/db/` — read-only access to `chat.db` (rusqlite + `imessage-database` for typedstream parsing)
 - `src/ui/` — ratatui widgets: chat list, conversation, composer, palette, help; `ui::compute`, `chat_list::Shape`, `conversation::Scroll`, and `ui::message::block` are pure layout functions with tests, and `ui::format` holds the string helpers (relative times, previews, wrapping, truncation)
-- `src/shell.rs` — the clipboard (`pbcopy`, then OSC 52) and the browser (`open`); the only two things msgs asks the rest of the machine to do
+- `src/media.rs` — attachments as pictures: `fit` (pure cell arithmetic), `Images` (the measure/encode cache, `ratatui-image` under it), HEIC through `sips` into `~/Library/Caches/msgs/attachments`, and `s` copying a file to `~/Downloads`
+- `src/shell.rs` — the clipboard (`pbcopy`, then OSC 52), the browser, and `open` for an attachment; the only things msgs asks the rest of the machine to do
 - `src/send.rs` — outbound messages via `osascript` → Messages.app; tapbacks via `imsg`
 - `src/watch.rs` — live updates: `notify` on the directory `chat.db` lives in, debounced, with a 2s timer as the fallback; `App::on_db_change` does the re-reading
 - `src/search.rs` — the FTS5 message index at `~/Library/Application Support/msgs/index.db` (never inside chat.db): a worker thread builds it, tops it up from the live-update stream by `ROWID`, and answers `MATCH` queries
@@ -23,3 +24,4 @@ Rust + ratatui terminal client for iMessage on macOS.
 - Message content is private. Do not print message bodies, phone numbers, or names to logs, test output, or commit messages. Tests use a fixture DB under `tests/fixtures/`, never the real one.
 - `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` must pass before a commit.
 - Keep the UI calm: no feature creep beyond the mockups.
+- A block's height and its drawing must come from one number. `ui::message::block` reserves rows for a picture from `Images::cells`, and `Images::render` draws into exactly those rows; never let the two compute a size separately.

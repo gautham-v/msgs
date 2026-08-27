@@ -26,7 +26,7 @@ use ratatui::backend::CrosstermBackend;
 use msgs::app::{App, WatcherStatus};
 use msgs::config::Config;
 use msgs::db::{Db, Source};
-use msgs::{config, default_db_path, keymap, search, ui};
+use msgs::{config, default_db_path, keymap, media, search, ui};
 
 /// How long the loop waits for input before waking up to expire toasts.
 const TICK: Duration = Duration::from_millis(250);
@@ -54,6 +54,10 @@ struct Cli {
     /// Do not build or use the full-text message index.
     #[arg(long)]
     no_index: bool,
+
+    /// Do not draw pictures inline; show every attachment as a chip.
+    #[arg(long)]
+    no_images: bool,
 }
 
 fn main() -> Result<()> {
@@ -86,6 +90,13 @@ fn main() -> Result<()> {
 
     install_panic_hook();
     let mut terminal = setup_terminal(app.mouse_enabled)?;
+    // The terminal is asked what it can draw after the alternate screen is up
+    // and before a single key is read, because the answer comes back on stdin
+    // and would otherwise land in the event loop as keystrokes.
+    if !cli.no_images && app.config.images {
+        app.enable_images(media::Images::detect());
+        let _ = terminal.clear();
+    }
     let result = run(&mut terminal, &mut app);
     restore_terminal();
     result
@@ -289,10 +300,50 @@ fn check(cli: &Cli, warnings: &[String]) -> Result<()> {
             .unwrap_or_else(|_| std::env::var("TERM").unwrap_or_else(|_| "unknown".to_string())),
     );
 
+    // `--check` prints outside the alternate screen, so the capability query
+    // would leave its reply on the shell's line. Guess from the environment
+    // instead, and say that is what this is.
+    row(
+        "inline images",
+        &if cli.no_images {
+            "off (--no-images)".to_string()
+        } else {
+            format!("{} — guessed from the environment", guessed_images())
+        },
+    );
+
+    row(
+        "sips",
+        &which("sips").map_or_else(
+            || "not on PATH — HEIC photos will stay chips".to_string(),
+            |path| path.display().to_string(),
+        ),
+    );
+
     for warning in warnings {
         row("warning", warning);
     }
     Ok(())
+}
+
+/// What `--check` says about inline images, without querying the terminal.
+///
+/// The real answer comes from a control sequence the terminal replies to, and
+/// asking for it here would print the reply onto the user's shell.
+fn guessed_images() -> &'static str {
+    let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    let term = std::env::var("TERM").unwrap_or_default();
+    let kitty = matches!(program.as_str(), "ghostty" | "WezTerm")
+        || term.contains("kitty")
+        || term.contains("ghostty")
+        || std::env::var_os("KITTY_WINDOW_ID").is_some();
+    if kitty {
+        media::Backend::Kitty.label()
+    } else if program == "iTerm.app" {
+        media::Backend::Iterm2.label()
+    } else {
+        media::Backend::Halfblocks.label()
+    }
 }
 
 fn row(label: &str, value: &str) {
@@ -319,18 +370,27 @@ mod tests {
 
     #[test]
     fn flags_parse() {
-        let cli = Cli::parse_from(["msgs", "--db", "/tmp/copy.db", "--no-mouse", "--no-index"]);
+        let cli = Cli::parse_from([
+            "msgs",
+            "--db",
+            "/tmp/copy.db",
+            "--no-mouse",
+            "--no-index",
+            "--no-images",
+        ]);
         assert_eq!(
             cli.db.as_deref(),
             Some(std::path::Path::new("/tmp/copy.db"))
         );
         assert!(cli.no_mouse);
         assert!(cli.no_index);
+        assert!(cli.no_images);
         assert!(!cli.check);
 
         let cli = Cli::parse_from(["msgs"]);
         assert!(cli.db.is_none());
         assert!(!cli.no_mouse);
         assert!(!cli.no_index);
+        assert!(!cli.no_images);
     }
 }

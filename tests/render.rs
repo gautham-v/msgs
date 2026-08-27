@@ -723,6 +723,137 @@ fn an_attachment_without_words_still_says_what_was_sent() {
     assert!(contains(&buffer, "draft-order.pdf · 84 KB"));
 }
 
+/// A picture whose rows all differ, so the half-block fallback draws real
+/// glyphs rather than collapsing every cell to a colored space.
+fn gradient(width: u32, height: u32) -> image::RgbImage {
+    image::ImageBuffer::from_fn(width, height, |x, y| {
+        let shade = u8::try_from((x + y * 3) % 256).unwrap_or(0);
+        image::Rgb([shade, 255 - shade, 128])
+    })
+}
+
+/// How many cells the half-block renderer painted a picture into.
+fn half_blocks(buffer: &Buffer) -> usize {
+    buffer
+        .content()
+        .iter()
+        .filter(|cell| cell.symbol() == "▀" || cell.symbol() == "▄")
+        .count()
+}
+
+#[test]
+fn an_attachment_that_never_arrived_says_so_where_its_size_would_be() {
+    let mut photo = message(1, false, 1, "", 10);
+    photo.attachments = vec![AttachmentRef {
+        rowid: 2,
+        guid: "A2".to_string(),
+        message_rowid: 1,
+        // `chat.db` holds no filename for bytes that were never downloaded.
+        filename: None,
+        mime_type: Some("image/jpeg".to_string()),
+        uti: None,
+        transfer_name: Some("IMG_4412.jpg".to_string()),
+        total_bytes: 2_202_009,
+        transfer_state: 1,
+        is_sticker: false,
+        hide_attachment: false,
+    }];
+    let mut app = with_conversation(false, 1, vec![photo]);
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "IMG_4412.jpg"));
+    assert!(contains(&buffer, "(not downloaded on this Mac)"));
+}
+
+#[test]
+fn a_photo_is_drawn_in_the_pane_and_named_on_the_meta_line() {
+    // A picture written for this test, in a temp directory. No test in this
+    // file reads the real attachment store.
+    let dir = std::env::temp_dir().join(format!("msgs-render-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a temp directory");
+    let path = dir.join("IMG_4412.jpg");
+    image::DynamicImage::from(gradient(320, 160))
+        .save(&path)
+        .expect("a written jpeg");
+
+    let mut photo = message(1, false, 1, "", 10);
+    photo.attachments = vec![AttachmentRef {
+        rowid: 3,
+        guid: "A3".to_string(),
+        message_rowid: 1,
+        filename: Some(path.display().to_string()),
+        mime_type: Some("image/jpeg".to_string()),
+        uti: None,
+        transfer_name: Some("IMG_4412.jpg".to_string()),
+        total_bytes: 2_202_009,
+        transfer_state: 5,
+        is_sticker: false,
+        hide_attachment: false,
+    }];
+
+    let mut plain = with_conversation(false, 1, vec![photo.clone()]);
+    let without = frame(&mut plain, 120, 34);
+    assert!(
+        contains(&without, "IMG_4412.jpg · 2.1 MB"),
+        "the chip fallback names the file"
+    );
+    assert!(contains(&without, "┄"), "and draws it as a dashed chip");
+
+    let mut app = with_conversation(false, 1, vec![photo]);
+    app.enable_images(msgs::media::Images::halfblocks());
+    let buffer = frame(&mut app, 120, 34);
+
+    // The name and size move onto the meta line, and the chip goes away.
+    assert!(contains(&buffer, "IMG_4412.jpg · 2.1 MB"), "the meta line");
+    assert!(!contains(&buffer, "┄"), "no chip once the picture is drawn");
+
+    // 320×160 pixels is thirty-two by eight cells at the half-block picker's
+    // font, and every one of them is painted rather than left blank.
+    let painted = half_blocks(&buffer);
+    assert_eq!(
+        painted,
+        32 * 8,
+        "the picture filled the rows reserved for it"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_photo_scrolled_off_the_top_keeps_the_rows_that_are_still_in_view() {
+    let dir = std::env::temp_dir().join(format!("msgs-render-scroll-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a temp directory");
+    let path = dir.join("IMG_4412.jpg");
+    image::DynamicImage::from(gradient(320, 160))
+        .save(&path)
+        .expect("a written jpeg");
+
+    let mut photo = message(1, false, 1, "", 10);
+    photo.attachments = vec![AttachmentRef {
+        rowid: 4,
+        guid: "A4".to_string(),
+        message_rowid: 1,
+        filename: Some(path.display().to_string()),
+        mime_type: Some("image/jpeg".to_string()),
+        uti: None,
+        transfer_name: Some("IMG_4412.jpg".to_string()),
+        total_bytes: 2_202_009,
+        transfer_state: 5,
+        is_sticker: false,
+        hide_attachment: false,
+    }];
+    let mut app = with_conversation(false, 1, vec![photo]);
+    app.enable_images(msgs::media::Images::halfblocks());
+
+    // A pane only a few rows tall cuts the picture off at both edges; the
+    // protocol clips it rather than refusing to draw.
+    let short = frame(&mut app, 120, 12);
+    let painted = half_blocks(&short);
+    assert!(painted > 0, "some of the picture is still on screen");
+    assert!(painted < 32 * 8, "and not all of it fits");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn the_header_names_the_chat_the_service_and_the_counts() {
     let mut app = with_conversation(false, 1, vec![message(1, false, 1, "hi", 5)]);

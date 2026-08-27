@@ -1,11 +1,13 @@
-//! The two things msgs asks the rest of the machine to do: put text on the
-//! clipboard, and open a link.
+//! The few things msgs asks the rest of the machine to do: put text on the
+//! clipboard, open a link, and open an attachment.
 //!
-//! Both are deliberately tiny and both are one-way. Nothing here reads anything
-//! back, nothing here logs what it was given — the text handed to [`copy`] is a
-//! message body, and it goes to the pasteboard and nowhere else.
+//! All of them are deliberately tiny and all of them are one-way. Nothing here
+//! reads anything back, nothing here logs what it was given — the text handed
+//! to [`copy`] is a message body, and it goes to the pasteboard and nowhere
+//! else.
 
 use std::io::Write as _;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Why a hand-off to the system failed. The message never carries the text.
@@ -17,6 +19,8 @@ pub enum Error {
     Failed,
     /// The link was not something worth opening.
     NotALink,
+    /// There is no file at that path.
+    NotAFile,
 }
 
 impl std::fmt::Display for Error {
@@ -25,6 +29,7 @@ impl std::fmt::Display for Error {
             Self::NotAvailable => "no clipboard helper",
             Self::Failed => "the clipboard refused it",
             Self::NotALink => "not a link",
+            Self::NotAFile => "no file there",
         })
     }
 }
@@ -133,6 +138,30 @@ pub fn open_url(url: &str) -> Result<(), Error> {
         .map_err(|_| Error::NotAvailable)
 }
 
+/// Open a file with whatever the Finder would open it with.
+///
+/// The path comes from the `attachment` table, so it is checked to be a real
+/// file first: `open` is given a file and never a URL, and never anything a
+/// message body could have chosen.
+///
+/// # Errors
+///
+/// Returns [`Error::NotAFile`] when nothing is at the path, and
+/// [`Error::NotAvailable`] when `open` cannot be run.
+pub fn open_path(path: &Path) -> Result<(), Error> {
+    if !path.is_file() {
+        return Err(Error::NotAFile);
+    }
+    Command::new("open")
+        .arg("--")
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| Error::NotAvailable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +197,12 @@ mod tests {
             open_url("mailto:someone@example.invalid"),
             Err(Error::NotALink)
         );
+    }
+
+    #[test]
+    fn only_a_real_file_is_handed_to_open() {
+        let missing = std::env::temp_dir().join("msgs-no-such-attachment.png");
+        assert_eq!(open_path(&missing), Err(Error::NotAFile));
+        assert_eq!(open_path(std::path::Path::new("/")), Err(Error::NotAFile));
     }
 }

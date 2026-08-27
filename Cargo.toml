@@ -9,11 +9,16 @@ chrono = "0.4.44"
 clap = { version = "4.6.6", features = ["derive"] }
 crossterm = "0.29"
 dirs = "6.0.0"
+image = { version = "0.25.8", default-features = false, features = ["gif", "jpeg", "png"] }
 imessage-database = "4.2.0"
 notify = "8.2.0"
 nucleo-matcher = "0.3.1"
 ratatui = "0.30.2"
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 rusqlite = { version = "=0.40.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.4"
 unicode-width = "0.2.2"
+
+[dev-dependencies]
+image = { version = "0.25.8", default-features = false, features = ["jpeg", "png"] }

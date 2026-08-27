@@ -19,6 +19,7 @@ use ratatui::text::{Line, Span};
 use crate::db::handle;
 use crate::db::message::split_association;
 use crate::db::{AttachmentRef, Chat, GroupAction, Message, Tapback};
+use crate::media::{Images, NOT_DOWNLOADED};
 use crate::send::{Delivery, Pending};
 use crate::theme::Theme;
 use crate::ui::format::{bytes, clock, day_label, find_links, single_line, truncate, width, wrap};
@@ -38,6 +39,8 @@ pub const CHROME: u16 = MARGIN_LEFT + RAIL + GAP + MARGIN_RIGHT;
 pub const RAIL_GLYPH: &str = "▌";
 /// The left border of a quoted reply.
 const QUOTE_GLYPH: &str = "▏";
+/// The dashes that stand in for the mockup's dashed border on a file chip.
+const CHIP_EDGE: &str = "┄";
 
 /// Cells left for words at a pane `columns` wide.
 #[must_use]
@@ -58,6 +61,25 @@ pub struct Link {
     pub url: String,
 }
 
+/// A picture inside a laid-out block: the rows reserved for it, and which
+/// attachment fills them.
+///
+/// [`block`] only reserves the space — the pixels are put there by
+/// [`crate::media::Images::render`] once the row is actually on screen — so the
+/// layout stays a pure function and the height can never drift from the
+/// drawing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageSpot {
+    /// First row within [`Block::lines`] the picture covers.
+    pub row: u16,
+    /// Columns it covers, counted from the start of the body.
+    pub columns: u16,
+    /// Rows it covers.
+    pub rows: u16,
+    /// Its position in the message's `attachments`.
+    pub attachment: usize,
+}
+
 /// One message as rows ready to draw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
@@ -71,6 +93,8 @@ pub struct Block {
     pub band: bool,
     /// Links in [`Block::lines`], for `Ctrl+L` and for clicks.
     pub links: Vec<Link>,
+    /// Pictures drawn over [`Block::lines`], for the conversation to fill in.
+    pub images: Vec<ImageSpot>,
 }
 
 impl Block {
@@ -97,6 +121,9 @@ pub struct Ctx<'a> {
     pub pending: &'a [Pending],
     /// The clock, passed in so day labels are testable.
     pub now: DateTime<Local>,
+    /// What the terminal can draw pictures with, and how big they come out.
+    /// [`Images::off`] lays every attachment out as a chip.
+    pub images: &'a Images,
 }
 
 impl Ctx<'_> {
@@ -198,6 +225,7 @@ pub fn block(ctx: &Ctx<'_>, index: usize, columns: u16) -> Block {
             rail: None,
             band: false,
             links: Vec::new(),
+            images: Vec::new(),
         };
     };
     let room = body_width(columns);
@@ -254,17 +282,36 @@ pub fn block(ctx: &Ctx<'_>, index: usize, columns: u16) -> Block {
         lines.pop();
     }
 
-    for attachment in &message.attachments {
+    let room_columns = u16::try_from(room).unwrap_or(u16::MAX);
+    let mut images: Vec<ImageSpot> = Vec::new();
+    let mut first_inline: Option<&AttachmentRef> = None;
+
+    for (index, attachment) in message.attachments.iter().enumerate() {
         if attachment.hide_attachment {
             continue;
         }
-        lines.push(Line::from(Span::styled(
-            truncate(&chip(attachment), room),
-            Style::new().fg(theme.text_secondary),
-        )));
+        // A picture the terminal can draw takes rows of its own; the name and
+        // the size then ride on the meta line, the way the mockup has them.
+        if let Some((columns, rows)) = ctx.images.cells(attachment, room_columns) {
+            images.push(ImageSpot {
+                row: u16::try_from(lines.len()).unwrap_or(u16::MAX),
+                columns,
+                rows,
+                attachment: index,
+            });
+            for _ in 0..rows {
+                lines.push(Line::default());
+            }
+            if first_inline.is_none() {
+                first_inline = Some(attachment);
+            }
+            continue;
+        }
+        lines.push(Line::from(chip_spans(attachment, theme, room)));
     }
 
-    lines.extend(meta_lines(ctx, message, room));
+    let note = first_inline.map(|attachment| inline_note(attachment, images.len()));
+    lines.extend(meta_lines(ctx, message, room, note.as_deref()));
 
     Block {
         day,
@@ -272,7 +319,24 @@ pub fn block(ctx: &Ctx<'_>, index: usize, columns: u16) -> Block {
         rail: Some(ctx.accent(message)),
         band: message.is_from_me,
         links,
+        images,
     }
+}
+
+/// What the meta line says about the pictures drawn above it:
+/// `IMG_4412.jpg · 2.1 MB`, or `3 photos` when a message carried several.
+fn inline_note(attachment: &AttachmentRef, drawn: usize) -> String {
+    if drawn > 1 {
+        return format!("{drawn} photos");
+    }
+    let name = attachment
+        .display_name()
+        .filter(|name| !name.is_empty())
+        .map_or_else(|| "Photo".to_string(), ToString::to_string);
+    if attachment.total_bytes > 0 {
+        return format!("{name} · {}", bytes(attachment.total_bytes));
+    }
+    name
 }
 
 /// A rename, a join, or a leave: dim, italic, and without a rail.
@@ -290,6 +354,7 @@ fn system_block(ctx: &Ctx<'_>, message: &Message, day: Option<String>, room: usi
         rail: None,
         band: false,
         links: Vec::new(),
+        images: Vec::new(),
     }
 }
 
@@ -355,27 +420,59 @@ fn quote_line(ctx: &Ctx<'_>, target: &Message, room: usize) -> Line<'static> {
     ])
 }
 
-/// `📄 draft-order.pdf · 84 KB`.
+/// `📄 draft-order.pdf · 84 KB`, with
+/// `· (not downloaded on this Mac)` on the end when the bytes are not here.
 fn chip(attachment: &AttachmentRef) -> String {
     let kind = attachment.kind();
     let name = attachment
         .display_name()
         .filter(|name| !name.is_empty())
         .map_or_else(|| kind.label().to_string(), ToString::to_string);
+    let mut out = format!("{} {name}", kind.glyph());
     if attachment.total_bytes > 0 {
-        return format!(
-            "{} {name} · {}",
-            kind.glyph(),
-            bytes(attachment.total_bytes)
-        );
+        out.push_str(" · ");
+        out.push_str(&bytes(attachment.total_bytes));
     }
-    format!("{} {name}", kind.glyph())
+    if !attachment.is_downloaded() {
+        out.push_str(" · ");
+        out.push_str(NOT_DOWNLOADED);
+    }
+    out
+}
+
+/// The chip with the mockup's dashed border around it, drawn as the two dashes
+/// a terminal has room for: `┄ 📄 draft-order.pdf · 84 KB ┄`.
+fn chip_spans(attachment: &AttachmentRef, theme: &Theme, room: usize) -> Vec<Span<'static>> {
+    let text = chip(attachment);
+    let edges = width(CHIP_EDGE) * 2 + 2;
+    let color = if attachment.is_downloaded() {
+        theme.text_secondary
+    } else {
+        theme.gray_dim
+    };
+    if room <= edges {
+        return vec![Span::styled(truncate(&text, room), Style::new().fg(color))];
+    }
+    let dash = Style::new().fg(theme.border);
+    vec![
+        Span::styled(format!("{CHIP_EDGE} "), dash),
+        Span::styled(truncate(&text, room - edges), Style::new().fg(color)),
+        Span::styled(format!(" {CHIP_EDGE}"), dash),
+    ]
 }
 
 /// The meta line, and the tapback chips that ride on the end of it.
-fn meta_lines(ctx: &Ctx<'_>, message: &Message, room: usize) -> Vec<Line<'static>> {
+fn meta_lines(
+    ctx: &Ctx<'_>,
+    message: &Message,
+    room: usize,
+    note: Option<&str>,
+) -> Vec<Line<'static>> {
     let theme = ctx.theme;
-    let meta = meta_text(message);
+    let meta = match note {
+        Some(note) => format!("{} · {note}", meta_text(message)),
+        None => meta_text(message),
+    };
     let chips = tapback_chips(ctx, message);
 
     let mut spans = vec![Span::styled(
@@ -601,6 +698,7 @@ mod tests {
         chat: Chat,
         messages: Vec<Message>,
         by_guid: HashMap<String, usize>,
+        images: crate::media::Images,
     }
 
     impl Fixture {
@@ -615,6 +713,7 @@ mod tests {
                 chat: chat(is_group),
                 messages,
                 by_guid,
+                images: crate::media::Images::off(),
             }
         }
 
@@ -626,6 +725,7 @@ mod tests {
                 by_guid: &self.by_guid,
                 pending: &[],
                 now: now(),
+                images: &self.images,
             }
         }
     }
@@ -812,9 +912,79 @@ mod tests {
             hide_attachment: false,
         }];
         let fixture = Fixture::new(false, vec![photo]);
-        let block = block(&fixture.ctx(), 0, 60);
+        let block = block(&fixture.ctx(), 0, 80);
         assert_eq!(block.lines.len(), 2, "chip and meta, no empty body row");
-        assert_eq!(text_of(&block.lines[0]), "📄 draft-order.pdf · 84 KB");
+        let chip = text_of(&block.lines[0]);
+        assert!(chip.contains("📄 draft-order.pdf · 84 KB"), "{chip}");
+        assert!(chip.starts_with(CHIP_EDGE), "the dashed edge: {chip}");
+        assert!(block.images.is_empty(), "a pdf is never drawn inline");
+    }
+
+    #[test]
+    fn a_picture_takes_rows_of_its_own_and_names_itself_on_the_meta_line() {
+        let dir = std::env::temp_dir().join(format!("msgs-block-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp directory");
+        let path = dir.join("IMG_4412.jpg");
+        let pixels = image::ImageBuffer::from_pixel(200, 100, image::Rgba::<u8>([1, 2, 3, 255]));
+        image::DynamicImage::from(pixels)
+            .save(&path)
+            .expect("a written jpeg");
+
+        let mut photo = message(1, false, "");
+        photo.attachments = vec![AttachmentRef {
+            rowid: 7,
+            guid: "A7".to_string(),
+            message_rowid: 1,
+            filename: Some(path.display().to_string()),
+            mime_type: Some("image/jpeg".to_string()),
+            uti: None,
+            transfer_name: Some("IMG_4412.jpg".to_string()),
+            total_bytes: 2_202_009,
+            transfer_state: 5,
+            is_sticker: false,
+            hide_attachment: false,
+        }];
+        let mut fixture = Fixture::new(false, vec![photo]);
+        fixture.images = crate::media::Images::halfblocks();
+        let block = block(&fixture.ctx(), 0, 60);
+
+        let spot = *block.images.first().expect("a reserved picture");
+        assert_eq!(spot.row, 0, "the picture opens the block");
+        assert_eq!(spot.attachment, 0);
+        // Twenty by ten cells at a ten-by-twenty font: five rows for the rows.
+        assert_eq!((spot.columns, spot.rows), (20, 5));
+        assert_eq!(block.lines.len(), usize::from(spot.rows) + 1);
+        for row in 0..usize::from(spot.rows) {
+            assert_eq!(text_of(&block.lines[row]), "", "row {row} is left blank");
+        }
+        let meta = text_of(&block.lines[usize::from(spot.rows)]);
+        assert!(meta.contains("IMG_4412.jpg · 2.1 MB"), "{meta}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_never_reached_this_mac_says_so() {
+        let mut photo = message(1, false, "");
+        photo.attachments = vec![AttachmentRef {
+            rowid: 1,
+            guid: "A".to_string(),
+            message_rowid: 1,
+            // No filename is what an undownloaded attachment looks like.
+            filename: None,
+            mime_type: Some("image/jpeg".to_string()),
+            uti: None,
+            transfer_name: Some("IMG_4412.jpg".to_string()),
+            total_bytes: 2_202_009,
+            transfer_state: 1,
+            is_sticker: false,
+            hide_attachment: false,
+        }];
+        let fixture = Fixture::new(false, vec![photo]);
+        let block = block(&fixture.ctx(), 0, 120);
+        let chip = text_of(&block.lines[0]);
+        assert!(chip.contains(NOT_DOWNLOADED), "{chip}");
+        assert!(block.images.is_empty(), "nothing to draw");
     }
 
     #[test]

@@ -13,8 +13,9 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
 use crate::config::Config;
-use crate::db::{Chat, Db, DbError, MAX_PAGE, Message, PAGE, Source};
+use crate::db::{AttachmentRef, Chat, Db, DbError, MAX_PAGE, Message, PAGE, Source};
 use crate::jump::{self, Jump};
+use crate::media::{self, Images};
 use crate::search::{self, Search};
 use crate::send::{self, Delivery, Outbox, Outgoing, Pending, SendError, Service, Target};
 use crate::theme::Theme;
@@ -561,6 +562,10 @@ pub struct App {
     pub new_below: usize,
     /// When the scratch copy of a locked database was last re-taken.
     last_snapshot: Option<Instant>,
+    /// Inline pictures: what the terminal can draw, and everything measured or
+    /// encoded so far. [`Images::off`] until the terminal has been asked, which
+    /// is how the tests and `--no-images` leave it.
+    pub images: Images,
 }
 
 impl App {
@@ -620,6 +625,7 @@ impl App {
             watcher: Watcher::off(),
             new_below: 0,
             last_snapshot: None,
+            images: Images::off(),
         }
     }
 
@@ -685,6 +691,15 @@ impl App {
             return;
         }
         self.search = Some(Search::start(&db_path, index_path));
+    }
+
+    /// Take the terminal's picture-drawing ability, once it has been asked.
+    ///
+    /// Until this is called nothing is drawn inline and every attachment is a
+    /// chip, which is how the tests and `--no-images` run.
+    pub fn enable_images(&mut self, images: Images) {
+        self.images = images;
+        self.measured.stale = true;
     }
 
     /// Where the message index lives, for `--check` and the status line.
@@ -1007,6 +1022,7 @@ impl App {
                 by_guid: &by_guid,
                 pending: &self.pending,
                 now,
+                images: &self.images,
             };
             let one = |index: usize| message::block(&ctx, index, width).height();
             if prepended {
@@ -1537,8 +1553,8 @@ impl App {
             Action::CursorHome => self.edit(TextField::cursor_home),
             Action::CursorEnd => self.edit(TextField::cursor_end),
             Action::Attach => self.start_attach(),
-            Action::OpenAttachment => self.not_yet("Attachments arrive with the attachment pass"),
-            Action::SaveAttachment => self.not_yet("Attachments arrive with the attachment pass"),
+            Action::OpenAttachment => self.open_attachment(),
+            Action::SaveAttachment => self.save_attachment(),
             Action::QuoteReply => self.quote_reply(),
             Action::React => self.not_yet("Tapbacks arrive with the imsg integration"),
             Action::CopySelection => self.copy_selection(),
@@ -1896,6 +1912,65 @@ impl App {
         self.attach_prompt.get_or_insert_with(TextField::default);
     }
 
+    /// The attachment `o` and `s` act on: the first one on the selected
+    /// message that Messages is not hiding.
+    #[must_use]
+    pub fn selected_attachment(&self) -> Option<&AttachmentRef> {
+        self.selected_message()?
+            .attachments
+            .iter()
+            .find(|attachment| !attachment.hide_attachment)
+    }
+
+    /// The selected attachment's path, once it is known to be on this Mac.
+    ///
+    /// Everything that can go wrong becomes a status line here rather than at
+    /// each caller, and the path itself never reaches a log.
+    fn openable_attachment(&mut self) -> Option<PathBuf> {
+        let Some(attachment) = self.selected_attachment() else {
+            self.status.toast("no attachment on the selected message");
+            return None;
+        };
+        let path = attachment.path();
+        match path.filter(|path| path.is_file()) {
+            Some(path) => Some(path),
+            None => {
+                self.status
+                    .toast(format!("that file is {}", media::NOT_DOWNLOADED));
+                None
+            }
+        }
+    }
+
+    /// `o`: hand the selected attachment to `open`.
+    fn open_attachment(&mut self) {
+        let Some(path) = self.openable_attachment() else {
+            return;
+        };
+        match crate::shell::open_path(&path) {
+            Ok(()) => self.status.toast("opening the attachment"),
+            Err(err) => self
+                .status
+                .error(format!("could not open the attachment: {err}")),
+        }
+    }
+
+    /// `s`: copy the selected attachment into `~/Downloads`.
+    ///
+    /// A copy out, never a move, and never a write anywhere near `chat.db`.
+    fn save_attachment(&mut self) {
+        let Some(path) = self.openable_attachment() else {
+            return;
+        };
+        match media::save_to_downloads(&path) {
+            Ok(saved) => {
+                let shown = crate::ui::home_relative(&saved);
+                self.status.toast(format!("saved to {shown}"));
+            }
+            Err(err) => self.status.error(format!("could not save it: {err}")),
+        }
+    }
+
     /// `r`: open a reply by quoting what is selected.
     ///
     /// Messages has no in-thread reply that AppleScript can reach, so the quote
@@ -2097,6 +2172,13 @@ impl App {
         }
         dirty |= self.absorb_replies();
         dirty |= self.reconcile_pending();
+        // A HEIC that finished converting can be drawn now, which changes how
+        // tall its block is, so the page is measured again.
+        if self.images.take_arrived() {
+            self.images.reconsider();
+            self.measured.stale = true;
+            dirty = true;
+        }
         if self.watcher.ready() {
             dirty |= self.on_db_change();
         }
@@ -2714,6 +2796,79 @@ mod tests {
         assert_eq!(app.composer.text(), "> dinner tonight?\n");
         // The cursor is on the empty line under the quote, ready to type.
         assert_eq!(app.composer.cursor(), app.composer.text().len());
+    }
+
+    /// A message carrying one attachment at `filename`, selected.
+    fn app_with_attachment(filename: Option<String>) -> App {
+        let mut app = app_with_chat();
+        let mut row = echo_row(&Pending::new(0, 1, String::new(), false, 0));
+        row.text = None;
+        row.attachments = vec![AttachmentRef {
+            rowid: 1,
+            guid: "A1".to_string(),
+            message_rowid: row.rowid,
+            filename,
+            mime_type: Some("image/png".to_string()),
+            uti: None,
+            transfer_name: Some("shot.png".to_string()),
+            total_bytes: 2048,
+            transfer_state: 5,
+            is_sticker: false,
+            hide_attachment: false,
+        }];
+        app.message_rows = vec![row];
+        app.messages.set_len(1);
+        app.pending.clear();
+        app.focus = Focus::Conversation;
+        app
+    }
+
+    #[test]
+    fn o_and_s_say_so_when_there_is_no_attachment_to_act_on() {
+        let mut app = app_with_chat();
+        app.message_rows = vec![echo_row(&Pending::new(
+            0,
+            1,
+            "just words".to_string(),
+            false,
+            0,
+        ))];
+        app.messages.set_len(1);
+        app.pending.clear();
+        app.focus = Focus::Conversation;
+
+        app.update(Action::OpenAttachment);
+        let (text, is_error) = app.status.active_toast().expect("a toast");
+        assert!(text.contains("no attachment"), "{text}");
+        assert!(!is_error, "a missing attachment is not an error");
+
+        app.update(Action::SaveAttachment);
+        let (text, _) = app.status.active_toast().expect("a toast");
+        assert!(text.contains("no attachment"), "{text}");
+    }
+
+    #[test]
+    fn an_undownloaded_attachment_is_neither_opened_nor_saved() {
+        // No filename is what `chat.db` holds for bytes that never arrived.
+        let mut app = app_with_attachment(None);
+        assert!(app.selected_attachment().is_some());
+
+        app.update(Action::OpenAttachment);
+        let (text, _) = app.status.active_toast().expect("a toast");
+        assert!(text.contains(media::NOT_DOWNLOADED), "{text}");
+
+        app.update(Action::SaveAttachment);
+        let (text, _) = app.status.active_toast().expect("a toast");
+        assert!(text.contains(media::NOT_DOWNLOADED), "{text}");
+    }
+
+    #[test]
+    fn a_path_that_points_nowhere_is_treated_as_undownloaded() {
+        let missing = std::env::temp_dir().join("msgs-not-here.png");
+        let mut app = app_with_attachment(Some(missing.display().to_string()));
+        app.update(Action::OpenAttachment);
+        let (text, _) = app.status.active_toast().expect("a toast");
+        assert!(text.contains(media::NOT_DOWNLOADED), "{text}");
     }
 
     #[test]

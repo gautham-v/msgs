@@ -402,6 +402,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
         by_guid: &app.measured.by_guid,
         pending: &app.pending,
         now,
+        images: &app.images,
     };
     let heights = &app.measured.heights;
     let body = Rect {
@@ -412,6 +413,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
     };
     let text_x = body.x + GAP;
     let text_width = body.width - GAP;
+    // The width the blocks were laid out at, which is what a picture is filed
+    // under in the cache.
+    let room = u16::try_from(message::body_width(area.width)).unwrap_or(u16::MAX);
 
     let visible = app.convo.visible(heights, area.height);
     for entry in &visible {
@@ -478,6 +482,32 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
                     height: 1,
                 },
             );
+        }
+
+        // Pictures go on after the rows they sit over, so the band and the
+        // selection tint are underneath rather than over them. A block taller
+        // than the pane hands the picture a negative offset and the protocol
+        // clips the rows that scrolled past the top edge.
+        for spot in &block.images {
+            let top = i32::from(entry.y) + i32::from(spot.row) + i32::from(day_rows)
+                - i32::from(entry.skip);
+            let Some(attachment) = app
+                .message_rows
+                .get(entry.index)
+                .and_then(|message| message.attachments.get(spot.attachment))
+            else {
+                continue;
+            };
+            let strip = Rect {
+                x: text_x,
+                y: area.y,
+                width: spot.columns.min(text_width),
+                height: area.height,
+            };
+            let offset = i16::try_from(top.clamp(i32::from(i16::MIN), i32::from(i16::MAX)))
+                .unwrap_or_default();
+            app.images
+                .render(frame.buffer_mut(), strip, offset, attachment, room);
         }
 
         for link in &block.links {

@@ -32,6 +32,7 @@ Flags:
 | `--no-mouse` | do not capture the mouse |
 | `--check` | print a readiness report (database, row counts, live updates, Messages.app, `osascript`, `imsg`, search index) and exit |
 | `--no-index` | do not build or use the full-text message index |
+| `--no-images` | do not draw pictures inline; show every attachment as a chip |
 | `--version` | print the version |
 
 ## Keys
@@ -58,6 +59,34 @@ Flags:
 | `Esc` | close an overlay / leave the composer |
 | `?` | help |
 | `q` / `Ctrl+C` | quit |
+
+## Attachments
+
+A picture in a thread is drawn where it was sent. msgs asks the terminal what it
+can do the moment the alternate screen is up: Ghostty, Kitty, and WezTerm answer
+with the kitty graphics protocol and get real pixels, iTerm2 gets its own inline
+images, and everything else falls back to unicode half-blocks, which any
+terminal can draw. Pictures are capped at ten rows and at forty-eight columns
+and keep their aspect ratio, and the file name and size move onto the meta line
+under them. `--no-images`, or `images = false` in the config, turns the whole
+thing off and leaves every attachment as a chip.
+
+HEIC is what an iPhone camera sends and nothing in Rust reads it, so `sips` —
+the converter macOS ships — turns one into a JPEG the first time it is on
+screen. That runs on its own thread, so a thread full of photos never blocks a
+keystroke, and the result is cached under
+`~/Library/Caches/msgs/attachments` and reused by every later session. Until it
+lands the attachment shows as a chip.
+
+Anything that is not a picture is a dashed chip: `┄ 📄 draft-order.pdf · 84 KB ┄`.
+An attachment whose bytes never reached this Mac says
+`(not downloaded on this Mac)` rather than pretending to be there.
+
+`o` opens the selected message's attachment with `open`, and `s` copies it into
+`~/Downloads` without ever overwriting anything — a name already taken gets
+` (2)` before the extension. Both read the file and nothing else; `chat.db` is
+untouched. `Ctrl+A` goes the other way and sends a file to the open
+conversation.
 
 ## Reading
 
@@ -168,6 +197,7 @@ show_chat_list = true    # show the chat list on startup
 chat_list_width = 30     # columns, 18–60, never more than half the screen
 page_step = 10           # rows moved by PageUp / PageDown
 mouse = true             # --no-mouse overrides this
+images = true            # draw pictures inline; --no-images overrides this
 
 [theme]
 # Any color slot, as "#rrggbb", "#rgb", or an ANSI index 0–255.

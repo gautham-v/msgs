@@ -10,6 +10,7 @@
 //! - [`db`] — read-only queries against `chat.db`
 //! - [`jump`] — what the `Ctrl+K` palette matches and shows
 //! - [`keymap`] — keys to actions, and the table the help modal renders
+//! - [`media`] — inline pictures, and the files behind the attachment chips
 //! - [`search`] — the FTS5 message index msgs keeps of its own
 //! - [`send`] — outbound messages, through Messages.app
 //! - [`shell`] — the clipboard and the browser, the only two things msgs asks
@@ -26,6 +27,7 @@ pub mod config;
 pub mod db;
 pub mod jump;
 pub mod keymap;
+pub mod media;
 pub mod search;
 pub mod send;
 pub mod shell;
