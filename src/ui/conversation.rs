@@ -435,7 +435,15 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
             hits.rows[usize::from(entry.y + offset)] = Some(entry.index);
 
             if row < day_rows {
-                let label = block.day.clone().unwrap_or_default();
+                // The band above the pane already names this day when the
+                // separator is the very first thing on screen; leave the row
+                // empty rather than say it twice.
+                let named_by_band = app.panes.day.is_some() && entry.y == 0 && entry.skip == 0;
+                let label = if named_by_band {
+                    String::new()
+                } else {
+                    block.day.clone().unwrap_or_default()
+                };
                 frame.render_widget(
                     Paragraph::new(Line::from(Span::styled(label, Style::new().fg(theme.gray))))
                         .alignment(Alignment::Center),
