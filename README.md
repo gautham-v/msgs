@@ -204,7 +204,8 @@ where to look after the toast has gone.
 `msgs --check` answers the same questions from the shell without starting the
 UI: Full Disk Access, whether `chat.db` opens and what is in it, the read state,
 live updates, Messages.app and whether it is running, `osascript`, `imsg`, the
-search index, Contacts, the terminal's graphics support, and `sips`. It prints
+search index, Contacts, the terminal's graphics support, `sips`, and
+`qlmanage`. It prints
 paths and counts — never a name, a number, or a message.
 
 ## The status line
@@ -239,11 +240,18 @@ keystroke, and the result is cached under
 `~/Library/Caches/msgs/attachments` and reused by every later session. Until it
 lands the attachment shows as a chip.
 
-Anything that is not a picture is a dashed chip: `┄ 📄 draft-order.pdf · 84 KB ┄`.
+A video gets the same treatment through `qlmanage`, the Quick Look tool macOS
+ships: its poster frame is cached as a PNG and drawn inline, marked with 🎬 on
+the meta line so a still is not read as a photo. Until the frame lands the video
+shows as a chip, and `o` still opens the clip in the default player — nothing
+here plays video.
+
+Anything that is not a picture or a video is a dashed chip: `┄ 📄 draft-order.pdf · 84 KB ┄`.
 An attachment whose bytes never reached this Mac says
 `(not downloaded on this Mac)` rather than pretending to be there.
 
-`o` opens the selected message's attachment with `open`, and `s` copies it into
+`o` opens the selected message's attachment with `open` — clicking a picture
+opens that one the same way — and `s` copies it into
 `~/Downloads` without ever overwriting anything — a name already taken gets
 ` (2)` before the extension. Both read the file and nothing else; `chat.db` is
 untouched. `Ctrl+A` goes the other way and sends a file to the open

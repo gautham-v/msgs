@@ -309,6 +309,21 @@ mod tests {
     }
 
     #[test]
+    fn a_toggle_on_a_narrow_terminal_leaves_the_layout_alone() {
+        use crate::app::Action;
+
+        let narrow = Rect::new(0, 0, MIN_WIDTH_FOR_CHAT_LIST - 1, 40);
+        let mut app = app();
+        app.panes = compute(narrow, &app);
+        assert!(app.panes.chat_list.is_none());
+
+        app.update(Action::ToggleChatList);
+        let panes = compute(narrow, &app);
+        assert!(panes.chat_list.is_none());
+        assert_eq!(panes.conversation.width, MIN_WIDTH_FOR_CHAT_LIST - 1);
+    }
+
+    #[test]
     fn chat_list_never_takes_more_than_half_the_width() {
         let mut app = app();
         app.config.chat_list_width = 60;

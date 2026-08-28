@@ -4,6 +4,8 @@
 //! in — so the chat list's timestamps and preview lines can be tested without a
 //! terminal and without a database.
 
+use std::borrow::Cow;
+
 use chrono::{DateTime, Datelike, Local};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -421,6 +423,84 @@ pub fn first_link(text: &str) -> Option<String> {
     })
 }
 
+/// Fit `(keys, label)` hint pairs into `columns` terminal cells.
+///
+/// The bar is built at full length and then degraded in one fixed order, so
+/// the right edge never eats half a word: pairs are dropped from the
+/// middle-right inward with the first and last pinned, then labels go away
+/// entirely, and only a last pair whose keys alone overflow is truncated.
+/// A label is always present in full or not at all.
+#[must_use]
+pub fn fit_hints<'a>(
+    hints: &[(&'a str, &'a str)],
+    columns: usize,
+) -> Vec<(Cow<'a, str>, Option<&'a str>)> {
+    if hints.is_empty() || columns == 0 {
+        return Vec::new();
+    }
+    // One cell of the line is the leading pad every renderer draws.
+    let budget = columns.saturating_sub(1);
+
+    // The candidate sets, widest first: everything, then the first `k` pairs
+    // plus the pinned last one.
+    let n = hints.len();
+    let floor = n.min(2);
+    for labelled in [true, false] {
+        for k in (floor..=n).rev() {
+            let picked: Vec<usize> = if k == n {
+                (0..n).collect()
+            } else {
+                let mut v: Vec<usize> = (0..k - 1).collect();
+                v.push(n - 1);
+                v
+            };
+            let cost: usize = picked
+                .iter()
+                .map(|&i| {
+                    if labelled {
+                        width(hints[i].0) + 1 + width(hints[i].1)
+                    } else {
+                        width(hints[i].0)
+                    }
+                })
+                .sum::<usize>()
+                + 3 * picked.len().saturating_sub(1);
+            if cost <= budget {
+                return picked
+                    .into_iter()
+                    .map(|i| {
+                        (
+                            Cow::Borrowed(hints[i].0),
+                            if labelled { Some(hints[i].1) } else { None },
+                        )
+                    })
+                    .collect();
+            }
+        }
+    }
+
+    // Not even both pinned pairs' keys fit, so only the last one is left, and
+    // this is the one place a hint is ever cut.
+    let keys = hints[n - 1].0;
+    if width(keys) <= budget {
+        return vec![(Cow::Borrowed(keys), None)];
+    }
+    vec![(Cow::Owned(truncate(keys, budget)), None)]
+}
+
+/// How wide the fitted hints render, pad included.
+#[must_use]
+pub fn hints_width(fitted: &[(Cow<'_, str>, Option<&str>)]) -> usize {
+    if fitted.is_empty() {
+        return 0;
+    }
+    1 + fitted
+        .iter()
+        .map(|(keys, label)| width(keys) + label.map_or(0, |l| 1 + width(l)))
+        .sum::<usize>()
+        + 3 * (fitted.len() - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,5 +677,47 @@ b", 10, 10
         assert_eq!(truncate("héllo 🌊", 7), "héllo …");
         assert_eq!(truncate("héllo 🌊", 3), "hé…");
         assert!(width(&truncate("🌊🌊🌊", 5)) <= 5);
+    }
+
+    #[test]
+    fn fit_hints_keeps_everything_when_there_is_room() {
+        let hints = crate::keymap::SHORTCUT_BAR;
+        let fitted = fit_hints(hints, 120);
+        assert_eq!(fitted.len(), hints.len());
+        assert!(fitted.iter().all(|(_, label)| label.is_some()));
+        assert!(hints_width(&fitted) <= 120);
+    }
+
+    #[test]
+    fn fit_hints_pins_the_help_entry() {
+        let hints = crate::keymap::SHORTCUT_BAR;
+        for columns in [40usize, 20, 12, 8, 3] {
+            let fitted = fit_hints(hints, columns);
+            assert!(!fitted.is_empty(), "empty at {columns}");
+            assert!(hints_width(&fitted) <= columns, "too wide at {columns}");
+            assert_eq!(fitted.last().unwrap().0, "?", "lost help at {columns}");
+        }
+    }
+
+    #[test]
+    fn fit_hints_drops_labels_before_the_pinned_pair() {
+        let fitted = fit_hints(crate::keymap::SHORTCUT_BAR, 12);
+        assert!(fitted.iter().all(|(_, label)| label.is_none()));
+        assert_eq!(fitted.first().unwrap().0, "Tab");
+        assert_eq!(fitted.last().unwrap().0, "?");
+    }
+
+    #[test]
+    fn fit_hints_never_renders_half_a_label() {
+        let hints = crate::keymap::SHORTCUT_BAR;
+        for columns in 0..120usize {
+            let fitted = fit_hints(hints, columns);
+            assert!(hints_width(&fitted) <= columns, "wide at {columns}");
+            for (keys, label) in &fitted {
+                if let Some(label) = label {
+                    assert!(hints.iter().any(|(k, l)| k == keys && l == label));
+                }
+            }
+        }
     }
 }

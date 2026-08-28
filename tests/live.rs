@@ -220,6 +220,52 @@ fn a_message_arriving_in_the_open_chat_is_appended_and_followed() {
 }
 
 #[test]
+fn an_edit_to_a_loaded_row_moves_the_chat_list_preview_with_it() {
+    let store = Store::new("edited-preview");
+    let mut app = app_on(&store);
+    let newest = app
+        .message_rows
+        .last()
+        .map(|message| message.rowid)
+        .expect("the open chat has messages");
+
+    let edited = "edited after it was already on screen";
+    {
+        let conn = Connection::open(&store.db).expect("open the copy for writing");
+        conn.execute(
+            "UPDATE message SET text = ?1 WHERE ROWID = ?2",
+            rusqlite::params![edited, newest],
+        )
+        .expect("edit the newest message in place");
+    }
+    assert!(app.on_db_change());
+
+    // The change landed in place, so nothing was appended.
+    assert_eq!(
+        app.message_rows.last().map(|message| message.rowid),
+        Some(newest)
+    );
+    assert_eq!(
+        app.message_rows
+            .last()
+            .and_then(|message| message.text.as_deref()),
+        Some(edited)
+    );
+    // ...and the chat list's preview line moved with it.
+    let open = app
+        .chat_rows
+        .iter()
+        .find(|chat| Some(chat.rowid) == app.open_chat)
+        .expect("the open chat is in the list");
+    assert_eq!(
+        open.preview
+            .as_ref()
+            .and_then(|preview| preview.text.as_deref()),
+        Some(edited)
+    );
+}
+
+#[test]
 fn a_message_arriving_elsewhere_bumps_that_chat_to_the_top() {
     let store = Store::new("bump");
     let mut app = app_on(&store);

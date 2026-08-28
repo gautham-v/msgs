@@ -101,7 +101,7 @@ pub fn render_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     frame.render_widget(
-        Paragraph::new(super::composer::shortcut_bar_line(app)),
+        Paragraph::new(super::composer::shortcut_bar_line(app, area.width)),
         area,
     );
 }

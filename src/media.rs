@@ -10,9 +10,11 @@
 //!   on screen — the encoded protocol data for it. Terminals that speak the
 //!   kitty graphics protocol get real pixels; everything else falls back to
 //!   unicode half-blocks, which every terminal can draw.
-//! - [`convert`] and [`save_to_downloads`] are the two file-system errands:
-//!   HEIC through `sips` into a cached JPEG, and `s` copying an attachment out
-//!   to `~/Downloads`.
+//! - [`convert`], [`poster`] and [`save_to_downloads`] are the file-system
+//!   errands: HEIC through `sips` into a cached JPEG, a video's poster frame
+//!   through `qlmanage` into a cached PNG, and `s` copying an attachment out to
+//!   `~/Downloads`. [`prep`] is the one place that says which route a file
+//!   takes, so measuring and drawing can never pick different ones.
 //!
 //! Nothing here logs a filename or reads a message body. The bytes go from
 //! `~/Library/Messages/Attachments` to the screen and nowhere else, and the one
@@ -32,6 +34,8 @@ use ratatui::widgets::Widget;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
 use ratatui_image::{FontSize, Resize};
+
+use image::{ImageDecoder, metadata::Orientation};
 
 use crate::db::AttachmentRef;
 
@@ -89,18 +93,45 @@ impl Backend {
     }
 }
 
-/// Whether a file is one `sips` has to turn into a JPEG first.
-///
-/// The `image` crate cannot read HEIC, which is what an iPhone camera sends.
+/// How an attachment is turned into something the `image` crate can read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prep {
+    /// Decode the file as it is.
+    Direct,
+    /// HEIC through `sips`, which is what an iPhone camera sends.
+    Sips,
+    /// A video's poster frame through `qlmanage`, the still Quick Look shows.
+    QuickLook,
+    /// Nothing here can draw it. It stays a chip.
+    Skip,
+}
+
+/// Which of the three routes an attachment takes to the screen.
 #[must_use]
-pub fn needs_conversion(attachment: &AttachmentRef) -> bool {
+pub fn prep(attachment: &AttachmentRef) -> Prep {
     let heic = |text: &str| {
         let lower = text.to_ascii_lowercase();
         lower.contains("heic") || lower.contains("heif")
     };
-    attachment.mime_type.as_deref().is_some_and(heic)
+    let is_heic = attachment.mime_type.as_deref().is_some_and(heic)
         || attachment.uti.as_deref().is_some_and(heic)
-        || attachment.filename.as_deref().is_some_and(heic)
+        || attachment.filename.as_deref().is_some_and(heic);
+    if is_heic {
+        return Prep::Sips;
+    }
+    if attachment.kind() == crate::db::AttachmentKind::Video {
+        return Prep::QuickLook;
+    }
+    if attachment.is_image() {
+        return Prep::Direct;
+    }
+    Prep::Skip
+}
+
+/// Whether a file has to be turned into a readable still first.
+#[must_use]
+pub fn needs_conversion(attachment: &AttachmentRef) -> bool {
+    matches!(prep(attachment), Prep::Sips | Prep::QuickLook)
 }
 
 /// Where converted pictures are kept: `~/Library/Caches/msgs/attachments`.
@@ -111,10 +142,12 @@ pub fn cache_dir() -> Option<PathBuf> {
     Some(dirs::cache_dir()?.join("msgs").join("attachments"))
 }
 
-/// The cached JPEG a HEIC attachment converts to.
+/// The cached still an attachment converts to: a JPEG for HEIC, a PNG poster
+/// frame for a video.
 ///
 /// Named after the attachment's `guid`, which is what `chat.db` guarantees to
-/// be unique and stable, so a second session reuses the first one's work.
+/// be unique and stable, so a second session reuses the first one's work. The
+/// two conversions get different names so a video never collides with a photo.
 #[must_use]
 pub fn converted_path(attachment: &AttachmentRef) -> Option<PathBuf> {
     let stem: String = attachment
@@ -125,7 +158,65 @@ pub fn converted_path(attachment: &AttachmentRef) -> Option<PathBuf> {
     if stem.is_empty() {
         return None;
     }
-    Some(cache_dir()?.join(format!("{stem}.jpg")))
+    let name = match prep(attachment) {
+        Prep::QuickLook => format!("{stem}-poster.png"),
+        _ => format!("{stem}.jpg"),
+    };
+    Some(cache_dir()?.join(name))
+}
+
+/// Ask Quick Look for a video's poster frame, the still Finder shows.
+///
+/// `qlmanage -t` writes `<name>.png` into an output directory, so this renders
+/// into a scratch directory beside the cache and moves the one file it made
+/// onto `target`. Returns whether a readable still now exists.
+pub fn poster(source: &Path, target: &Path) -> bool {
+    if target.is_file() {
+        return true;
+    }
+    let Some(dir) = target.parent() else {
+        return false;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    private(dir, 0o700);
+    let scratch = dir.join(format!(
+        "poster-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&scratch);
+    if std::fs::create_dir_all(&scratch).is_err() {
+        return false;
+    }
+    private(&scratch, 0o700);
+    let ran = Command::new("qlmanage")
+        .arg("-t")
+        .arg("-s")
+        .arg("640")
+        .arg("-o")
+        .arg(&scratch)
+        .arg(source)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let made = matches!(ran, Ok(status) if status.success())
+        .then(|| {
+            std::fs::read_dir(&scratch).ok().and_then(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .find(|path| path.is_file())
+            })
+        })
+        .flatten();
+    let landed = made.is_some_and(|path| std::fs::rename(&path, target).is_ok());
+    let _ = std::fs::remove_dir_all(&scratch);
+    if landed {
+        private(target, 0o600);
+    }
+    landed && target.is_file()
 }
 
 /// Turn `source` into a JPEG at `target` with `sips`, the converter macOS ships.
@@ -256,6 +347,47 @@ pub fn fit(pixels: (u32, u32), font: FontSize, max_cols: u16, max_rows: u16) -> 
     Some((fitted.0.min(max_cols), fitted.1.min(max_rows)))
 }
 
+/// A decoder for a file on disk, format guessed from the bytes.
+///
+/// Both decode sites go through this so they read the same file the same way,
+/// and so [`image::ImageDecoder::orientation`] — the EXIF tag an iPhone photo
+/// carries instead of rotated pixels — is available to both.
+fn decoder(path: &Path) -> Option<impl image::ImageDecoder> {
+    image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_decoder()
+        .ok()
+}
+
+/// The size a picture is once its EXIF orientation has been applied.
+///
+/// The quarter-turns swap width and height, which is why this and
+/// [`decode_oriented`] have to agree: [`fit`] reserves rows from this number
+/// and the drawing uses the rotated image.
+fn oriented_dimensions(path: &Path) -> Option<(u32, u32)> {
+    let mut decoder = decoder(path)?;
+    let (width, height) = decoder.dimensions();
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    Some(match orientation {
+        Orientation::Rotate90
+        | Orientation::Rotate270
+        | Orientation::Rotate90FlipH
+        | Orientation::Rotate270FlipH => (height, width),
+        _ => (width, height),
+    })
+}
+
+/// Decode a picture and turn it the way it was shot.
+fn decode_oriented(path: &Path) -> Option<image::DynamicImage> {
+    let mut decoder = decoder(path)?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut image = image::DynamicImage::from_decoder(decoder).ok()?;
+    image.apply_orientation(orientation);
+    Some(image)
+}
+
 /// What the cache knows about one attachment.
 enum Entry {
     /// The size is known; the protocol data has not been built yet.
@@ -291,11 +423,11 @@ pub struct Images {
     backend: Backend,
     picker: Option<Picker>,
     entries: RefCell<HashMap<Key, Entry>>,
-    /// HEIC conversions handed to the worker, so none is queued twice.
+    /// Conversions handed to the worker, so none is queued twice.
     queued: RefCell<Vec<i64>>,
     /// Encoded pictures in the order they were encoded, for eviction.
     encoded: RefCell<Vec<Key>>,
-    jobs: Option<Sender<(PathBuf, PathBuf)>>,
+    jobs: Option<Sender<(PathBuf, PathBuf, Prep)>>,
     /// Set by the worker when a conversion lands, so the app knows to measure
     /// the page again and let the picture in.
     arrived: Arc<AtomicBool>,
@@ -361,16 +493,20 @@ impl Images {
             ProtocolType::Halfblocks => Backend::Halfblocks,
         };
         let arrived = Arc::new(AtomicBool::new(false));
-        let (sender, receiver) = channel::<(PathBuf, PathBuf)>();
+        let (sender, receiver) = channel::<(PathBuf, PathBuf, Prep)>();
         let flag = Arc::clone(&arrived);
-        // `sips` is a process launch per picture. It happens off the UI thread
+        // `sips` and `qlmanage` are a process launch per picture. It happens off the UI thread
         // so a thread full of photos never stalls a keystroke; the flag is how
         // the finished work gets back onto the screen.
         let spawned = std::thread::Builder::new()
             .name("msgs-convert".to_string())
             .spawn(move || {
-                while let Ok((source, target)) = receiver.recv() {
-                    if convert(&source, &target) {
+                while let Ok((source, target, how)) = receiver.recv() {
+                    let made = match how {
+                        Prep::QuickLook => poster(&source, &target),
+                        _ => convert(&source, &target),
+                    };
+                    if made {
                         flag.store(true, Ordering::SeqCst);
                     }
                 }
@@ -402,12 +538,13 @@ impl Images {
 
     /// How many cells `attachment` gets, at a body `room` columns wide.
     ///
-    /// `None` means it is not drawn inline and stays a chip: not a picture, not
-    /// downloaded, a format nothing here can read, or a HEIC whose conversion
-    /// has not finished yet.
+    /// `None` means it is not drawn inline and stays a chip: not a picture or
+    /// a video, not downloaded, a format nothing here can read, or one whose
+    /// conversion has not finished yet.
     #[must_use]
     pub fn cells(&self, attachment: &AttachmentRef, room: u16) -> Option<(u16, u16)> {
-        if !self.backend.is_on() || !attachment.is_image() || attachment.hide_attachment {
+        let route = prep(attachment);
+        if !self.backend.is_on() || route == Prep::Skip || attachment.hide_attachment {
             return None;
         }
         let key = (attachment.rowid, room);
@@ -429,26 +566,26 @@ impl Images {
         let Some(source) = attachment.path().filter(|path| path.is_file()) else {
             return Entry::Unusable;
         };
-        if std::fs::metadata(&source).is_ok_and(|meta| meta.len() > MAX_DECODE_BYTES) {
-            return Entry::Unusable;
-        }
-        let readable = if needs_conversion(attachment) {
+        let route = prep(attachment);
+        let readable = if route == Prep::Direct {
+            source
+        } else {
             let Some(target) = converted_path(attachment) else {
                 return Entry::Unusable;
             };
             if !target.is_file() {
-                self.queue(attachment.rowid, source, target);
-                // Not a failure: the chip stands in until the JPEG lands.
+                self.queue(attachment.rowid, source, target, route);
+                // Not a failure: the chip stands in until the still lands.
                 return Entry::Unusable;
             }
             target
-        } else {
-            source
         };
-        let Ok(dimensions) = image::ImageReader::open(&readable)
-            .map_err(image::ImageError::IoError)
-            .and_then(image::ImageReader::into_dimensions)
-        else {
+        // The guard belongs to the file that is actually decoded: a video is
+        // routinely larger than the cap while its poster frame is tiny.
+        if std::fs::metadata(&readable).is_ok_and(|meta| meta.len() > MAX_DECODE_BYTES) {
+            return Entry::Unusable;
+        }
+        let Some(dimensions) = oriented_dimensions(&readable) else {
             return Entry::Unusable;
         };
         let columns = room.min(MAX_COLS);
@@ -458,8 +595,9 @@ impl Images {
         }
     }
 
-    /// Hand one HEIC to the converter thread, at most once per attachment.
-    fn queue(&self, rowid: i64, source: PathBuf, target: PathBuf) {
+    /// Hand one conversion to the converter thread, at most once per
+    /// attachment.
+    fn queue(&self, rowid: i64, source: PathBuf, target: PathBuf, how: Prep) {
         let Some(jobs) = self.jobs.as_ref() else {
             return;
         };
@@ -467,7 +605,7 @@ impl Images {
         if queued.contains(&rowid) {
             return;
         }
-        if jobs.send((source, target)).is_ok() {
+        if jobs.send((source, target, how)).is_ok() {
             queued.push(rowid);
         }
     }
@@ -528,15 +666,12 @@ impl Images {
         let Some(picker) = self.picker.as_ref() else {
             return;
         };
-        let source = if needs_conversion(attachment) {
-            converted_path(attachment).filter(|path| path.is_file())
-        } else {
+        let source = if prep(attachment) == Prep::Direct {
             attachment.path().filter(|path| path.is_file())
+        } else {
+            converted_path(attachment).filter(|path| path.is_file())
         };
-        let decoded = source
-            .and_then(|path| image::ImageReader::open(path).ok())
-            .and_then(|reader| reader.with_guessed_format().ok())
-            .and_then(|reader| reader.decode().ok());
+        let decoded = source.and_then(|path| decode_oriented(&path));
         let entry = decoded
             .and_then(|image| {
                 SlicedProtocol::new_with_resize(picker, image, size, Resize::Fit(None)).ok()
@@ -620,10 +755,47 @@ mod tests {
 
     #[test]
     fn only_heic_goes_through_sips() {
+        assert_eq!(prep(&attachment("image/heic", "IMG.HEIC")), Prep::Sips);
+        assert_eq!(prep(&attachment("image/heif", "IMG.heif")), Prep::Sips);
         assert!(needs_conversion(&attachment("image/heic", "IMG.HEIC")));
-        assert!(needs_conversion(&attachment("image/heif", "IMG.heif")));
         assert!(!needs_conversion(&attachment("image/jpeg", "IMG.jpg")));
         assert!(!needs_conversion(&attachment("image/png", "shot.png")));
+    }
+
+    #[test]
+    fn a_video_takes_the_quick_look_route_and_a_picture_does_not() {
+        assert_eq!(
+            prep(&attachment("video/quicktime", "clip.mov")),
+            Prep::QuickLook
+        );
+        assert_eq!(prep(&attachment("video/mp4", "clip.mp4")), Prep::QuickLook);
+        assert_eq!(prep(&attachment("image/jpeg", "IMG.jpg")), Prep::Direct);
+        assert_eq!(prep(&attachment("application/pdf", "a.pdf")), Prep::Skip);
+        assert_eq!(prep(&attachment("audio/x-caf", "note.caf")), Prep::Skip);
+        assert!(needs_conversion(&attachment("video/quicktime", "clip.mov")));
+    }
+
+    #[test]
+    fn a_poster_and_a_converted_photo_never_share_a_cache_name() {
+        let mut photo = attachment("image/heic", "IMG.HEIC");
+        photo.guid = "SAME".to_string();
+        let mut video = attachment("video/quicktime", "clip.mov");
+        video.guid = "SAME".to_string();
+        let photo = converted_path(&photo).expect("a cache path");
+        let video = converted_path(&video).expect("a cache path");
+        assert!(photo.ends_with("SAME.jpg"));
+        assert!(video.ends_with("SAME-poster.png"));
+        assert_ne!(photo, video);
+    }
+
+    #[test]
+    fn a_video_without_a_poster_yet_stays_a_chip() {
+        let images = Images::halfblocks();
+        // The fixture path does not exist, so no poster can have been made.
+        assert_eq!(
+            images.cells(&attachment("video/quicktime", "clip.mov"), 40),
+            None
+        );
     }
 
     #[test]
@@ -670,6 +842,67 @@ mod tests {
         let mut attachment = attachment("image/png", "shot.png");
         attachment.filename = Some(path.display().to_string());
         (dir, attachment)
+    }
+
+    /// A JPEG carrying nothing but an EXIF orientation tag, written by hand:
+    /// `image` can decode the tag but not write one. Synthetic pixels only.
+    fn jpeg_with_orientation(tag: &str, width: u32, height: u32, orientation: u16) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("msgs-media-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp directory");
+        let path = dir.join("shot.jpg");
+
+        let buffer =
+            image::ImageBuffer::from_pixel(width, height, image::Rgb::<u8>([90, 140, 190]));
+        let mut plain = Vec::new();
+        image::DynamicImage::from(buffer)
+            .write_to(
+                &mut std::io::Cursor::new(&mut plain),
+                image::ImageFormat::Jpeg,
+            )
+            .expect("an encoded jpeg");
+
+        // Little-endian TIFF header, one IFD entry: orientation, SHORT, count 1.
+        let mut exif = b"Exif\0\0".to_vec();
+        exif.extend_from_slice(b"II\x2a\x00\x08\x00\x00\x00");
+        exif.extend_from_slice(&1u16.to_le_bytes());
+        exif.extend_from_slice(&0x0112u16.to_le_bytes());
+        exif.extend_from_slice(&3u16.to_le_bytes());
+        exif.extend_from_slice(&1u32.to_le_bytes());
+        exif.extend_from_slice(&orientation.to_le_bytes());
+        exif.extend_from_slice(&[0, 0]);
+        exif.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut bytes = plain[..2].to_vec(); // SOI
+        bytes.extend_from_slice(&[0xff, 0xe1]);
+        let length = u16::try_from(exif.len() + 2).expect("a small segment");
+        bytes.extend_from_slice(&length.to_be_bytes());
+        bytes.extend_from_slice(&exif);
+        bytes.extend_from_slice(&plain[2..]);
+        std::fs::write(&path, bytes).expect("a written jpeg");
+        path
+    }
+
+    #[test]
+    fn a_quarter_turn_is_applied_and_measured_the_same_way() {
+        // Orientation 6 is a quarter turn: a wide picture is drawn tall.
+        let path = jpeg_with_orientation("rotate90", 60, 20, 6);
+        assert_eq!(oriented_dimensions(&path), Some((20, 60)));
+        let decoded = decode_oriented(&path).expect("a decoded picture");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (20, 60),
+            "the reserved size and the drawn size are the one number"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("a temp directory"));
+    }
+
+    #[test]
+    fn a_picture_shot_upright_is_left_alone() {
+        let path = jpeg_with_orientation("upright", 60, 20, 1);
+        assert_eq!(oriented_dimensions(&path), Some((60, 20)));
+        let decoded = decode_oriented(&path).expect("a decoded picture");
+        assert_eq!((decoded.width(), decoded.height()), (60, 20));
+        let _ = std::fs::remove_dir_all(path.parent().expect("a temp directory"));
     }
 
     #[test]

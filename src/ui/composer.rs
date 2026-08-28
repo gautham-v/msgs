@@ -132,32 +132,35 @@ pub fn render_info_row(frame: &mut Frame, app: &App, area: Rect) {
             ("Ctrl+R", "react"),
         ],
     };
-    frame.render_widget(Paragraph::new(hint_line(app, hints)), area);
+    frame.render_widget(Paragraph::new(hint_line(app, hints, area.width)), area);
 }
 
-/// `key label · key label` with the keys picked out.
-pub(crate) fn hint_line<'a>(app: &App, hints: &[(&'a str, &'a str)]) -> Line<'a> {
+/// `key label · key label` with the keys picked out, fitted to `columns`.
+pub(crate) fn hint_line<'a>(app: &App, hints: &[(&'a str, &'a str)], columns: u16) -> Line<'a> {
     let theme = &app.theme;
+    let fitted = super::format::fit_hints(hints, usize::from(columns));
     let mut spans = vec![Span::raw(" ")];
-    for (index, (keys, label)) in hints.iter().enumerate() {
+    for (index, (keys, label)) in fitted.into_iter().enumerate() {
         if index > 0 {
             spans.push(Span::styled(" · ", Style::new().fg(theme.gray_dim)));
         }
         spans.push(Span::styled(
-            *keys,
+            keys.into_owned(),
             Style::new()
                 .fg(theme.text_secondary)
                 .add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(*label, Style::new().fg(theme.gray)));
+        if let Some(label) = label {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(label, Style::new().fg(theme.gray)));
+        }
     }
     Line::from(spans)
 }
 
 /// The condensed shortcuts bar along the bottom of the screen.
-pub fn shortcut_bar_line(app: &App) -> Line<'static> {
-    hint_line(app, keymap::SHORTCUT_BAR)
+pub fn shortcut_bar_line(app: &App, columns: u16) -> Line<'static> {
+    hint_line(app, keymap::SHORTCUT_BAR, columns)
 }
 
 #[cfg(test)]

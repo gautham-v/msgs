@@ -388,6 +388,14 @@ fn check(cli: &Cli, warnings: &[String]) -> Result<()> {
         ),
     );
 
+    row(
+        "qlmanage",
+        &which("qlmanage").map_or_else(
+            || "not on PATH — videos stay chips".to_string(),
+            |path| path.display().to_string(),
+        ),
+    );
+
     for warning in warnings {
         row("warning", warning);
     }

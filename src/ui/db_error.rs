@@ -77,12 +77,13 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, err: &DbError) {
     }
 
     lines.push(Line::from(""));
+    let width = MAX_WIDTH.min(area.width);
     lines.push(super::composer::hint_line(
         app,
         &[("r", "retry"), ("?", "help"), ("q", "quit")],
+        width.saturating_sub(2),
     ));
 
-    let width = MAX_WIDTH.min(area.width);
     // Two rows of border plus the text, or as much of it as fits.
     let height = (u16::try_from(lines.len())
         .unwrap_or(u16::MAX)

@@ -12,7 +12,7 @@ use chrono::Local;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
-use crate::config::Config;
+use crate::config::{Config, MIN_WIDTH_FOR_CHAT_LIST};
 use crate::contacts::Contacts;
 use crate::db::{AttachmentRef, Chat, Db, DbError, MAX_PAGE, Message, PAGE, Source};
 use crate::jump::{self, Jump};
@@ -1580,9 +1580,10 @@ impl App {
                 // screen; only what someone else added is news.
                 self.new_below += refreshed.appended.saturating_sub(refreshed.claimed);
             }
-            // The chat list's preview line and ordering moved with it.
-            self.reload_chats();
         }
+        // Anything the database did to the open thread — a row on the end, an
+        // edit, an unsend, a tapback — also changed its row in the list.
+        self.reload_chats();
         true
     }
 
@@ -1744,6 +1745,11 @@ impl App {
         if self.db_error.is_some() && !self.focus.is_overlay() {
             return Focus::DbError;
         }
+        // A terminal narrowed under a focused chat list leaves the focus on a
+        // pane that is no longer drawn; the keys go to what is on screen.
+        if self.focus == Focus::ChatList && !self.chat_list_visible() {
+            return Focus::Conversation;
+        }
         if self.focus == Focus::ChatList && self.chat_filter.is_some() {
             Focus::Composer
         } else {
@@ -1754,7 +1760,7 @@ impl App {
     /// Panes that can hold focus right now, in `Tab` order.
     fn focus_cycle(&self) -> Vec<Focus> {
         let mut cycle = Vec::with_capacity(3);
-        if self.show_chat_list {
+        if self.chat_list_visible() {
             cycle.push(Focus::ChatList);
         }
         cycle.push(Focus::Conversation);
@@ -2037,7 +2043,28 @@ impl App {
         self.draft_target = None;
     }
 
+    /// Whether the chat list is actually on screen: the toggle *and* enough
+    /// room for it. `Panes::default()` is width 0, before the first frame, so
+    /// the intent stands in until a real layout has been computed.
+    pub fn chat_list_visible(&self) -> bool {
+        if self.panes.status.width == 0 {
+            return self.show_chat_list;
+        }
+        self.show_chat_list && self.panes.status.width >= MIN_WIDTH_FOR_CHAT_LIST
+    }
+
+    fn too_narrow_for_the_chat_list(&self) -> bool {
+        self.panes.status.width > 0 && self.panes.status.width < MIN_WIDTH_FOR_CHAT_LIST
+    }
+
     fn toggle_chat_list(&mut self) {
+        if self.too_narrow_for_the_chat_list() {
+            // Flipping a flag the layout would override reads as a dead key.
+            self.status.toast(format!(
+                "the chat list needs {MIN_WIDTH_FOR_CHAT_LIST} columns"
+            ));
+            return;
+        }
         self.show_chat_list = !self.show_chat_list;
         if !self.show_chat_list {
             self.chat_filter = None;
@@ -2198,7 +2225,7 @@ impl App {
                 }
             }
             Focus::Conversation => {
-                if self.show_chat_list {
+                if self.chat_list_visible() {
                     self.focus = Focus::ChatList;
                 }
             }
@@ -2207,6 +2234,12 @@ impl App {
     }
 
     fn start_filter(&mut self) {
+        if self.too_narrow_for_the_chat_list() {
+            self.status.toast(format!(
+                "the chat list needs {MIN_WIDTH_FOR_CHAT_LIST} columns"
+            ));
+            return;
+        }
         if !self.show_chat_list {
             self.show_chat_list = true;
         }
@@ -2237,8 +2270,19 @@ impl App {
     ///
     /// Everything that can go wrong becomes a status line here rather than at
     /// each caller, and the path itself never reaches a log.
-    fn openable_attachment(&mut self) -> Option<PathBuf> {
-        let Some(attachment) = self.selected_attachment() else {
+    /// `which` is `None` for the first non-hidden attachment (what `o` and `s`
+    /// act on) or `Some(index)` for one the pointer landed on.
+    fn openable_attachment(&mut self, which: Option<usize>) -> Option<PathBuf> {
+        let found = match which {
+            None => self.selected_attachment(),
+            Some(index) => self.selected_message().and_then(|message| {
+                message
+                    .attachments
+                    .get(index)
+                    .filter(|attachment| !attachment.hide_attachment)
+            }),
+        };
+        let Some(attachment) = found else {
             self.status.toast("no attachment on the selected message");
             return None;
         };
@@ -2255,7 +2299,12 @@ impl App {
 
     /// `o`: hand the selected attachment to `open`.
     fn open_attachment(&mut self) {
-        let Some(path) = self.openable_attachment() else {
+        self.open_attachment_at(None);
+    }
+
+    /// `o`, or a click on a picture, which names the attachment it landed on.
+    fn open_attachment_at(&mut self, which: Option<usize>) {
+        let Some(path) = self.openable_attachment(which) else {
             return;
         };
         match crate::shell::open_path(&path) {
@@ -2270,7 +2319,7 @@ impl App {
     ///
     /// A copy out, never a move, and never a write anywhere near `chat.db`.
     fn save_attachment(&mut self) {
-        let Some(path) = self.openable_attachment() else {
+        let Some(path) = self.openable_attachment(None) else {
             return;
         };
         match media::save_to_downloads(&path) {
@@ -2636,6 +2685,10 @@ impl App {
                 .map(ToString::to_string)
             {
                 self.open_link(&url);
+            } else if let Some((index, attachment)) = self.hits.image_at(position.x, position.y) {
+                // A click on a drawn picture does what `o` does to it.
+                self.messages.selected = index;
+                self.open_attachment_at(Some(attachment));
             } else if let Some(index) = self.hits.message_at(self.panes.conversation, position.y) {
                 self.messages.selected = index;
             }
@@ -2842,6 +2895,44 @@ mod tests {
     }
 
     #[test]
+    fn tab_skips_a_chat_list_the_terminal_is_too_narrow_to_draw() {
+        // The flag says the reader wants it, but nothing is drawn there.
+        let mut app = app();
+        app.panes.status.width = MIN_WIDTH_FOR_CHAT_LIST - 1;
+        app.focus = Focus::Conversation;
+        assert!(app.show_chat_list);
+        app.update(Action::FocusNext);
+        assert_eq!(app.focus, Focus::Composer);
+        app.update(Action::FocusNext);
+        assert_eq!(app.focus, Focus::Conversation);
+    }
+
+    #[test]
+    fn keys_leave_a_chat_list_the_terminal_narrowed_out_from_under() {
+        // Focused while there was room, then the terminal shrank.
+        let mut app = app();
+        app.focus = Focus::ChatList;
+        app.panes.status.width = MIN_WIDTH_FOR_CHAT_LIST - 1;
+        assert_eq!(app.key_focus(), Focus::Conversation);
+        app.panes.status.width = MIN_WIDTH_FOR_CHAT_LIST;
+        assert_eq!(app.key_focus(), Focus::ChatList);
+    }
+
+    #[test]
+    fn a_narrow_terminal_explains_the_toggle_instead_of_flipping_it() {
+        let mut app = app();
+        app.panes.status.width = MIN_WIDTH_FOR_CHAT_LIST - 1;
+        assert!(app.show_chat_list);
+
+        app.update(Action::ToggleChatList);
+        assert!(app.show_chat_list);
+        assert!(!app.chat_list_visible());
+        let (text, is_error) = app.status.active_toast().expect("a toast explains it");
+        assert!(text.contains(&MIN_WIDTH_FOR_CHAT_LIST.to_string()));
+        assert!(!is_error);
+    }
+
+    #[test]
     fn overlays_return_focus_where_it_was() {
         let mut app = app();
         app.update(Action::FocusNext);
@@ -3018,6 +3109,7 @@ mod tests {
         app.hits = Hits {
             rows: (0..20).map(|row| Some(row / 2)).collect(),
             links: Vec::new(),
+            images: Vec::new(),
             pill: None,
         };
 
@@ -3030,6 +3122,50 @@ mod tests {
 
         assert_eq!(app.focus, Focus::Conversation);
         assert_eq!(app.messages.selected, 3);
+    }
+
+    #[test]
+    fn clicking_a_picture_selects_its_message_and_opens_it() {
+        let mut app = with_measured_conversation(2);
+        let mut row = message_row("IMG-0001");
+        row.attachments = vec![AttachmentRef {
+            rowid: 9,
+            guid: "ATT-0001".to_string(),
+            message_rowid: 5,
+            // A path that is not on this Mac, so the click stops at the toast
+            // instead of handing anything to `open`.
+            filename: Some("~/Library/Messages/Attachments/invented.heic".to_string()),
+            mime_type: Some("image/heic".to_string()),
+            uti: Some("public.heic".to_string()),
+            transfer_name: Some("invented.heic".to_string()),
+            total_bytes: 0,
+            transfer_state: 5,
+            is_sticker: false,
+            hide_attachment: false,
+        }];
+        app.message_rows = vec![message_row("TXT-0001"), row];
+        app.hits = Hits {
+            rows: (0..20).map(|row| Some(row / 2)).collect(),
+            links: Vec::new(),
+            images: vec![crate::ui::conversation::ImageHit {
+                rect: Rect::new(34, 5, 10, 6),
+                message: 1,
+                attachment: 0,
+            }],
+            pill: None,
+        };
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 36,
+            row: 7,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.focus, Focus::Conversation);
+        assert_eq!(app.messages.selected, 1, "the picture's own message");
+        let (text, _) = app.status.active_toast().expect("a toast explains it");
+        assert!(text.contains(media::NOT_DOWNLOADED), "{text}");
     }
 
     #[test]

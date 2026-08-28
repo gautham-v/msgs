@@ -18,7 +18,7 @@ use ratatui::text::{Line, Span};
 
 use crate::contacts::Contacts;
 use crate::db::message::split_association;
-use crate::db::{AttachmentRef, Chat, GroupAction, Message, Tapback};
+use crate::db::{AttachmentKind, AttachmentRef, Chat, GroupAction, Message, Tapback};
 use crate::media::{Images, NOT_DOWNLOADED};
 use crate::send::{Delivery, Pending, PendingTapback};
 use crate::theme::Theme;
@@ -401,14 +401,23 @@ pub fn block(ctx: &Ctx<'_>, index: usize, columns: u16) -> Block {
 
 /// What the meta line says about the pictures drawn above it:
 /// `IMG_4412.jpg · 2.1 MB`, or `3 photos` when a message carried several.
+///
+/// A video's still is marked with the video glyph, so a poster frame is not
+/// read as a photo.
 fn inline_note(attachment: &AttachmentRef, drawn: usize) -> String {
     if drawn > 1 {
         return format!("{drawn} photos");
     }
+    let kind = attachment.kind();
     let name = attachment
         .display_name()
         .filter(|name| !name.is_empty())
-        .map_or_else(|| "Photo".to_string(), ToString::to_string);
+        .map_or_else(|| kind.label().to_string(), ToString::to_string);
+    let name = if kind == AttachmentKind::Video {
+        format!("{} {name}", kind.glyph())
+    } else {
+        name
+    };
     if attachment.total_bytes > 0 {
         return format!("{name} · {}", bytes(attachment.total_bytes));
     }

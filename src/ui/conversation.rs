@@ -221,6 +221,17 @@ pub struct LinkHit {
     pub url: String,
 }
 
+/// A picture as it was drawn on the last frame, in terminal coordinates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageHit {
+    /// The cells it covers on screen, clipped to the pane.
+    pub rect: Rect,
+    /// Index of the message it belongs to, in `App::message_rows`.
+    pub message: usize,
+    /// Index of the attachment on that message.
+    pub attachment: usize,
+}
+
 /// What the last frame put where, so a click can act on it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Hits {
@@ -228,6 +239,8 @@ pub struct Hits {
     pub rows: Vec<Option<usize>>,
     /// Links drawn on the pane.
     pub links: Vec<LinkHit>,
+    /// Pictures drawn on the pane.
+    pub images: Vec<ImageHit>,
     /// Where the `↓ N new` pill was drawn, when one was.
     pub pill: Option<Rect>,
 }
@@ -256,6 +269,15 @@ impl Hits {
             .iter()
             .find(|hit| hit.y == row && column >= hit.start && column < hit.end)
             .map(|hit| hit.url.as_str())
+    }
+
+    /// The `(message, attachment)` of the picture under an absolute cell.
+    #[must_use]
+    pub fn image_at(&self, column: u16, row: u16) -> Option<(usize, usize)> {
+        self.images
+            .iter()
+            .find(|hit| hit.rect.contains(Position::new(column, row)))
+            .map(|hit| (hit.message, hit.attachment))
     }
 }
 
@@ -522,6 +544,26 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
                 .unwrap_or_default();
             app.images
                 .render(frame.buffer_mut(), strip, offset, attachment, room);
+
+            // Where it actually landed, so a click can open it. The rect comes
+            // from the very numbers the block reserved and `render` drew into,
+            // clipped to the pane rather than measured again.
+            let bottom = (top + i32::from(spot.rows)).min(i32::from(area.y + area.height));
+            let visible_top = top.max(i32::from(area.y));
+            if bottom > visible_top {
+                let y = u16::try_from(visible_top).unwrap_or(area.y);
+                let height = u16::try_from(bottom - visible_top).unwrap_or_default();
+                hits.images.push(ImageHit {
+                    rect: Rect {
+                        x: strip.x,
+                        y,
+                        width: strip.width,
+                        height,
+                    },
+                    message: entry.index,
+                    attachment: spot.attachment,
+                });
+            }
         }
 
         for link in &block.links {
@@ -690,6 +732,33 @@ fn render_new_pill(frame: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_at_finds_the_picture_under_a_cell_and_nothing_beside_it() {
+        let hits = Hits {
+            images: vec![
+                ImageHit {
+                    rect: Rect::new(10, 4, 8, 5),
+                    message: 2,
+                    attachment: 0,
+                },
+                ImageHit {
+                    rect: Rect::new(10, 9, 8, 5),
+                    message: 2,
+                    attachment: 1,
+                },
+            ],
+            ..Hits::default()
+        };
+
+        assert_eq!(hits.image_at(10, 4), Some((2, 0)));
+        assert_eq!(hits.image_at(17, 8), Some((2, 0)));
+        assert_eq!(hits.image_at(12, 9), Some((2, 1)));
+        // One cell past each edge is not the picture.
+        assert_eq!(hits.image_at(18, 6), None);
+        assert_eq!(hits.image_at(12, 3), None);
+        assert_eq!(hits.image_at(12, 14), None);
+    }
 
     /// Six messages: two rows, then three, then two, and so on.
     fn heights() -> Vec<u16> {
