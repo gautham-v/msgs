@@ -127,13 +127,12 @@ fn store(name: &str, drawn: &str) {
          rerun with TZ=UTC UPDATE_SCREENSHOT=1 and check the README block"
     );
 
-    // The README embeds the same frame, and a stale block there is the thing
-    // this test exists to prevent.
-    let readme = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
-        .expect("read the README");
+    // The manual embeds the same frame, and a stale block there is the thing
+    // this test exists to prevent. (The README may carry it too, or a video.)
+    let manual = std::fs::read_to_string(docs("MANUAL.md")).expect("read the manual");
     assert!(
-        readme.contains(drawn.trim_end()),
-        "the block in README.md is not docs/{name} any more"
+        manual.contains(drawn.trim_end()),
+        "the block in docs/MANUAL.md is not docs/{name} any more"
     );
 }
 

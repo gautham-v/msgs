@@ -20,8 +20,9 @@ Rust + ratatui terminal client for iMessage on macOS.
 - `src/contacts.rs` — names for handles: the macOS AddressBook stores read read-only, normalized phone/email keys, and the stamped cache at `~/Library/Application Support/msgs/contacts.json`; `Contacts::apply` hangs a `Name` on every `Handle`, which is how names reach every pane at once
 - `src/jump.rs` — what the `Ctrl+K` palette matches and shows: the filter, fuzzy chat/people matching (`nucleo-matcher`), and the result rows with their highlight ranges
 - `docs/mockups.html` — the design target; match it
-- `docs/screenshot.txt` — the frame the README embeds, written by `tests/screenshot.rs` from the synthetic fixture (`TZ=UTC UPDATE_SCREENSHOT=1 cargo test --test screenshot` regenerates it, and it also checks the block embedded in the README); never a frame of a real `chat.db`
-- `tests/docs.rs` — the README's key tables against `keymap::BINDINGS`, in both directions, so a binding cannot be added to one and not the other
+- `docs/screenshot.txt` — the frame `docs/MANUAL.md` (and the README, until a video replaces it) embeds, written by `tests/screenshot.rs` from the synthetic fixture (`TZ=UTC UPDATE_SCREENSHOT=1 cargo test --test screenshot` regenerates it, and it also checks the block embedded in the manual); never a frame of a real `chat.db`
+- `docs/MANUAL.md` — the long-form docs; the README stays short
+- `tests/docs.rs` — the README's key table against `keymap::BINDINGS`, in both directions, so a binding cannot be added to one and not the other
 - `tests/perf.rs` — the budgets, against `fixtures::perf_database` (200k invented messages): cold start under 300ms, a keystroke-to-frame under 16.6ms, a page under 25ms, under 150MB resident. Stated for `--release`; a debug run gets `SLACK`× the number
 - `packaging/msgs.rb` — Homebrew formula stub; URL and sha256 are placeholders until a `v*` tag is pushed
 - `.github/workflows/` — `ci.yml` (fmt, clippy, build, test, `--check` on macOS) and `release.yml` (both targets, `lipo` into a universal binary, tarball plus checksum on a `v*` tag)
