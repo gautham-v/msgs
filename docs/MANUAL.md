@@ -94,10 +94,11 @@ Flags:
 | `--no-mouse` | do not capture the mouse |
 | `--theme <NAME>` | `dark`, `light`, `system`, or `terminal`; overrides `base` in the config's `[theme]` |
 | `--redact` | mask phone numbers and addresses on screen (`+1 (•••) •••-••39`), for a demo or a screenshot; names and message bodies still show |
-| `--check` | print a readiness report (Full Disk Access, database, row counts, unread, read state, live updates, Messages.app and whether it is running, `osascript`, `imsg`, search index, contacts, terminal graphics) and exit |
+| `--check` | print a readiness report (Full Disk Access, database, row counts, unread, read state, live updates, Messages.app and whether it is running, `osascript`, `imsg`, search index, contacts, pins, terminal graphics) and exit |
 | `--no-index` | do not build or use the full-text message index |
 | `--no-images` | do not draw pictures inline; show every attachment as a chip |
 | `--no-contacts` | do not read Contacts; show numbers and addresses instead of names |
+| `--no-pins` | do not read Messages.app's pinned conversations; list every chat by recency |
 | `--version` | print the version |
 
 ## Keys
@@ -348,6 +349,36 @@ Mac — the status line says so once, and every handle falls back to its
 pretty-printed address. `--no-contacts`, or `contacts = false` in the config,
 turns the whole thing off.
 
+## Pinned conversations
+
+The chats you pinned in Messages.app sit at the top of the list, under a
+`PINNED` heading, with a middle dot in the gutter before the name so a pinned
+row is still recognisable once you have scrolled past the heading. Inside each
+section the order is the one the rest of the list uses: newest first.
+
+The pins are not in `chat.db`. Every macOS to date leaves that database without
+an `is_pinned` column at all, and Messages keeps the state in its own preference
+file, `~/Library/Preferences/com.apple.messages.pinning.plist`. msgs reads that
+file — read-only, never written, never copied — on startup and again on every
+reload of the chat list, and tells the live-update watcher about it too, so a pin
+made in Messages while msgs is open lands on the screen within a second.
+
+Inside the file, a pinned person is a plain address and a pinned group is a
+hex-encoded identifier with a small table behind it. An address is matched the
+way Contacts entries are matched, so a number pinned as `(555) 000-0132` still
+finds a chat stored as `+15550000132`; a group is matched against the ids the
+chat row carries, of which `original_group_id` is the one that answers. A group
+whose identifier has been rotated since it was pinned — a thread re-created, a
+Mac restored — is simply not found, and stays in the recent section rather than
+being guessed at.
+
+Nothing about this can change what Messages itself shows: msgs never writes the
+file, so pinning and unpinning still happen in Messages.app. A Mac that has
+never pinned anything has no such file, which is not a problem and not a
+warning; a file that will not parse leaves one line in the notes under `?` and
+the list is ordered by recency alone. `--no-pins`, or `pins = false` in the
+config, turns the whole thing off.
+
 ## Live updates
 
 msgs keeps up with `chat.db` without Messages.app open. A `notify` watcher sits
@@ -366,10 +397,9 @@ by pressing `G`. A message in some other thread moves that chat to the top of
 the list and updates its preview and unread mark, and the chat-list selection
 follows the conversation you were in rather than the row number it was at.
 
-Pinned conversations are shown as their own section when the database records
-pinning. macOS keeps that in Messages.app's preferences rather than in
-`chat.db`, so on every current system the list is one flat run of chats,
-newest first.
+The watcher also has Messages.app's pin preference file on its list, so pinning
+or unpinning a conversation over there re-sorts the list here without a
+keystroke. See [Pinned conversations](#pinned-conversations).
 
 ## Read state
 
@@ -491,6 +521,7 @@ page_step = 10           # rows PageUp / PageDown move a list by
 mouse = true             # --no-mouse overrides this
 images = true            # draw pictures inline; --no-images overrides this
 contacts = true          # read Contacts for names; --no-contacts overrides this
+pins = true              # read Messages.app's pinned chats; --no-pins overrides this
 
 [theme]
 base = "dark"            # "light", "system" to follow macOS, or "terminal" to match the terminal
@@ -510,6 +541,7 @@ Every key, what it does, and what overrides it:
 | `mouse` | `true` | bool | capture the mouse; `--no-mouse` overrides it to `false` |
 | `images` | `true` | bool | draw pictures inline; `--no-images` overrides it to `false` |
 | `contacts` | `true` | bool | read Contacts for names; `--no-contacts` overrides it to `false` |
+| `pins` | `true` | bool | read Messages.app's pinned conversations so pinned chats come first; `--no-pins` overrides it to `false` |
 | `[theme] base` | `dark` | `dark`, `light`, `system`, `terminal` | the palette to start from; `--theme` overrides it and `Ctrl+T` cycles it at runtime |
 | `[theme]` | — | color per slot | any slot below, as `"#rrggbb"`, `"#rgb"`, or an ANSI index `0`–`255`, applied on top of `base` |
 
@@ -589,10 +621,12 @@ Some of these are macOS's and some are msgs's, and it is worth knowing which.
 - **No editing and no unsending.** AppleScript can do neither. An edit made on
   another device is read like any other change and the message says `· Edited`;
   msgs cannot make one.
-- **No pinned conversations.** macOS keeps pinning in Messages.app's
-  preferences rather than in `chat.db`, so the list is one flat run of chats.
-  The `Pinned` / `Recent` headings exist for a database that has the column,
-  which no macOS to date does.
+- **Pinning is read, never set.** The pins come out of Messages.app's own
+  preference file, which msgs only reads; pinning and unpinning still happen in
+  Messages.app. A pinned group whose identifier has been rotated since — a
+  thread re-created, a Mac restored — is not recognised and stays in the recent
+  section, and Messages's own left-to-right pin order is not kept: pinned chats
+  are sorted newest first like everything else.
 - **No group management** — no renaming, no adding or removing people — and no
   deleting a message or a thread. Group events are read and drawn.
 - **Sending needs Messages.app** signed in and `osascript` available. msgs

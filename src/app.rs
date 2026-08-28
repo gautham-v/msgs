@@ -5,7 +5,7 @@
 //! Nothing else touches state, so behavior stays testable without a terminal.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::Local;
@@ -17,6 +17,7 @@ use crate::contacts::Contacts;
 use crate::db::{AttachmentRef, Chat, Db, DbError, MAX_PAGE, Message, PAGE, Source};
 use crate::jump::{self, Jump};
 use crate::media::{self, Images};
+use crate::pins::Pins;
 use crate::search::{self, Search};
 use crate::seen::Seen;
 use crate::send::{
@@ -652,6 +653,10 @@ pub struct App {
     /// Names for handles. [`Contacts::empty`] until something reads the macOS
     /// Contacts stores, which is how the tests run.
     pub contacts: Contacts,
+    /// Which chats Messages.app has pinned. [`Pins::off`] until something reads
+    /// the preference file, which is how the tests run: nothing under `tests/`
+    /// reads the user's own pins.
+    pub pins: Pins,
     /// The local read state: how much of each chat's unread has already been
     /// on screen here. [`Seen::off`] until something asks for it, which is how
     /// the tests run and what keeps them out of the user's home.
@@ -735,6 +740,7 @@ impl App {
             last_snapshot: None,
             images: Images::off(),
             contacts: Contacts::empty(),
+            pins: Pins::off(),
             seen: Seen::off(),
             presence: Presence::off(),
             seen_path: None,
@@ -811,6 +817,11 @@ impl App {
         }
         if self.contacts_from_stores && self.contacts.status().warning().is_some() {
             self.enable_contacts_from_stores();
+        }
+        if let Some(path) = self.pins.path().map(Path::to_path_buf) {
+            // Re-opening the database started a new watcher, which has never
+            // heard of the preference file.
+            self.watcher.also(&path);
         }
         if let Some(seen) = self.seen_path.clone() {
             self.enable_seen(&seen);
@@ -940,6 +951,53 @@ impl App {
         self.enable_contacts(Contacts::load());
     }
 
+    /// Take the pinned conversations Messages.app keeps in its preferences.
+    ///
+    /// Read-only and never fatal: a file that is not there pins nothing, and a
+    /// file that will not parse leaves one line in the startup warnings and
+    /// pins nothing. Everything already loaded is re-sorted, so this can be
+    /// called before or after the database is opened.
+    pub fn enable_pins(&mut self, pins: Pins) {
+        if let Some(warning) = pins.status().warning()
+            && !self.status.warnings.contains(&warning)
+        {
+            self.status.warnings.push(warning.clone());
+            if self.status.active_toast().is_none() {
+                self.status.error(warning);
+            }
+        }
+        self.pins = pins;
+        // A pin made in Messages while msgs is open is a write to that file and
+        // nothing else, so the live-update watcher is told about it too.
+        if let Some(path) = self.pins.path().map(Path::to_path_buf) {
+            self.watcher.also(&path);
+        }
+        self.apply_pins();
+        self.refresh_anchored(true, self.selected_chat().map(|chat| chat.rowid));
+    }
+
+    /// Read this Mac's own pin state and take the pins from it.
+    ///
+    /// The only caller is the binary; the tests hand over [`Pins::from_entries`]
+    /// through [`App::enable_pins`] instead, so nothing under `tests/` reads
+    /// the user's preferences.
+    pub fn enable_pins_from_preferences(&mut self) {
+        let pins = Pins::default_path().map_or_else(Pins::off, |path| Pins::load(&path));
+        self.enable_pins(pins);
+    }
+
+    /// Say which chats are pinned, then put the list back in pinned-first order.
+    ///
+    /// The pin state is not a column of `chat.db`, so the ordering the query
+    /// could not do is done here — after [`crate::pins::Pins::apply`] and
+    /// nowhere else — and a database that does record pinning in SQL keeps the
+    /// answer it already had.
+    fn apply_pins(&mut self) {
+        self.pins.reload();
+        self.pins.apply(&mut self.chat_rows);
+        crate::db::chat::sort(&mut self.chat_rows);
+    }
+
     /// Start keeping local read state at `path`.
     ///
     /// Off until something asks for it, which is how the tests run: nothing
@@ -1054,6 +1112,10 @@ impl App {
                 // the participants.
                 self.contacts.apply(&mut chats);
                 self.chat_rows = chats;
+                // Messages.app's pins, out of its preference file, and the
+                // pinned-first order the query could not give the list because
+                // the pin state is not a column of `chat.db`.
+                self.apply_pins();
                 // The local read state is laid over the database's counts the
                 // same way names are laid over the handles: once, here, so
                 // every pane and the status line read one number.
@@ -3394,6 +3456,8 @@ mod tests {
             rowid: 1,
             guid: "iMessage;-;+15550000000".to_string(),
             identifier: Some("+15550000000".to_string()),
+            group_id: None,
+            original_group_id: None,
             display_name: None,
             service: Some("iMessage".to_string()),
             style: 45,

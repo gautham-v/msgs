@@ -36,6 +36,9 @@ pub struct Config {
     /// Read the macOS Contacts stores so handles become names.
     /// `--no-contacts` overrides this to `false`.
     pub contacts: bool,
+    /// Read Messages.app's pinned conversations so pinned chats come first.
+    /// `--no-pins` overrides this to `false`.
+    pub pins: bool,
     /// The `[theme]` table: `base = "light"` picks a palette, and any other
     /// key is a per-slot color override, e.g. `accent_me = "#ff8800"`.
     #[serde(default)]
@@ -51,6 +54,7 @@ impl Default for Config {
             mouse: true,
             images: true,
             contacts: true,
+            pins: true,
             theme: BTreeMap::new(),
         }
     }
@@ -149,6 +153,7 @@ mod tests {
             page_step = 5
             mouse = false
             contacts = false
+            pins = false
 
             [theme]
             base = "light"
@@ -162,6 +167,7 @@ mod tests {
         assert_eq!(config.page_step, 5);
         assert!(!config.mouse);
         assert!(!config.contacts);
+        assert!(!config.pins);
         assert_eq!(
             config.theme.get("accent_me").map(String::as_str),
             Some("#ff8800")

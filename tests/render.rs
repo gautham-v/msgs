@@ -432,6 +432,8 @@ fn chat(rowid: i64, name: &str, minutes_ago: i64, preview: &str) -> Chat {
         rowid,
         guid: format!("iMessage;-;chat{rowid}"),
         identifier: Some(format!("chat{rowid}")),
+        group_id: None,
+        original_group_id: None,
         display_name: Some(name.to_string()),
         service: Some("iMessage".to_string()),
         style: 45,

@@ -865,6 +865,8 @@ mod tests {
             rowid: 1,
             guid: "iMessage;-;chat1".to_string(),
             identifier: Some("chat1".to_string()),
+            group_id: None,
+            original_group_id: None,
             display_name: None,
             service: Some("iMessage".to_string()),
             style: if is_group { 43 } else { 45 },

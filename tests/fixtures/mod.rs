@@ -27,6 +27,13 @@ pub const CHAT_DIRECT: i64 = 1;
 pub const CHAT_GROUP: i64 = 2;
 pub const CHAT_EMPTY: i64 = 3;
 
+/// `chat.original_group_id` of [`CHAT_GROUP`], which is what Messages.app's
+/// pin state refers to a group by. Invented, like every other id here.
+pub const GROUP_ORIGINAL_ID: &str = "9F1C0A72-0000-4000-8000-00000000FEED";
+
+/// The address behind [`CHAT_DIRECT`], for a test that pins a person.
+pub const DIRECT_ADDRESS: &str = "+15550000001";
+
 /// Message rowids worth naming.
 pub const MSG_PLAIN: i64 = 1;
 pub const MSG_ATTRIBUTED: i64 = 2;
@@ -331,6 +338,12 @@ fn build(path: &Path) -> rusqlite::Result<()> {
         Some("Fixture Group"),
     )?;
     chat(&conn, CHAT_EMPTY, "iMessage;-;+15550000009", 45, None)?;
+    // Messages.app's pin state names a group by this, not by its rowid or its
+    // guid; the value is invented like everything else here.
+    conn.execute(
+        "UPDATE chat SET original_group_id = ?1 WHERE ROWID = ?2",
+        rusqlite::params![GROUP_ORIGINAL_ID, CHAT_GROUP],
+    )?;
 
     for (chat_id, handle_id) in [
         (CHAT_DIRECT, HANDLE_ALEX),
@@ -634,6 +647,51 @@ pub const CONTACT_ALEX: (&str, &str, &str) = ("+1 (555) 000-0001", "Alex", "Naka
 pub const CONTACT_BAILEY: (&str, &str, &str) = ("555-000-0002", "Bailey", "Okonkwo");
 pub const CONTACT_CASEY: (&str, &str, &str) = ("Casey@Example.Invalid", "Casey", "Lindqvist");
 
+/// Build a synthetic `com.apple.messages.pinning.plist` in `dir`.
+///
+/// The keys are the ones Messages.app actually writes — `pD`, `pP`, `pZ`, and
+/// the `o` / `h` behind a group — so the parser under test is the parser that
+/// will run against a real Mac, but every address and identifier here is
+/// invented and no test ever opens `~/Library/Preferences`.
+///
+/// `handles` are pinned people, written as plain addresses. `groups` are
+/// `(name, original_group_id)`: the name is hex-encoded into the `pP` entry the
+/// way Messages encodes a group's identifier, and the id is what a chat's
+/// `original_group_id` has to equal for the group to be found.
+pub fn pinning_plist(dir: &Path, handles: &[&str], groups: &[(&str, &str)]) -> PathBuf {
+    std::fs::create_dir_all(dir).expect("preferences directory");
+    let path = dir.join("com.apple.messages.pinning.plist");
+
+    let hex = |text: &str| -> String { text.bytes().map(|byte| format!("{byte:02X}")).collect() };
+    let mut pinned = String::new();
+    for handle in handles {
+        pinned.push_str(&format!("        <string>{handle}</string>\n"));
+    }
+    let mut table = String::new();
+    for (name, original) in groups {
+        let key = hex(name);
+        pinned.push_str(&format!("        <string>{key}</string>\n"));
+        table.push_str(&format!(
+            "        <key>{key}</key>\n        <dict>\n          \
+             <key>o</key><string>{original}</string>\n          \
+             <key>h</key><string>{}</string>\n        </dict>\n",
+            hex(&format!("digest of {name}"))
+        ));
+    }
+
+    let text = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+         \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n  <key>pD</key>\n  <dict>\n    <key>pP</key>\n    <array>\n\
+         {pinned}    </array>\n    <key>pZ</key>\n    <dict>\n\
+         {table}    </dict>\n  </dict>\n</dict>\n</plist>\n"
+    );
+    std::fs::write(&path, text).expect("write the pinning fixture");
+    path
+}
+
 /// Build a synthetic macOS Contacts store at `dir/AddressBook-v22.abcddb`.
 ///
 /// The tables carry the column names Core Data actually uses, so the queries
@@ -768,6 +826,7 @@ CREATE TABLE chat (
     is_archived INTEGER DEFAULT 0,
     display_name TEXT,
     group_id TEXT,
+    original_group_id TEXT,
     last_read_message_timestamp INTEGER DEFAULT 0
 );
 

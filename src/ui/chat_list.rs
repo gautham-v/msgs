@@ -287,7 +287,7 @@ fn name_line<'a>(
     let padding = name_width.saturating_sub(width(&name));
 
     let mut spans = vec![
-        Span::raw(" ".repeat(GUTTER)),
+        Span::styled(gutter(chat), Style::new().fg(theme.gray)),
         Span::styled(name, name_style(theme, unread, selected)),
         Span::raw(" ".repeat(padding)),
     ];
@@ -321,6 +321,23 @@ fn preview_row<'a>(theme: &Theme, chat: &Chat, selected: bool, columns: usize) -
         Span::styled(body, Style::new().fg(body_color)),
     ])
 }
+
+/// The [`GUTTER`] before a name, with a pinned chat's marker in it.
+///
+/// A pinned chat is already under its own heading, so the marker only has to
+/// survive scrolling past that heading: one middle dot in the air the name was
+/// indented by, no colour beyond the gray the times and the headings are in,
+/// and the same two columns either way so nothing shifts.
+fn gutter(chat: &Chat) -> String {
+    if chat.is_pinned() {
+        format!("{PIN} ")
+    } else {
+        " ".repeat(GUTTER)
+    }
+}
+
+/// The marker a pinned chat carries in the gutter.
+const PIN: char = '·';
 
 /// Read chats sit back in the secondary text; unread ones come forward in
 /// bold, and the selected one comes forward too.

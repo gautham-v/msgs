@@ -156,6 +156,41 @@ impl Watcher {
         watcher
     }
 
+    /// Also report writes to `path`, wherever it lives.
+    ///
+    /// Messages.app keeps its pinned conversations in a preference file next to
+    /// everybody else's, so this watches that directory as well and keeps the
+    /// same by-name filter over it: only the one file counts, and a busy
+    /// `Preferences` directory costs a name comparison per event.
+    ///
+    /// Does nothing while polling or off — the timer already re-reads
+    /// everything — and answers whether the file is now being watched.
+    pub fn also(&mut self, path: &Path) -> bool {
+        if self.status != WatcherStatus::Watching {
+            return false;
+        }
+        let (Some(name), Some(dir)) = (path.file_name(), path.parent()) else {
+            return false;
+        };
+        if dir.as_os_str().is_empty() {
+            return false;
+        }
+        let name = name.to_os_string();
+        if self.names.contains(&name) {
+            return true;
+        }
+        let Some(inner) = self.inner.as_mut() else {
+            return false;
+        };
+        // An already-watched directory is not an error worth reporting: the
+        // name filter is what decides, and it has just gained the file.
+        if inner.watch(dir, RecursiveMode::NonRecursive).is_err() {
+            return false;
+        }
+        self.names.push(name);
+        true
+    }
+
     /// Whether this is watching, polling, or off.
     #[must_use]
     pub const fn status(&self) -> WatcherStatus {
