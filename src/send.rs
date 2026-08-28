@@ -907,6 +907,14 @@ impl Outbox {
         }
     }
 
+    /// Whether tapbacks have a way out: `imsg` is on `$PATH`, or the outbox is
+    /// inert and would not run it anyway. Asked when the picker opens, so an
+    /// `imsg` installed while msgs is running is found the next time.
+    #[must_use]
+    pub fn has_helper(&self) -> bool {
+        matches!(self.mode, Mode::Inert(_)) || imsg_path().is_some()
+    }
+
     /// Start one send in the background. The answer arrives from
     /// [`Outbox::drain`] carrying the same `id`.
     pub fn send(&self, id: u64, target: Target, what: Outgoing) {

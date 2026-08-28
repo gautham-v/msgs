@@ -2413,7 +2413,7 @@ impl App {
             chat_rowid,
             selected,
             standing,
-            available: send::imsg_path().is_some(),
+            available: self.outbox.has_helper(),
             fallback,
         });
         self.open_overlay(Focus::Reactions);
