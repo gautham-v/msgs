@@ -263,6 +263,18 @@ opens that one the same way — and `s` copies it into
 untouched. `Ctrl+A` goes the other way and sends a file to the open
 conversation.
 
+Dragging a file from Finder onto the terminal is the same thing without the
+typing. Dropping one types its path, which msgs reads as a path rather than as
+a line of text: escaped spaces, single or double quotes, and `file://` URLs all
+come out the same, `~` is expanded, and several files dropped at once stay in
+the order they were dropped. Each one waits above the draft as a `📎 name` chip
+until `Enter` sends it — the files first, one message each, and whatever was
+typed as a message after them. `Esc` drops the chips and leaves the draft
+alone. A path that is not a file on this Mac is not a drop at all and is typed
+into the composer like any other paste; a paste that is not a path is typed
+too, newlines included in the composer and flattened to spaces in the
+one-line fields.
+
 ## Reading
 
 `chat.db` is only ever opened read-only: `SQLITE_OPEN_READ_ONLY`, a `?mode=ro`
@@ -446,7 +458,8 @@ real row shows up in `chat.db` the echo is replaced by it. A refused send is
 marked `· Failed` with the reason, and the text goes back in the composer.
 
 `Ctrl+A` asks for a path — `~` is expanded — and sends that file to the open
-conversation.
+conversation. A file dragged from Finder skips the prompt and waits on the
+composer as a chip; see [Attachments](#attachments).
 
 ## Reactions
 
