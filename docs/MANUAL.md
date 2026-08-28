@@ -510,7 +510,7 @@ Every key, what it does, and what overrides it:
 | `mouse` | `true` | bool | capture the mouse; `--no-mouse` overrides it to `false` |
 | `images` | `true` | bool | draw pictures inline; `--no-images` overrides it to `false` |
 | `contacts` | `true` | bool | read Contacts for names; `--no-contacts` overrides it to `false` |
-| `[theme] base` | `dark` | `dark`, `light`, `system`, `terminal` | the palette to start from; `--theme` overrides it and `Ctrl+T` cycles it at runtime |
+| `[theme] base` | `terminal` | `dark`, `light`, `system`, `terminal` | the palette to start from; `--theme` overrides it and `Ctrl+T` cycles it at runtime |
 | `[theme]` | — | color per slot | any slot below, as `"#rrggbb"`, `"#rgb"`, or an ANSI index `0`–`255`, applied on top of `base` |
 
 Slots: `bg_base`, `bg_light`, `bg_dark`, `bg_highlight`, `bg_hover`, `accent_me`,

@@ -87,14 +87,14 @@ pub const BASES: [&str; 4] = ["dark", "light", "system", "terminal"];
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Base {
     /// The mockup palette.
-    #[default]
     Dark,
     /// [`Theme::light`].
     Light,
     /// Whichever of the two macOS is showing, asked on a timer.
     System,
     /// The terminal's own background and foreground, asked once at startup,
-    /// with the bands and chrome derived from them.
+    /// with the bands and chrome derived from them. The default.
+    #[default]
     Terminal,
 }
 
@@ -284,7 +284,7 @@ pub fn query_terminal(timeout: Duration) -> Option<TerminalColors> {
 }
 
 impl Theme {
-    /// The palette a name picks out: `dark` (the default) or `light`.
+    /// The palette a name picks out: `dark` or `light`.
     /// `system` and `terminal` need an answer, so they are not names here.
     #[must_use]
     pub fn named(name: &str) -> Option<Self> {
@@ -583,7 +583,7 @@ mod tests {
     fn unknown_base_warns_and_keeps_the_default() {
         let overrides = BTreeMap::from([("base".to_string(), "sepia".to_string())]);
         let (base, warning) = Theme::base_from(&overrides);
-        assert_eq!(base, Base::Dark);
+        assert_eq!(base, Base::Terminal);
         assert!(warning.is_some_and(|w| w.contains("system")));
     }
 

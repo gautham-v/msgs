@@ -3323,6 +3323,9 @@ mod tests {
         let (config, warnings) = Config::parse("[theme]\naccent_me = \"#123456\"");
         let mut app = App::new(config, warnings);
         let accent = ratatui::style::Color::Rgb(0x12, 0x34, 0x56);
+        assert_eq!(app.theme_base, Base::Terminal);
+
+        app.update(Action::CycleTheme);
         assert_eq!(app.theme_base, Base::Dark);
 
         app.update(Action::CycleTheme);
