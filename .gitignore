@@ -4,3 +4,4 @@
 tests/fixtures/*.db
 tests/fixtures/*.db-wal
 tests/fixtures/*.db-shm
+tests/fixtures/*.pluginPayloadAttachment

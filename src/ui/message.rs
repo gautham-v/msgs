@@ -25,7 +25,7 @@ use ratatui::text::{Line, Span};
 
 use crate::contacts::Contacts;
 use crate::db::message::split_association;
-use crate::db::{AttachmentKind, AttachmentRef, Chat, GroupAction, Message, Tapback};
+use crate::db::{AttachmentKind, AttachmentRef, Chat, GroupAction, LinkPreview, Message, Tapback};
 use crate::media::{Images, NOT_DOWNLOADED};
 use crate::send::{Delivery, Pending, PendingTapback};
 use crate::theme::Theme;
@@ -76,8 +76,45 @@ pub struct Link {
     pub url: String,
 }
 
+/// Which picture of a message an [`ImageSpot`] holds room for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Picture {
+    /// A file sent with the message, by its position in `attachments`.
+    Attachment(usize),
+    /// The picture on the message's link preview.
+    Preview,
+}
+
+impl Picture {
+    /// The attachment behind it, whichever sort of picture it is.
+    ///
+    /// One answer for both the measuring and the drawing, so the rows a block
+    /// reserved and the pixels put into them can never come from two different
+    /// files.
+    #[must_use]
+    pub fn of(self, message: &Message) -> Option<&AttachmentRef> {
+        match self {
+            Self::Attachment(index) => message.attachments.get(index),
+            Self::Preview => message
+                .link_preview
+                .as_ref()
+                .and_then(|preview| preview.image.as_ref()),
+        }
+    }
+
+    /// Its position in `attachments`, for a click that wants to open the file.
+    /// A preview's picture is not one of them.
+    #[must_use]
+    pub const fn attachment(self) -> Option<usize> {
+        match self {
+            Self::Attachment(index) => Some(index),
+            Self::Preview => None,
+        }
+    }
+}
+
 /// A picture inside a laid-out block: the rows reserved for it, and which
-/// attachment fills them.
+/// picture fills them.
 ///
 /// [`block`] only reserves the space — the pixels are put there by
 /// [`crate::media::Images::render`] once the row is actually on screen — so the
@@ -97,8 +134,8 @@ pub struct ImageSpot {
     pub columns: u16,
     /// Rows it covers.
     pub rows: u16,
-    /// Its position in the message's `attachments`.
-    pub attachment: usize,
+    /// Which of the message's pictures it is.
+    pub picture: Picture,
 }
 
 /// One message as rows ready to draw.
@@ -400,7 +437,7 @@ pub fn block(ctx: &Ctx<'_>, index: usize, columns: u16) -> Block {
                 room: words_columns,
                 columns,
                 rows,
-                attachment: index,
+                picture: Picture::Attachment(index),
             });
             for _ in 0..rows {
                 lines.push(Line::from(lead()));
@@ -414,8 +451,36 @@ pub fn block(ctx: &Ctx<'_>, index: usize, columns: u16) -> Block {
         spans.insert(0, lead());
         lines.push(Line::from(spans));
     }
+    let attachment_pictures = images.len();
 
-    let note = first_inline.map(|attachment| inline_note(attachment, images.len()));
+    // The card for a link, under the line that holds the link itself. The
+    // picture first, then what the page calls itself — the same shape the
+    // rest of a block has, set in the name column like every other row.
+    if let Some(preview) = message.link_preview.as_ref().filter(|p| !p.is_empty()) {
+        if let Some((columns, rows)) = preview
+            .image
+            .as_ref()
+            .and_then(|image| ctx.images.cells(image, words_columns))
+        {
+            images.push(ImageSpot {
+                row: u16::try_from(lines.len()).unwrap_or(u16::MAX),
+                column: u16::try_from(column).unwrap_or(u16::MAX),
+                room: words_columns,
+                columns,
+                rows,
+                picture: Picture::Preview,
+            });
+            for _ in 0..rows {
+                lines.push(Line::from(lead()));
+            }
+        }
+        for mut line in preview_lines(preview, theme, words) {
+            line.spans.insert(0, lead());
+            lines.push(line);
+        }
+    }
+
+    let note = first_inline.map(|attachment| inline_note(attachment, attachment_pictures));
     for mut line in meta_lines(
         ctx,
         message,
@@ -620,6 +685,39 @@ fn chip_spans(attachment: &AttachmentRef, theme: &Theme, room: usize) -> Vec<Spa
         Span::styled(truncate(&text, room - edges), Style::new().fg(color)),
         Span::styled(format!(" {CHIP_EDGE}"), dash),
     ]
+}
+
+/// The card under a link: the page's title, the site it belongs to, and one
+/// line of its own summary.
+///
+/// The URL keeps its own line in the body above — the card is what Messages
+/// already knew about the page, added under it, never in place of it. Every row
+/// is truncated rather than wrapped, so a page with a paragraph for a title
+/// cannot push the rest of the transcript around and the card is as tall as the
+/// number of things the preview actually knows. No box, no rule, no colour: the
+/// title is the body's own [`Theme::text_primary`], the site a step back, the
+/// summary the gray the meta line uses, and the one accent on the whole block
+/// stays on the link itself.
+fn preview_lines(preview: &LinkPreview, theme: &Theme, room: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut row = |text: Option<&str>, color: Color| {
+        let Some(text) = text.map(single_line).filter(|text| !text.is_empty()) else {
+            return;
+        };
+        lines.push(Line::from(Span::styled(
+            truncate(&text, room),
+            Style::new().fg(color),
+        )));
+    };
+    let title = preview.title.as_deref().map(single_line);
+    row(title.as_deref(), theme.text_primary);
+    // A site row that only repeats the title says nothing twice.
+    let site = preview
+        .site()
+        .filter(|site| !title.as_deref().is_some_and(|title| title == *site));
+    row(site, theme.text_secondary);
+    row(preview.summary.as_deref(), theme.gray);
+    lines
 }
 
 /// The meta line, and the tapback chips that ride on the end of it. Nothing
@@ -857,6 +955,7 @@ mod tests {
             group_title: None,
             other_handle: None,
             group_action: None,
+            link_preview: None,
         }
     }
 
@@ -1303,7 +1402,7 @@ mod tests {
         assert_eq!(spot.row, 1, "the picture sits under the name row");
         assert_eq!(spot.column, 6, "set in past `alex  `");
         assert_eq!(spot.room, u16::try_from(body_width(60) - 6).unwrap());
-        assert_eq!(spot.attachment, 0);
+        assert_eq!(spot.picture, Picture::Attachment(0));
         // Twenty by ten cells at a ten-by-twenty font: five rows for the rows.
         assert_eq!((spot.columns, spot.rows), (20, 5));
         assert_eq!(block.lines.len(), usize::from(spot.rows) + 2);
@@ -1342,6 +1441,216 @@ mod tests {
         let chip = text_of(&block.lines[1]);
         assert!(chip.contains(NOT_DOWNLOADED), "{chip}");
         assert!(block.images.is_empty(), "nothing to draw");
+    }
+
+    /// The preview Messages would have stored for a link, with every string in
+    /// it invented here.
+    fn link_preview(image: Option<AttachmentRef>) -> LinkPreview {
+        LinkPreview {
+            url: Some("https://example.invalid/menu".to_string()),
+            title: Some("The Tuesday Menu".to_string()),
+            site_name: Some("Example Kitchen".to_string()),
+            summary: Some("Six things to cook, and one of them is soup.".to_string()),
+            image,
+        }
+    }
+
+    #[test]
+    fn a_link_preview_is_a_card_under_the_url_it_is_of() {
+        let mut linked = message(1, false, "https://example.invalid/menu");
+        linked.link_preview = Some(link_preview(None));
+        let fixture = Fixture::new(false, vec![linked]);
+        let block = block(&fixture.ctx(), 0, 80);
+
+        assert_eq!(block.lines.len(), 4, "the URL and the card's three rows");
+        let url = text_of(&block.lines[0]);
+        assert!(
+            url.starts_with("alex  https://example.invalid/menu"),
+            "the URL keeps its own line: {url}"
+        );
+        assert_eq!(block.links.len(), 1, "and stays the link `o` opens");
+
+        let rows: Vec<String> = block.lines[1..].iter().map(text_of).collect();
+        for row in &rows {
+            assert!(row.starts_with("      "), "set in past the name: {row}");
+        }
+        assert_eq!(rows[0].trim(), "The Tuesday Menu");
+        assert_eq!(rows[1].trim(), "Example Kitchen");
+        assert_eq!(
+            rows[2].trim(),
+            "Six things to cook, and one of them is soup."
+        );
+
+        let theme = Theme::default();
+        assert_eq!(block.lines[1].spans[1].style.fg, Some(theme.text_primary));
+        assert_eq!(block.lines[2].spans[1].style.fg, Some(theme.text_secondary));
+        assert_eq!(block.lines[3].spans[1].style.fg, Some(theme.gray));
+        for line in &block.lines[1..] {
+            assert!(
+                line.spans
+                    .iter()
+                    .all(|span| !span.style.add_modifier.contains(Modifier::BOLD)),
+                "the card is as calm as the rest of the block"
+            );
+        }
+        assert!(block.images.is_empty(), "no picture on this preview");
+    }
+
+    #[test]
+    fn a_preview_row_is_truncated_rather_than_wrapped() {
+        let mut linked = message(1, false, "look");
+        let mut preview = link_preview(None);
+        preview.title = Some("a very long title ".repeat(20));
+        preview.summary = Some("a very long summary ".repeat(20));
+        linked.link_preview = Some(preview);
+        let fixture = Fixture::new(false, vec![linked]);
+        let block = block(&fixture.ctx(), 0, 50);
+
+        assert_eq!(block.lines.len(), 4, "one row each, however long they are");
+        for line in &block.lines {
+            assert!(width(&text_of(line)) <= usize::from(row_width(50)));
+        }
+    }
+
+    #[test]
+    fn a_preview_with_nothing_to_say_draws_no_card() {
+        let mut linked = message(1, false, "https://example.invalid/menu");
+        linked.link_preview = Some(LinkPreview {
+            url: Some("https://example.invalid/menu".to_string()),
+            title: None,
+            site_name: Some("Example Kitchen".to_string()),
+            summary: None,
+            image: None,
+        });
+        let fixture = Fixture::new(false, vec![linked]);
+        assert_eq!(block(&fixture.ctx(), 0, 60).lines.len(), 1);
+    }
+
+    #[test]
+    fn a_site_row_that_only_repeats_the_title_is_left_out() {
+        let mut linked = message(1, false, "look");
+        let mut preview = link_preview(None);
+        preview.site_name.clone_from(&preview.title);
+        preview.summary = None;
+        linked.link_preview = Some(preview);
+        let fixture = Fixture::new(false, vec![linked]);
+        let block = block(&fixture.ctx(), 0, 60);
+        assert_eq!(block.lines.len(), 2, "the body and the title, said once");
+    }
+
+    #[test]
+    fn a_previews_picture_takes_rows_of_its_own_above_the_card() {
+        let dir = std::env::temp_dir().join(format!("msgs-preview-block-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp directory");
+        let path = dir.join("preview.pluginPayloadAttachment");
+        let pixels = image::ImageBuffer::from_pixel(200, 100, image::Rgba::<u8>([4, 5, 6, 255]));
+        image::DynamicImage::from(pixels)
+            .save_with_format(&path, image::ImageFormat::Png)
+            .expect("a written png");
+
+        let picture = AttachmentRef {
+            rowid: 42,
+            guid: "LINK42".to_string(),
+            message_rowid: 1,
+            filename: Some(path.display().to_string()),
+            mime_type: Some("image/png".to_string()),
+            uti: None,
+            transfer_name: None,
+            total_bytes: 4096,
+            transfer_state: 5,
+            is_sticker: false,
+            hide_attachment: false,
+        };
+        let mut linked = message(1, false, "https://example.invalid/menu");
+        linked.link_preview = Some(link_preview(Some(picture)));
+        let mut fixture = Fixture::new(false, vec![linked]);
+
+        // Pictures off: the card is its three rows and nothing is reserved.
+        let flat = block(&fixture.ctx(), 0, 60);
+        assert!(flat.images.is_empty());
+        assert_eq!(flat.lines.len(), 4);
+
+        fixture.images = crate::media::Images::halfblocks();
+        let block = block(&fixture.ctx(), 0, 60);
+        let spot = *block.images.first().expect("a reserved picture");
+        assert_eq!(spot.picture, Picture::Preview);
+        assert_eq!(spot.row, 1, "under the URL, above the title");
+        assert_eq!(spot.column, 6, "set in past `alex  `");
+        assert_eq!(spot.room, u16::try_from(body_width(60) - 6).unwrap());
+        assert_eq!((spot.columns, spot.rows), (20, 5));
+        // The one number: the rows reserved are the rows the block grew by.
+        assert_eq!(block.lines.len(), flat.lines.len() + usize::from(spot.rows));
+        for row in 1..=usize::from(spot.rows) {
+            assert_eq!(text_of(&block.lines[row]).trim(), "");
+        }
+        assert_eq!(
+            text_of(&block.lines[usize::from(spot.rows) + 1]).trim(),
+            "The Tuesday Menu"
+        );
+        assert!(
+            spot.picture.of(&fixture.messages[0]).is_some(),
+            "the drawing finds the same file the measuring did"
+        );
+        assert!(
+            spot.picture.attachment().is_none(),
+            "it is not a file `o` opens"
+        );
+        assert_eq!(
+            block.height(),
+            u16::try_from(block.lines.len()).unwrap() + 2
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_photo_and_a_link_preview_each_keep_their_own_rows() {
+        let dir = std::env::temp_dir().join(format!("msgs-preview-both-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp directory");
+        let photo_path = dir.join("IMG_0001.jpg");
+        let pixels = image::ImageBuffer::from_pixel(200, 100, image::Rgba::<u8>([7, 7, 7, 255]));
+        image::DynamicImage::from(pixels)
+            .save(&photo_path)
+            .expect("a written jpeg");
+        let card_path = dir.join("card.pluginPayloadAttachment");
+        image::DynamicImage::from(image::ImageBuffer::from_pixel(
+            200,
+            100,
+            image::Rgba::<u8>([8, 8, 8, 255]),
+        ))
+        .save_with_format(&card_path, image::ImageFormat::Png)
+        .expect("a written png");
+
+        let file = |rowid: i64, path: &std::path::Path, mime: &str| AttachmentRef {
+            rowid,
+            guid: format!("A{rowid}"),
+            message_rowid: 1,
+            filename: Some(path.display().to_string()),
+            mime_type: Some(mime.to_string()),
+            uti: None,
+            transfer_name: Some("IMG_0001.jpg".to_string()),
+            total_bytes: 2_202_009,
+            transfer_state: 5,
+            is_sticker: false,
+            hide_attachment: false,
+        };
+        let mut linked = message(1, false, "https://example.invalid/menu");
+        linked.attachments = vec![file(1, &photo_path, "image/jpeg")];
+        linked.link_preview = Some(link_preview(Some(file(2, &card_path, "image/png"))));
+        let mut fixture = Fixture::new(false, vec![linked]);
+        fixture.images = crate::media::Images::halfblocks();
+        let block = block(&fixture.ctx(), 0, 60);
+
+        assert_eq!(block.images.len(), 2);
+        assert_eq!(block.images[0].picture, Picture::Attachment(0));
+        assert_eq!(block.images[1].picture, Picture::Preview);
+        assert!(block.images[0].row < block.images[1].row);
+        // The meta line counts the photo, not the card's picture.
+        let meta = text_of(block.lines.last().expect("a row"));
+        assert!(meta.contains("IMG_0001.jpg"), "{meta}");
+        assert!(!meta.contains("photos"), "{meta}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

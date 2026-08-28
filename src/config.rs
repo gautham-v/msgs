@@ -36,6 +36,10 @@ pub struct Config {
     /// Read the macOS Contacts stores so handles become names.
     /// `--no-contacts` overrides this to `false`.
     pub contacts: bool,
+    /// Show the link previews Messages.app already stored, under the message
+    /// that carries the link. `--no-link-previews` overrides this to `false`.
+    /// msgs never fetches a page itself, whichever way this is set.
+    pub link_previews: bool,
     /// The `[theme]` table: `base = "light"` picks a palette, and any other
     /// key is a per-slot color override, e.g. `accent_me = "#ff8800"`.
     #[serde(default)]
@@ -51,6 +55,7 @@ impl Default for Config {
             mouse: true,
             images: true,
             contacts: true,
+            link_previews: true,
             theme: BTreeMap::new(),
         }
     }
@@ -149,6 +154,7 @@ mod tests {
             page_step = 5
             mouse = false
             contacts = false
+            link_previews = false
 
             [theme]
             base = "light"
@@ -162,6 +168,7 @@ mod tests {
         assert_eq!(config.page_step, 5);
         assert!(!config.mouse);
         assert!(!config.contacts);
+        assert!(!config.link_previews);
         assert_eq!(
             config.theme.get("accent_me").map(String::as_str),
             Some("#ff8800")

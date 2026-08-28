@@ -30,8 +30,8 @@ use rusqlite::{Connection, OpenFlags};
 pub use chat::{Chat, Preview};
 pub use handle::{Handle, Name};
 pub use message::{
-    AttachmentKind, AttachmentRef, GroupAction, Message, Tapback, TapbackAction, TapbackKind,
-    body_text,
+    AttachmentKind, AttachmentRef, GroupAction, LinkPreview, Message, Tapback, TapbackAction,
+    TapbackKind, body_text,
 };
 
 /// How many messages a conversation page holds by default.
@@ -252,6 +252,9 @@ pub struct Schema {
     /// `chat.is_pinned`. Absent on every macOS to date — pinning lives in
     /// Messages.app's preferences, not in the database.
     pub chat_is_pinned: bool,
+    /// `message.payload_data` and `message.balloon_bundle_id`, which together
+    /// carry the rich-link previews Messages built.
+    pub link_preview: bool,
 }
 
 /// An open, read-only connection to a Messages database.
@@ -261,6 +264,7 @@ pub struct Db {
     path: PathBuf,
     source: Source,
     schema: Schema,
+    link_previews: bool,
     // Dropping this removes the scratch copy, so it must outlive `conn`'s use.
     scratch: Option<Scratch>,
 }
@@ -304,11 +308,14 @@ impl Db {
             path: path.to_path_buf(),
             source,
             schema: Schema::default(),
+            link_previews: true,
             scratch,
         };
         db.schema = Schema {
             tapback_emoji: db.has_column("message", "associated_message_emoji"),
             chat_is_pinned: db.has_column("chat", "is_pinned"),
+            link_preview: db.has_column("message", "payload_data")
+                && db.has_column("message", "balloon_bundle_id"),
         };
         db
     }
@@ -317,6 +324,18 @@ impl Db {
     #[must_use]
     pub const fn schema(&self) -> Schema {
         self.schema
+    }
+
+    /// Whether pages come back with the link previews Messages stored.
+    #[must_use]
+    pub const fn link_previews(&self) -> bool {
+        self.link_previews
+    }
+
+    /// Switch link previews off, for `--no-link-previews` and
+    /// `link_previews = false`. Off means the payload is never even read.
+    pub const fn set_link_previews(&mut self, on: bool) {
+        self.link_previews = on;
     }
 
     /// The read-only connection, for queries this module does not provide.

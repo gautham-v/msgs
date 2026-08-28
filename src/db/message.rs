@@ -18,9 +18,13 @@
 //! and forty.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local};
+use imessage_database::message_types::url::URLMessage;
+use imessage_database::message_types::variants::BalloonProvider;
+use imessage_database::util::plist::parse_ns_keyed_archiver;
 use imessage_database::util::streamtyped;
 use rusqlite::types::Value;
 
@@ -95,6 +99,8 @@ pub struct Message {
     pub other_handle: Option<i64>,
     /// The group event this row announces, when it announces one.
     pub group_action: Option<GroupAction>,
+    /// The preview Messages.app already built for a link in this message.
+    pub link_preview: Option<LinkPreview>,
 }
 
 impl Message {
@@ -259,6 +265,162 @@ impl AttachmentRef {
                 .and_then(|path| path.rsplit('/').next())
         })
     }
+}
+
+/// `message.balloon_bundle_id` on a message Messages drew a link preview for.
+pub const URL_BALLOON: &str = "com.apple.messages.URLBalloonProvider";
+
+/// Where the link's picture is, counted in the message's own attachments.
+const SUBSTITUTE_INDEX: &str = "richLinkImageAttachmentSubstituteIndex";
+
+/// What Messages.app already knows about a link somebody sent.
+///
+/// When a message contains a URL, Messages fetches the page once, on the
+/// sending or receiving device, and archives what it found in
+/// `message.payload_data`: an `NSKeyedArchiver` plist holding the page's title,
+/// summary, and site name, with the pictures written beside it as ordinary
+/// `attachment` rows. msgs only reads that archive. **Nothing here opens a
+/// socket** — a link whose preview Messages never built simply has none, and a
+/// preview stays exactly as stale as Messages left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkPreview {
+    /// The page the preview is of.
+    pub url: Option<String>,
+    /// The page's `<og:title>`.
+    pub title: Option<String>,
+    /// The site the page belongs to, when the page named one.
+    pub site_name: Option<String>,
+    /// The page's `<og:description>`, as one paragraph.
+    pub summary: Option<String>,
+    /// The picture Messages stored for it: one of the message's own
+    /// attachments, typed by what its first bytes actually are, so it goes
+    /// through the same [`crate::media::Images`] cache as any photo.
+    pub image: Option<AttachmentRef>,
+}
+
+impl LinkPreview {
+    /// The host of [`LinkPreview::url`], `www.` dropped.
+    #[must_use]
+    pub fn host(&self) -> Option<&str> {
+        let raw = self.url.as_deref()?;
+        let rest = raw.split_once("://").map_or(raw, |(_, rest)| rest);
+        let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+        let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+        let host = host.split_once(':').map_or(host, |(host, _)| host);
+        let host = host.strip_prefix("www.").unwrap_or(host);
+        (!host.is_empty()).then_some(host)
+    }
+
+    /// What to call the site: the name the page gave, else its host.
+    #[must_use]
+    pub fn site(&self) -> Option<&str> {
+        self.site_name.as_deref().or_else(|| self.host())
+    }
+
+    /// Whether the preview says nothing the URL line does not already say.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.title.is_none() && self.summary.is_none() && self.image.is_none()
+    }
+}
+
+/// Read the preview out of one `payload_data` blob.
+///
+/// `attachments` are the message's own attachment rows, in the order Messages
+/// stored them, because the archive points at its picture by position in that
+/// list rather than by name. Anything unparseable — a payload from another
+/// balloon, a truncated archive, an image type nothing here can decode — is
+/// `None`, silently: a link preview is a nicety and never an error.
+#[must_use]
+pub fn parse_link_preview(payload: &[u8], attachments: &[AttachmentRef]) -> Option<LinkPreview> {
+    let raw = plist::Value::from_reader(std::io::Cursor::new(payload)).ok()?;
+    let resolved = parse_ns_keyed_archiver(&raw).ok()?;
+    let balloon = URLMessage::from_map(&resolved).ok()?;
+    // An unloaded placeholder is what Messages writes before it has fetched
+    // anything. There is nothing in it to show.
+    if balloon.placeholder {
+        return None;
+    }
+
+    let text = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    };
+    let preview = LinkPreview {
+        url: text(balloon.url.or(balloon.original_url)),
+        title: text(balloon.title),
+        site_name: text(balloon.site_name),
+        summary: text(balloon.summary),
+        image: image_index(&raw)
+            .and_then(|index| attachments.get(index))
+            .and_then(preview_picture),
+    };
+    (preview.url.is_some() || !preview.is_empty()).then_some(preview)
+}
+
+/// Which of the message's attachments holds the preview picture.
+///
+/// The index sits on the metadata's `image` dictionary, which
+/// `parse_ns_keyed_archiver` folds away, so this walks the raw archive:
+/// `$top.root` → `richLinkMetadata` → `image` → the index.
+fn image_index(raw: &plist::Value) -> Option<usize> {
+    let body = raw.as_dictionary()?;
+    let objects = body.get("$objects")?.as_array()?;
+    let follow = |value: Option<&plist::Value>| -> Option<&plist::Dictionary> {
+        let index = usize::try_from(value?.as_uid()?.get()).ok()?;
+        objects.get(index)?.as_dictionary()
+    };
+    let root = follow(body.get("$top")?.as_dictionary()?.get("root"))?;
+    let metadata = follow(
+        root.get("richLinkMetadata")
+            .or_else(|| root.get("metadata")),
+    )?;
+    let image = follow(
+        metadata
+            .get("image")
+            .or_else(|| metadata.get("imageMetadata")),
+    )?;
+    usize::try_from(image.get(SUBSTITUTE_INDEX)?.as_signed_integer()?).ok()
+}
+
+/// The attachment row a preview picture is drawn from.
+///
+/// Messages files these under a `.pluginPayloadAttachment` name with a
+/// generated UTI and no MIME type, and marks them hidden so the transcript does
+/// not list them as files. The bytes underneath are an ordinary PNG or JPEG, so
+/// this reads the first of them and hands back a row typed by what is really
+/// there — and `None` for a favicon or anything else msgs cannot decode.
+fn preview_picture(attachment: &AttachmentRef) -> Option<AttachmentRef> {
+    if attachment.is_sticker {
+        return None;
+    }
+    let mime = sniff_image(&attachment.path()?)?;
+    Some(AttachmentRef {
+        mime_type: Some(mime.to_string()),
+        uti: None,
+        // The row it was cloned from stays hidden; this one is the picture the
+        // card draws, so it is not.
+        hide_attachment: false,
+        ..attachment.clone()
+    })
+}
+
+/// The MIME type a file's first bytes say it is, for the types msgs can decode.
+fn sniff_image(path: &Path) -> Option<&'static str> {
+    let mut head = [0u8; 8];
+    std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
+    if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if head.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    None
 }
 
 /// Which reaction a tapback carries.
@@ -611,11 +773,45 @@ impl Db {
         let ids: Vec<i64> = page.iter().map(|message| message.rowid).collect();
         let mut attachments = self.attachments_by_message(&ids)?;
         let mut tapbacks = self.tapbacks_for(chat_rowid, page)?;
+        let mut payloads = self.link_payloads(&ids)?;
         for message in page.iter_mut() {
             message.attachments = attachments.remove(&message.rowid).unwrap_or_default();
             message.tapbacks = tapbacks.remove(&message.guid).unwrap_or_default();
+            // After the attachments, because the archive points at its picture
+            // by position in that list.
+            message.link_preview = payloads
+                .remove(&message.rowid)
+                .and_then(|payload| parse_link_preview(&payload, &message.attachments));
         }
         Ok(())
+    }
+
+    /// The rich-link payloads on the given messages, keyed by message `ROWID`.
+    ///
+    /// Empty when link previews are switched off, and empty on a database old
+    /// enough not to have the two columns — the blob is only read for the rows
+    /// Messages marked as a link balloon, which is a handful per page.
+    fn link_payloads(&self, message_rowids: &[i64]) -> Result<HashMap<i64, Vec<u8>>, DbError> {
+        if !self.link_previews() || !self.schema().link_preview || message_rowids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids: Vec<Value> = message_rowids
+            .iter()
+            .take(MAX_PAGE)
+            .map(|rowid| Value::Integer(*rowid))
+            .collect();
+        let sql = format!(
+            "SELECT ROWID, payload_data FROM message \
+             WHERE ROWID IN ({}) AND balloon_bundle_id = '{URL_BALLOON}' \
+               AND payload_data IS NOT NULL",
+            placeholders(ids.len())
+        );
+        let mut statement = self.conn().prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(ids), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(DbError::from)
     }
 
     /// Attachments hanging off the given messages, keyed by message `ROWID`.
@@ -806,6 +1002,7 @@ fn row_to_message(row: &rusqlite::Row<'_>, chat_rowid: i64) -> rusqlite::Result<
         ),
         group_title,
         other_handle,
+        link_preview: None,
     })
 }
 
@@ -1015,6 +1212,89 @@ mod tests {
         assert!(!path.to_string_lossy().starts_with('~'));
         assert!(!attachment.is_image());
         assert_eq!(attachment.display_name(), Some("file.pdf"));
+    }
+
+    fn preview(url: &str) -> LinkPreview {
+        LinkPreview {
+            url: Some(url.to_string()),
+            title: None,
+            site_name: None,
+            summary: None,
+            image: None,
+        }
+    }
+
+    #[test]
+    fn a_preview_names_its_site_by_the_url_when_the_page_did_not() {
+        let mut link = preview("https://www.example.invalid:8443/a/b?c=d#e");
+        assert_eq!(link.host(), Some("example.invalid"));
+        assert_eq!(link.site(), Some("example.invalid"));
+
+        link.site_name = Some("Example".to_string());
+        assert_eq!(link.site(), Some("Example"), "the page's own name wins");
+
+        assert!(preview("").host().is_none());
+        assert!(preview("not a url at all").host().is_some());
+    }
+
+    #[test]
+    fn a_preview_with_nothing_but_a_url_has_nothing_to_draw() {
+        let mut link = preview("https://example.invalid/x");
+        assert!(link.is_empty());
+        link.title = Some("Something".to_string());
+        assert!(!link.is_empty());
+    }
+
+    #[test]
+    fn a_payload_that_is_not_an_archive_is_no_preview_at_all() {
+        assert!(parse_link_preview(b"", &[]).is_none());
+        assert!(parse_link_preview(b"not a property list", &[]).is_none());
+        // A well-formed plist that is not a keyed archive either.
+        let mut plain = Vec::new();
+        plist::Value::String("hello".to_string())
+            .to_writer_binary(&mut plain)
+            .expect("a plist");
+        assert!(parse_link_preview(&plain, &[]).is_none());
+    }
+
+    #[test]
+    fn a_preview_picture_is_typed_by_its_bytes_not_by_the_row() {
+        let dir = std::env::temp_dir().join(format!("msgs-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp directory");
+        let png = dir.join("shot.pluginPayloadAttachment");
+        let pixels = image::ImageBuffer::from_pixel(8, 8, image::Rgba::<u8>([1, 2, 3, 255]));
+        image::DynamicImage::from(pixels)
+            .save_with_format(&png, image::ImageFormat::Png)
+            .expect("a written png");
+        let text = dir.join("notes.pluginPayloadAttachment");
+        std::fs::write(&text, b"not a picture at all").expect("a written file");
+
+        // The row Messages writes: a generated UTI, no MIME type, and hidden.
+        let row = |path: &std::path::Path| AttachmentRef {
+            rowid: 1,
+            guid: "A".to_string(),
+            message_rowid: 1,
+            filename: Some(path.display().to_string()),
+            mime_type: None,
+            uti: Some("dyn.age81a5dzq7y066dbtf0g82peqf4hk2".to_string()),
+            transfer_name: None,
+            total_bytes: 64,
+            transfer_state: 5,
+            is_sticker: false,
+            hide_attachment: true,
+        };
+
+        let picture = preview_picture(&row(&png)).expect("a picture");
+        assert_eq!(picture.mime_type.as_deref(), Some("image/png"));
+        assert!(picture.is_image(), "the Images cache will take it");
+        assert!(
+            !picture.hide_attachment,
+            "the card draws it, so it is not hidden"
+        );
+        assert!(preview_picture(&row(&text)).is_none());
+        assert!(preview_picture(&row(&dir.join("missing"))).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

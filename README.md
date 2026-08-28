@@ -21,6 +21,7 @@ Reactions need [`imsg`](https://github.com/steipete/imsg) (`brew install steipet
 ## What it does
 
 - Chats, messages, group chats, names from Contacts, pictures inline, video posters
+- Link previews from what Messages already stored — msgs never touches the network
 - Send text, files, replies, and reactions; live updates as messages land
 - `Ctrl+K` fuzzy jump to any chat or person, full-text search over every message
 - Local unread state, so opening a chat here does not touch Messages.app's badge

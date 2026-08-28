@@ -70,6 +70,10 @@ struct Cli {
     #[arg(long)]
     no_contacts: bool,
 
+    /// Do not show the link previews Messages stored; leave the URL alone.
+    #[arg(long)]
+    no_link_previews: bool,
+
     /// Mask phone numbers and addresses on screen, for a demo or a screenshot.
     /// Names from Contacts and message bodies still show.
     #[arg(long)]
@@ -81,6 +85,9 @@ fn main() -> Result<()> {
     let (mut config, warnings) = Config::load(cli.config.as_deref());
     if let Some(name) = &cli.theme {
         config.theme.insert("base".to_string(), name.clone());
+    }
+    if cli.no_link_previews {
+        config.link_previews = false;
     }
 
     if cli.check {
@@ -418,6 +425,15 @@ fn check(cli: &Cli, warnings: &[String]) -> Result<()> {
     );
 
     row(
+        "link previews",
+        if cli.no_link_previews {
+            "off (--no-link-previews)"
+        } else {
+            "on — read from Messages' own payloads, never from the network"
+        },
+    );
+
+    row(
         "sips",
         &which("sips").map_or_else(
             || "not on PATH — HEIC photos will stay chips".to_string(),
@@ -510,6 +526,7 @@ mod tests {
             "--no-mouse",
             "--no-index",
             "--no-images",
+            "--no-link-previews",
         ]);
         assert_eq!(
             cli.db.as_deref(),
@@ -518,6 +535,7 @@ mod tests {
         assert!(cli.no_mouse);
         assert!(cli.no_index);
         assert!(cli.no_images);
+        assert!(cli.no_link_previews);
         assert!(!cli.no_contacts);
         assert!(!cli.check);
 
@@ -526,6 +544,7 @@ mod tests {
         assert!(!cli.no_mouse);
         assert!(!cli.no_index);
         assert!(!cli.no_images);
+        assert!(!cli.no_link_previews);
         assert!(!cli.no_contacts);
     }
 }
