@@ -8,6 +8,7 @@
 //! resolved name reaches every pane at once.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -124,14 +125,59 @@ impl Handle {
     }
 }
 
+/// Whether addresses are masked on screen (`--redact`), for a demo or a
+/// screenshot that would otherwise carry somebody's number.
+static REDACT: AtomicBool = AtomicBool::new(false);
+
+/// Mask every address from now on. Names from Contacts still show; message
+/// bodies are left alone.
+pub fn set_redact(on: bool) {
+    REDACT.store(on, Ordering::Relaxed);
+}
+
+/// Whether [`set_redact`] is on.
+#[must_use]
+pub fn redacted() -> bool {
+    REDACT.load(Ordering::Relaxed)
+}
+
+/// `id` with its identifying part hidden: a number keeps its last two digits,
+/// an email its first letter and domain, anything else becomes dots.
+#[must_use]
+pub fn mask(id: &str) -> String {
+    if let Some(digits) = id.strip_prefix("+1").filter(|d| d.len() == 10) {
+        return format!("+1 (•••) •••-••{}", &digits[8..]);
+    }
+    if let Some((local, domain)) = id.split_once('@') {
+        let first = local.chars().next().map(String::from).unwrap_or_default();
+        return format!("{first}•••@{domain}");
+    }
+    let digits = id.chars().filter(char::is_ascii_digit).count();
+    if digits >= 7 {
+        let tail: String = id
+            .chars()
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        return format!("•••{tail}");
+    }
+    "•••".to_string()
+}
+
 /// An address written for a reader: a North American number spaced out,
-/// anything else as it is stored.
+/// anything else as it is stored — or masked, under `--redact`.
 ///
 /// This is the last resort, for somebody Contacts does not know and for a Mac
 /// whose Contacts stores could not be read at all: a row showing a number
 /// should at least show a readable one.
 #[must_use]
 pub fn display_name(id: &str) -> String {
+    if redacted() {
+        return mask(id);
+    }
     format_phone(id).unwrap_or_else(|| id.to_string())
 }
 
@@ -143,6 +189,9 @@ pub fn display_name(id: &str) -> String {
 /// number identifies nobody.
 #[must_use]
 pub fn short_name(id: &str) -> String {
+    if redacted() {
+        return mask(id);
+    }
     match id.split_once('@') {
         Some((local, _)) if !local.is_empty() => local.to_string(),
         _ => display_name(id),
@@ -204,6 +253,18 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mask_keeps_the_shape_and_hides_the_person() {
+        assert_eq!(mask("+15555550132"), "+1 (•••) •••-••32");
+        assert_eq!(mask("pat@example.com"), "p•••@example.com");
+        assert_eq!(mask("+447700900123"), "•••23");
+        assert_eq!(mask("iMessage;-;+15555550132"), "•••32");
+        assert_eq!(mask("chat12"), "•••");
+        assert!(!mask("+15555550132").contains("5550"));
+        assert!(!mask("+447700900123").contains("7700"));
+        assert!(!mask("pat@example.com").contains("pat"));
+    }
 
     fn named(id: &str, first: &str, last: &str) -> Handle {
         let mut handle = Handle::new(1, id.to_string(), "iMessage".to_string());

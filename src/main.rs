@@ -65,6 +65,11 @@ struct Cli {
     /// Do not read Contacts; show phone numbers and addresses instead of names.
     #[arg(long)]
     no_contacts: bool,
+
+    /// Mask phone numbers and addresses on screen, for a demo or a screenshot.
+    /// Names from Contacts and message bodies still show.
+    #[arg(long)]
+    redact: bool,
 }
 
 fn main() -> Result<()> {
@@ -73,6 +78,10 @@ fn main() -> Result<()> {
 
     if cli.check {
         return check(&cli, &warnings);
+    }
+
+    if cli.redact {
+        msgs::db::handle::set_redact(true);
     }
 
     let mut app = App::new(config, warnings);

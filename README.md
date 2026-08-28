@@ -44,6 +44,7 @@ Or from source: `cargo install --path .`
 
 Then give your terminal **Full Disk Access** (System Settings → Privacy & Security),
 relaunch it, and run `msgs`. `msgs --check` tells you what is missing.
+`msgs --redact` masks phone numbers and addresses, for screenshots and demos.
 Reactions need [`imsg`](https://github.com/steipete/imsg) (`brew install steipete/tap/imsg`).
 
 ## What it does

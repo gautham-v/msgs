@@ -136,10 +136,7 @@ impl Chat {
             return name.to_string();
         }
         match self.participants.as_slice() {
-            [] => self
-                .identifier
-                .as_deref()
-                .map_or_else(|| self.guid.clone(), display_name),
+            [] => display_name(self.identifier.as_deref().unwrap_or(&self.guid)),
             [only] => only.display_name(),
             many => many
                 .iter()
