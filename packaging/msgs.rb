@@ -14,20 +14,20 @@ class Msgs < Formula
   homepage "https://github.com/gautham-v/msgs"
   license "MIT"
   version "0.1.0"
-  head "https://github.com/gautham-v/msgs.git", branch: "main"
 
   # The tagged release: a universal binary, so one bottle covers Apple silicon
   # and Intel. Both fields are placeholders until the first tag is pushed.
   url "https://github.com/gautham-v/msgs/releases/download/v0.1.0/msgs-0.1.0-macos-universal.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "b5f1d313deef17f615f02e5c5ac7f306703dcaecb75e13db41b88b87a1f65ff7"
 
   # macOS 14+, which is what msgs supports. SQLite is compiled in, so there is
   # nothing else to depend on.
   depends_on macos: :sonoma
 
-  # Only needed to build from source or from HEAD; the release tarball is a
-  # binary and needs neither.
-  on_head do
+  # Building from HEAD needs a Rust toolchain; the release tarball is a binary
+  # and needs nothing.
+  head do
+    url "https://github.com/gautham-v/msgs.git", branch: "main"
     depends_on "rust" => :build
   end
 
