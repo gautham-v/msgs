@@ -4,15 +4,14 @@
 //! can be swapped wholesale (and overridden per-slot from `config.toml`) without
 //! touching render code. Defaults are the GrokNight-ish values from
 //! `docs/mockups.html`; [`Theme::light`] is the same layout on a light ground,
-//! chosen with `base = "light"` in `[theme]` or `--theme light`.
+//! chosen with `base = "light"` in `[theme]` or `--theme light`, and
+//! [`Theme::terminal`] is the layout on whatever ground the terminal itself
+//! draws, asked for with OSC 10/11 at startup ([`query_terminal`]).
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use ratatui::style::Color;
-
-/// How many stable accent colors a group conversation can hand out before it
-/// wraps around.
-pub const PARTICIPANT_SLOTS: usize = 4;
 
 /// The full set of color slots used by the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,13 +27,9 @@ pub struct Theme {
     /// Mouse hover tint.
     pub bg_hover: Color,
 
-    /// Accent rail for messages you sent.
+    /// The one accent: your own name, an unread chat's time, and links.
+    /// Never chrome — focus and selection are grays.
     pub accent_me: Color,
-    /// Accent rail for the other person in a 1:1 chat.
-    pub accent_them: Color,
-    /// Stable per-participant accents for group chats. `participants[0]` is the
-    /// same green as [`Theme::accent_them`] so 1:1 and group chats agree.
-    pub participants: [Color; PARTICIPANT_SLOTS],
 
     /// Message bodies, chat names.
     pub text_primary: Color,
@@ -46,12 +41,14 @@ pub struct Theme {
     pub gray_dim: Color,
     /// System lines (renames, joins, leaves).
     pub system: Color,
-    /// Highlighted characters in fuzzy-match results.
+    /// Highlighted characters in fuzzy-match results: bold, a step brighter
+    /// than the text, and no hue.
     pub fuzzy: Color,
 
     /// Pane and composer borders at rest.
     pub border: Color,
-    /// Border of the focused pane / selected row outline.
+    /// Border of the focused pane: a step brighter than [`Theme::border`],
+    /// and gray like it.
     pub border_active: Color,
     /// Failures: send errors, unreadable database.
     pub error: Color,
@@ -67,23 +64,16 @@ impl Default for Theme {
             bg_hover: rgb(0x1f, 0x1f, 0x25),
 
             accent_me: rgb(0x5e, 0xa8, 0xff),
-            accent_them: rgb(0x7e, 0xc6, 0x99),
-            participants: [
-                rgb(0x7e, 0xc6, 0x99),
-                rgb(0xe5, 0xb5, 0x67),
-                rgb(0xd1, 0x7b, 0xe0),
-                rgb(0x7f, 0xd6, 0xc9),
-            ],
 
-            text_primary: rgb(0xe4, 0xe4, 0xe7),
+            text_primary: rgb(0xc8, 0xc8, 0xc8),
             text_secondary: rgb(0xa1, 0xa1, 0xaa),
             gray: rgb(0x52, 0x52, 0x5b),
             gray_dim: rgb(0x3a, 0x3a, 0x40),
             system: rgb(0x8a, 0x8a, 0x94),
-            fuzzy: rgb(0x9d, 0xd0, 0xff),
+            fuzzy: rgb(0xe4, 0xe4, 0xe7),
 
             border: rgb(0x2c, 0x2c, 0x33),
-            border_active: rgb(0x5e, 0xa8, 0xff),
+            border_active: rgb(0x6b, 0x6b, 0x74),
             error: rgb(0xe0, 0x6c, 0x75),
         }
     }
@@ -91,7 +81,7 @@ impl Default for Theme {
 
 /// The bases a config can name, in the order `--help` lists them and
 /// `Ctrl+T` cycles through them.
-pub const BASES: [&str; 3] = ["dark", "light", "system"];
+pub const BASES: [&str; 4] = ["dark", "light", "system", "terminal"];
 
 /// Which palette to start from before per-slot overrides.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -103,6 +93,9 @@ pub enum Base {
     Light,
     /// Whichever of the two macOS is showing, asked on a timer.
     System,
+    /// The terminal's own background and foreground, asked once at startup,
+    /// with the bands and chrome derived from them.
+    Terminal,
 }
 
 impl Base {
@@ -113,6 +106,7 @@ impl Base {
             "dark" => Some(Self::Dark),
             "light" => Some(Self::Light),
             "system" => Some(Self::System),
+            "terminal" => Some(Self::Terminal),
             _ => None,
         }
     }
@@ -124,6 +118,7 @@ impl Base {
             Self::Dark => "dark",
             Self::Light => "light",
             Self::System => "system",
+            Self::Terminal => "terminal",
         }
     }
 
@@ -133,18 +128,20 @@ impl Base {
         match self {
             Self::Dark => Self::Light,
             Self::Light => Self::System,
-            Self::System => Self::Dark,
+            Self::System => Self::Terminal,
+            Self::Terminal => Self::Dark,
         }
     }
 
     /// Whether this base draws dark, given the system's answer (`None` while
-    /// it has not answered yet, which reads as dark).
+    /// it has not answered yet, which reads as dark) and the terminal's.
     #[must_use]
-    pub fn is_dark(self, system_dark: Option<bool>) -> bool {
+    pub fn is_dark(self, system_dark: Option<bool>, terminal: Option<&TerminalColors>) -> bool {
         match self {
             Self::Dark => true,
             Self::Light => false,
             Self::System => system_dark.unwrap_or(true),
+            Self::Terminal => terminal.is_none_or(TerminalColors::is_dark),
         }
     }
 }
@@ -166,25 +163,212 @@ pub fn system_is_dark() -> Option<bool> {
     }
 }
 
+/// What the terminal said it draws with, from an OSC 10 / OSC 11 query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalColors {
+    /// The default background (OSC 11).
+    pub bg: (u8, u8, u8),
+    /// The default foreground (OSC 10), when the terminal answered that too.
+    pub fg: Option<(u8, u8, u8)>,
+}
+
+impl TerminalColors {
+    /// Whether the ground is dark enough that light text belongs on it.
+    #[must_use]
+    pub fn is_dark(&self) -> bool {
+        luma(self.bg) < 128
+    }
+}
+
+/// Perceived brightness, 0–255.
+fn luma((r, g, b): (u8, u8, u8)) -> u32 {
+    (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000
+}
+
+/// `a` moved `t` of the way to `b`, `t` in 0–100.
+fn mix(a: (u8, u8, u8), b: (u8, u8, u8), t: u8) -> (u8, u8, u8) {
+    let step = |x: u8, y: u8| {
+        let x = i32::from(x);
+        let y = i32::from(y);
+        (x + (y - x) * i32::from(t) / 100).clamp(0, 255) as u8
+    };
+    (step(a.0, b.0), step(a.1, b.1), step(a.2, b.2))
+}
+
+/// Parse one OSC color reply body — what follows `]10;` or `]11;` up to the
+/// terminator: `rgb:rrrr/gggg/bbbb` (xterm, Ghostty, kitty, iTerm2) or
+/// `rgb:rr/gg/bb`. The first two hex digits of each channel are its byte.
+#[must_use]
+pub fn parse_osc_color(body: &str) -> Option<(u8, u8, u8)> {
+    let mut parts = body.trim().strip_prefix("rgb:")?.split('/');
+    let mut channel = || {
+        let part = parts.next()?;
+        let byte = match part.len() {
+            1 => u8::from_str_radix(part, 16).ok()? * 17,
+            2..=4 => u8::from_str_radix(&part[..2], 16).ok()?,
+            _ => return None,
+        };
+        Some(byte)
+    };
+    let r = channel()?;
+    let g = channel()?;
+    let b = channel()?;
+    Some((r, g, b))
+}
+
+/// Pick the OSC 10 and OSC 11 replies out of whatever the terminal sent
+/// back, in either order and with either terminator (`ESC \` or BEL).
+/// `None` until the background has been answered.
+#[must_use]
+pub fn parse_terminal_replies(bytes: &[u8]) -> Option<TerminalColors> {
+    let text = String::from_utf8_lossy(bytes);
+    let find = |code: &str| {
+        let start = text.find(&format!("\x1b]{code};"))? + code.len() + 3;
+        let rest = &text[start..];
+        let end = rest.find(['\x1b', '\x07'])?;
+        parse_osc_color(&rest[..end])
+    };
+    Some(TerminalColors {
+        bg: find("11")?,
+        fg: find("10"),
+    })
+}
+
+/// Ask the terminal for its default foreground and background. Must run in
+/// raw mode, after the alternate screen is up and before the first key is
+/// read, because the reply arrives on stdin. A terminal that does not answer
+/// within `timeout` — or a stdin that is not a terminal — gives `None`.
+#[must_use]
+pub fn query_terminal(timeout: Duration) -> Option<TerminalColors> {
+    use std::io::{Read, Write};
+
+    // SAFETY: `isatty` only inspects the descriptor.
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
+        return None;
+    }
+    let mut out = std::io::stdout();
+    out.write_all(b"\x1b]11;?\x1b\\\x1b]10;?\x1b\\").ok()?;
+    out.flush().ok()?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut buf = Vec::new();
+    let mut stdin = std::io::stdin();
+    loop {
+        // Stop once both replies are in; keep reading a moment for the second
+        // after the first, and give up at the deadline.
+        if let Some(colors) = parse_terminal_replies(&buf)
+            && colors.fg.is_some()
+        {
+            return Some(colors);
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return parse_terminal_replies(&buf);
+        }
+        let mut fds = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd, and its length is 1.
+        let ready = unsafe { libc::poll(&mut fds, 1, left.as_millis().min(1000) as i32) };
+        if ready <= 0 {
+            return parse_terminal_replies(&buf);
+        }
+        let mut chunk = [0u8; 256];
+        match stdin.read(&mut chunk) {
+            Ok(0) | Err(_) => return parse_terminal_replies(&buf),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
 impl Theme {
     /// The palette a name picks out: `dark` (the default) or `light`.
-    /// `system` needs an answer, so it is not a name here.
+    /// `system` and `terminal` need an answer, so they are not names here.
     #[must_use]
     pub fn named(name: &str) -> Option<Self> {
         match Base::parse(name)? {
             Base::Dark => Some(Self::default()),
             Base::Light => Some(Self::light()),
-            Base::System => None,
+            Base::System | Base::Terminal => None,
         }
     }
 
-    /// The palette for a base, given what the system said.
+    /// The palette for a base, given what the system and the terminal said.
     #[must_use]
-    pub fn for_base(base: Base, system_dark: Option<bool>) -> Self {
-        if base.is_dark(system_dark) {
-            Self::default()
+    pub fn for_base(
+        base: Base,
+        system_dark: Option<bool>,
+        terminal: Option<&TerminalColors>,
+    ) -> Self {
+        match base {
+            Base::Terminal => Self::terminal(terminal),
+            _ if base.is_dark(system_dark, terminal) => Self::default(),
+            _ => Self::light(),
+        }
+    }
+
+    /// The layout on the terminal's own ground: its background exactly, its
+    /// foreground for text, and every band and line in between mixed from
+    /// the two so the chat list, the selection, and the borders are steps of
+    /// the same color. Accents come from the dark or light palette, whichever
+    /// the ground calls for. Without an answer the ground and the text are
+    /// left to the terminal (`Color::Reset`) and the rest is the dark palette.
+    #[must_use]
+    pub fn terminal(colors: Option<&TerminalColors>) -> Self {
+        let Some(colors) = colors else {
+            return Self {
+                bg_base: Color::Reset,
+                bg_dark: Color::Reset,
+                text_primary: Color::Reset,
+                ..Self::default()
+            };
+        };
+        let dark = colors.is_dark();
+        let accents = if dark { Self::default() } else { Self::light() };
+        let bg = colors.bg;
+        // Without a foreground answer, the palette's text color stands in as
+        // the far end of the mixes, but the text itself stays the terminal's.
+        let fg = colors.fg.unwrap_or(if dark {
+            (0xc8, 0xc8, 0xc8)
         } else {
-            Self::light()
+            (0x3a, 0x3a, 0x3a)
+        });
+        let toward_fg = |t| Color::from(mix(bg, fg, t));
+        // A dark ground has a long way to go toward its text and a short way
+        // to black; a light ground is the reverse. The steps are sized so
+        // both come out as the shipped palettes do: the chat list a shade
+        // darker, the bands and borders a little way toward the text, the
+        // grays far enough along to read.
+        let (list_step, band, hover, highlight, border, dim, gray, sys, secondary) = if dark {
+            (25, 4, 6, 9, 12, 20, 32, 50, 65)
+        } else {
+            (2, 5, 6, 9, 13, 27, 50, 60, 75)
+        };
+        // A light ground's focused divider is a hairline a shade darker, not
+        // a dark line down the screen.
+        let active = if dark { 40 } else { 25 };
+        // The chat list is one step darker than the conversation on both
+        // grounds; a ground that cannot get darker steps the other way.
+        let mut darker = mix(bg, (0, 0, 0), list_step);
+        if luma(bg).abs_diff(luma(darker)) < 2 {
+            darker = mix(bg, fg, band);
+        }
+        Self {
+            bg_base: Color::from(bg),
+            bg_light: toward_fg(band),
+            bg_dark: Color::from(darker),
+            bg_highlight: toward_fg(highlight),
+            bg_hover: toward_fg(hover),
+            text_primary: colors.fg.map_or(Color::Reset, Color::from),
+            text_secondary: toward_fg(secondary),
+            gray: toward_fg(gray),
+            gray_dim: toward_fg(dim),
+            system: toward_fg(sys),
+            border: toward_fg(border),
+            border_active: toward_fg(active),
+            ..accents
         }
     }
 
@@ -207,45 +391,30 @@ impl Theme {
         }
     }
 
-    /// The dark palette on a light ground: the same accents, darkened enough
-    /// to read on white, with the bands and borders inverted.
+    /// The layout on a light ground: a soft gray page rather than white, dark
+    /// gray text rather than black, and the accent darkened enough to read.
     #[must_use]
     pub fn light() -> Self {
         Self {
-            bg_base: rgb(0xff, 0xff, 0xff),
-            bg_light: rgb(0xf4, 0xf4, 0xf6),
-            bg_dark: rgb(0xf7, 0xf7, 0xf9),
-            bg_highlight: rgb(0xe6, 0xe6, 0xeb),
-            bg_hover: rgb(0xec, 0xec, 0xf0),
+            bg_base: rgb(0xf0, 0xf0, 0xf0),
+            bg_light: rgb(0xe6, 0xe6, 0xe6),
+            bg_dark: rgb(0xec, 0xec, 0xec),
+            bg_highlight: rgb(0xde, 0xde, 0xde),
+            bg_hover: rgb(0xe4, 0xe4, 0xe4),
 
             accent_me: rgb(0x1f, 0x6f, 0xe5),
-            accent_them: rgb(0x2e, 0x8b, 0x57),
-            participants: [
-                rgb(0x2e, 0x8b, 0x57),
-                rgb(0xb0, 0x7a, 0x1a),
-                rgb(0x9b, 0x3f, 0xb0),
-                rgb(0x1f, 0x8a, 0x80),
-            ],
 
-            text_primary: rgb(0x1c, 0x1c, 0x1f),
-            text_secondary: rgb(0x52, 0x52, 0x5b),
-            gray: rgb(0x8a, 0x8a, 0x94),
-            gray_dim: rgb(0xc4, 0xc4, 0xcb),
-            system: rgb(0x6e, 0x6e, 0x78),
-            fuzzy: rgb(0x1f, 0x6f, 0xe5),
+            text_primary: rgb(0x3a, 0x3a, 0x3a),
+            text_secondary: rgb(0x6a, 0x6a, 0x6a),
+            gray: rgb(0x96, 0x96, 0x96),
+            gray_dim: rgb(0xc0, 0xc0, 0xc0),
+            system: rgb(0x80, 0x80, 0x80),
+            fuzzy: rgb(0x1c, 0x1c, 0x1f),
 
-            border: rgb(0xd6, 0xd6, 0xdc),
-            border_active: rgb(0x1f, 0x6f, 0xe5),
+            border: rgb(0xd8, 0xd8, 0xd8),
+            border_active: rgb(0xbd, 0xbd, 0xbd),
             error: rgb(0xc0, 0x39, 0x2b),
         }
-    }
-
-    /// The accent for the `n`th participant of a group chat, wrapping around
-    /// the palette. Callers pass a stable index (handle rowid order) so a
-    /// person keeps the same color for the whole thread.
-    #[must_use]
-    pub fn participant(&self, n: usize) -> Color {
-        self.participants[n % PARTICIPANT_SLOTS]
     }
 
     /// Border color for a pane, given whether it currently has focus.
@@ -259,8 +428,6 @@ impl Theme {
     }
 
     /// Overwrite one slot by name. Returns `false` if the name is not a slot.
-    ///
-    /// Participant accents are addressed as `participant0` … `participant3`.
     pub fn set_slot(&mut self, name: &str, color: Color) -> bool {
         match name {
             "bg_base" => self.bg_base = color,
@@ -269,7 +436,6 @@ impl Theme {
             "bg_highlight" => self.bg_highlight = color,
             "bg_hover" => self.bg_hover = color,
             "accent_me" => self.accent_me = color,
-            "accent_them" => self.accent_them = color,
             "text_primary" => self.text_primary = color,
             "text_secondary" => self.text_secondary = color,
             "gray" => self.gray = color,
@@ -279,18 +445,7 @@ impl Theme {
             "border" => self.border = color,
             "border_active" => self.border_active = color,
             "error" => self.error = color,
-            _ => {
-                let Some(idx) = name.strip_prefix("participant") else {
-                    return false;
-                };
-                let Ok(idx) = idx.parse::<usize>() else {
-                    return false;
-                };
-                if idx >= PARTICIPANT_SLOTS {
-                    return false;
-                }
-                self.participants[idx] = color;
-            }
+            _ => return false,
         }
         true
     }
@@ -388,20 +543,12 @@ mod tests {
     }
 
     #[test]
-    fn participants_wrap_and_start_at_accent_them() {
-        let theme = Theme::default();
-        assert_eq!(theme.participant(0), theme.accent_them);
-        assert_eq!(theme.participant(4), theme.participant(0));
-        assert_eq!(theme.participant(5), theme.participant(1));
-    }
-
-    #[test]
     fn overrides_apply_and_report_problems() {
         let mut theme = Theme::default();
         let overrides = BTreeMap::from([
             ("accent_me".to_string(), "#ff0000".to_string()),
+            ("gray".to_string(), "#00ff00".to_string()),
             ("participant2".to_string(), "#00ff00".to_string()),
-            ("participant9".to_string(), "#00ff00".to_string()),
             ("nope".to_string(), "#000000".to_string()),
             ("border".to_string(), "chartreuse".to_string()),
         ]);
@@ -409,7 +556,7 @@ mod tests {
         let warnings = theme.apply_overrides(&overrides);
 
         assert_eq!(theme.accent_me, Color::Rgb(255, 0, 0));
-        assert_eq!(theme.participants[2], Color::Rgb(0, 255, 0));
+        assert_eq!(theme.gray, Color::Rgb(0, 255, 0));
         assert_eq!(theme.border, Theme::default().border);
         assert_eq!(warnings.len(), 3);
     }
@@ -422,7 +569,7 @@ mod tests {
         ]);
 
         let (base, warning) = Theme::base_from(&overrides);
-        let mut theme = Theme::for_base(base, None);
+        let mut theme = Theme::for_base(base, None, None);
         let warnings = theme.apply_overrides(&overrides);
 
         assert_eq!(base, Base::Light);
@@ -447,25 +594,107 @@ mod tests {
             assert_eq!(base.name(), name);
         }
         assert_eq!(Base::parse("nope"), None);
-        assert_eq!(Base::Dark.next().next().next(), Base::Dark);
+        assert_eq!(Base::Dark.next().next().next().next(), Base::Dark);
+        assert_eq!(Theme::named("terminal"), None);
         assert_eq!(Theme::named("dark"), Some(Theme::default()));
         assert_eq!(Theme::named("system"), None);
     }
 
     #[test]
     fn system_follows_the_answer_and_reads_dark_until_there_is_one() {
-        assert!(Base::System.is_dark(None));
-        assert!(Base::System.is_dark(Some(true)));
-        assert!(!Base::System.is_dark(Some(false)));
-        assert!(Base::Dark.is_dark(Some(false)));
-        assert!(!Base::Light.is_dark(Some(true)));
-        assert_eq!(Theme::for_base(Base::System, Some(false)), Theme::light());
+        assert!(Base::System.is_dark(None, None));
+        assert!(Base::System.is_dark(Some(true), None));
+        assert!(!Base::System.is_dark(Some(false), None));
+        assert!(Base::Dark.is_dark(Some(false), None));
+        assert!(!Base::Light.is_dark(Some(true), None));
+        assert_eq!(
+            Theme::for_base(Base::System, Some(false), None),
+            Theme::light()
+        );
+    }
+
+    #[test]
+    fn osc_replies_parse_in_any_order_and_either_terminator() {
+        assert_eq!(
+            parse_osc_color("rgb:2b2b/1f1f/1a1a"),
+            Some((0x2b, 0x1f, 0x1a))
+        );
+        assert_eq!(parse_osc_color("rgb:2b/1f/1a"), Some((0x2b, 0x1f, 0x1a)));
+        assert_eq!(parse_osc_color("rgb:2b2b/1f1f"), None);
+        assert_eq!(parse_osc_color("#2b1f1a"), None);
+
+        let both = b"\x1b]10;rgb:eeee/e8e8/d5d5\x1b\\\x1b]11;rgb:2b2b/1f1f/1a1a\x07";
+        assert_eq!(
+            parse_terminal_replies(both),
+            Some(TerminalColors {
+                bg: (0x2b, 0x1f, 0x1a),
+                fg: Some((0xee, 0xe8, 0xd5)),
+            })
+        );
+        let bg_only = b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\";
+        let colors = parse_terminal_replies(bg_only).expect("background is enough");
+        assert_eq!(colors.fg, None);
+        assert!(!colors.is_dark());
+        assert_eq!(parse_terminal_replies(b"\x1b]10;rgb:0/0/0\x07"), None);
+        assert_eq!(parse_terminal_replies(b"\x1b]11;rgb:2b2b/1f1f"), None);
+    }
+
+    #[test]
+    fn terminal_palette_stands_on_the_terminal_ground() {
+        let brown = TerminalColors {
+            bg: (0x2b, 0x1f, 0x1a),
+            fg: Some((0xee, 0xe8, 0xd5)),
+        };
+        let theme = Theme::terminal(Some(&brown));
+        assert_eq!(theme.bg_base, Color::Rgb(0x2b, 0x1f, 0x1a));
+        assert_eq!(theme.text_primary, Color::Rgb(0xee, 0xe8, 0xd5));
+        assert_ne!(
+            theme.bg_dark, theme.bg_base,
+            "the chat list is its own step"
+        );
+        assert_ne!(theme.bg_highlight, theme.bg_base);
+        assert_eq!(theme.accent_me, Theme::default().accent_me, "dark accents");
+        assert!(Base::Terminal.is_dark(None, Some(&brown)));
+
+        let paper = TerminalColors {
+            bg: (0xfd, 0xf6, 0xe3),
+            fg: None,
+        };
+        let theme = Theme::terminal(Some(&paper));
+        assert_eq!(theme.accent_me, Theme::light().accent_me, "light accents");
+        // A light ground steps down gently for the list, not into gray.
+        let Color::Rgb(r, _, _) = theme.bg_dark else {
+            panic!("an rgb list ground");
+        };
+        assert!(
+            r >= 0xf0,
+            "list ground {r:#x} is barely darker than the page"
+        );
+        assert_eq!(
+            theme.text_primary,
+            Color::Reset,
+            "no answer, so the terminal's"
+        );
+        assert_ne!(theme.text_secondary, theme.bg_base);
+
+        let black = TerminalColors {
+            bg: (0, 0, 0),
+            fg: None,
+        };
+        let theme = Theme::terminal(Some(&black));
+        assert_ne!(theme.bg_dark, theme.bg_base, "black steps the other way");
+
+        let unknown = Theme::terminal(None);
+        assert_eq!(unknown.bg_base, Color::Reset);
+        assert_eq!(unknown.text_primary, Color::Reset);
+        assert_eq!(Theme::for_base(Base::Terminal, Some(false), None), unknown);
+        assert!(Base::Terminal.is_dark(None, None));
     }
 
     #[test]
     fn light_and_dark_disagree_on_the_ground() {
         assert_ne!(Theme::light().bg_base, Theme::default().bg_base);
-        assert_eq!(Theme::light().participant(0), Theme::light().accent_them);
+        assert_ne!(Theme::light().accent_me, Theme::default().accent_me);
     }
 
     #[test]

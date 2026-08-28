@@ -20,6 +20,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Position;
+use ratatui::style::Modifier;
 
 fn app() -> App {
     App::new(Config::default(), Vec::new())
@@ -79,26 +80,38 @@ fn default_screen_has_every_pane_from_the_mockup() {
     let mut app = app();
     let buffer = frame(&mut app, 120, 34);
 
-    assert!(contains(&buffer, "search chats"), "chat list filter line");
+    assert!(contains(&buffer, "/ filter"), "chat list filter line");
     assert!(contains(&buffer, "no conversation"), "conversation header");
     assert!(
         contains(&buffer, "no messages yet"),
         "conversation empty state"
     );
-    assert!(contains(&buffer, "message…"), "composer placeholder");
-    assert!(contains(&buffer, "chat.db not opened"), "status line");
-    assert!(contains(&buffer, "focus list/convo"), "shortcuts bar");
+    assert!(contains(&buffer, "❯ Message"), "composer placeholder");
+    assert!(contains(&buffer, "? help"), "the footer");
+    assert!(
+        !contains(&buffer, "chat.db"),
+        "the footer says nothing about the database"
+    );
 }
 
 #[test]
-fn narrow_terminal_drops_the_chat_list_but_keeps_the_conversation() {
+fn narrow_terminal_opens_on_the_list_screen_and_ctrl_b_swaps_to_the_conversation() {
     let mut app = app();
     let buffer = frame(&mut app, 80, 30);
 
+    // The list has focus at startup, so it is the whole screen.
+    let list = app.panes.chat_list.expect("the list screen");
+    assert_eq!(list.width, 80);
+    assert!(contains(&buffer, "/ filter"));
+    assert!(!contains(&buffer, "no messages yet"));
+    assert!(!contains(&buffer, "❯ Message"));
+
+    press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+    let buffer = frame(&mut app, 80, 30);
     assert!(app.panes.chat_list.is_none());
-    assert!(!contains(&buffer, "search chats"));
+    assert!(!contains(&buffer, "/ filter"));
     assert!(contains(&buffer, "no messages yet"));
-    assert!(contains(&buffer, "message…"));
+    assert!(contains(&buffer, "❯ Message"));
 }
 
 #[test]
@@ -201,15 +214,15 @@ fn slash_opens_the_chat_filter_and_letters_go_into_it() {
 #[test]
 fn ctrl_b_toggles_the_chat_list() {
     let mut app = app();
-    assert!(contains(&frame(&mut app, 120, 34), "search chats"));
+    assert!(contains(&frame(&mut app, 120, 34), "/ filter"));
 
     press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
     let buffer = frame(&mut app, 120, 34);
-    assert!(!contains(&buffer, "search chats"));
+    assert!(!contains(&buffer, "/ filter"));
     assert_eq!(app.focus, Focus::Conversation);
 
     press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
-    assert!(contains(&frame(&mut app, 120, 34), "search chats"));
+    assert!(contains(&frame(&mut app, 120, 34), "/ filter"));
 }
 
 #[test]
@@ -227,7 +240,8 @@ fn theme_overrides_from_config_reach_the_rendered_cells() {
 
     let buffer = frame(&mut app, 120, 34);
     let composer = app.panes.composer;
-    let corner = &buffer[(composer.x, composer.y)];
+    // The box sits a column in from the pane's edge.
+    let corner = &buffer[(composer.x + 1, composer.y)];
     assert_eq!(
         corner.fg,
         ratatui::style::Color::Rgb(0xff, 0x00, 0x00),
@@ -450,7 +464,7 @@ fn cell(buffer: &Buffer, x: u16, y: u16) -> ratatui::buffer::Cell {
 }
 
 #[test]
-fn chat_rows_carry_a_name_a_preview_a_time_and_an_unread_badge() {
+fn chat_rows_carry_a_name_a_preview_and_a_time_and_unread_is_bold() {
     let mut first = chat(1, "Alpha Person", 2, "sounds good, see you at 7");
     first.unread_count = 2;
     first.unread = 2;
@@ -464,8 +478,24 @@ fn chat_rows_carry_a_name_a_preview_a_time_and_an_unread_badge() {
     assert!(contains(&buffer, "Alpha Person"), "name");
     assert!(contains(&buffer, "sounds good"), "preview");
     assert!(contains(&buffer, "2m"), "relative time");
-    assert!(contains(&buffer, " 2 "), "unread badge");
     assert!(contains(&buffer, "1h"), "an hour-old chat");
+    let rows = app.panes.chat_list_rows.expect("the rows area");
+    let name = cell(&buffer, rows.x + 2, rows.y);
+    assert!(name.modifier.contains(Modifier::BOLD), "unread is bold");
+    let unread_time: Vec<_> = (0..rows.width)
+        .map(|x| cell(&buffer, rows.x + x, rows.y).fg)
+        .collect();
+    assert!(
+        unread_time.contains(&app.theme.accent_me),
+        "the time of an unread chat takes the accent"
+    );
+    let read_time: Vec<_> = (0..rows.width)
+        .map(|x| cell(&buffer, rows.x + x, rows.y + 3).fg)
+        .collect();
+    assert!(
+        !read_time.contains(&app.theme.accent_me),
+        "a read chat has no accent"
+    );
     assert!(contains(&buffer, "Charlie"), "a nine-day-old chat");
     // No pinning in this database, so no section headings.
     assert!(!contains(&buffer, "PINNED"));
@@ -484,19 +514,24 @@ fn the_selected_row_is_outlined_and_the_hovered_one_is_tinted() {
         app.panes.chat_list_rows.expect("the rows area")
     };
 
-    // Hover over the third chat, which starts four rows into the list.
-    app.hover = Some(Position::new(rows.x + 2, rows.y + 4));
+    // Hover over the third chat, which starts six rows into the list.
+    app.hover = Some(Position::new(rows.x + 2, rows.y + 6));
     let buffer = frame(&mut app, 120, 34);
 
     let selected = cell(&buffer, rows.x, rows.y);
-    assert_eq!(selected.fg, app.theme.border_active, "selection bar");
     assert_eq!(selected.bg, app.theme.bg_highlight, "selection background");
+    assert_eq!(selected.symbol(), " ", "no edge, no marker");
 
-    let hovered = cell(&buffer, rows.x + 2, rows.y + 4);
+    let hovered = cell(&buffer, rows.x + 2, rows.y + 6);
     assert_eq!(hovered.bg, app.theme.bg_hover, "hover tint");
 
-    let plain = cell(&buffer, rows.x + 2, rows.y + 2);
+    let plain = cell(&buffer, rows.x + 2, rows.y + 3);
     assert_eq!(plain.bg, app.theme.bg_dark, "an untouched row");
+    let air = cell(&buffer, rows.x + 2, rows.y + 2);
+    assert_eq!(
+        air.bg, app.theme.bg_dark,
+        "the blank row under the selection is not tinted"
+    );
 }
 
 #[test]
@@ -519,7 +554,7 @@ fn arrows_move_the_chat_selection_and_a_click_lands_on_either_of_its_rows() {
 
     let rows = app.panes.chat_list_rows.expect("the rows area");
     // The preview line of the second chat.
-    click(&mut app, rows.x + 3, rows.y + 3);
+    click(&mut app, rows.x + 3, rows.y + 4);
     assert_eq!(app.focus, Focus::ChatList);
     assert_eq!(app.chats.selected, 1);
     assert_eq!(app.selected_chat().map(|chat| chat.rowid), Some(2));
@@ -599,7 +634,7 @@ fn a_pinned_chat_opens_a_section_and_the_rest_follow_under_another() {
     let rows = app.panes.chat_list_rows.expect("the rows area");
     click(&mut app, rows.x + 3, rows.y);
     assert_eq!(app.chats.selected, 0);
-    click(&mut app, rows.x + 3, rows.y + 4);
+    click(&mut app, rows.x + 3, rows.y + 5);
     assert_eq!(app.chats.selected, 1);
 }
 
@@ -667,6 +702,7 @@ fn message(rowid: i64, from_me: bool, handle_rowid: i64, text: &str, minutes: i6
         date_read: 0,
         date_edited: 0,
         is_edited: false,
+        error: 0,
         text: (!text.is_empty()).then(|| text.to_string()),
         subject: None,
         attachments: Vec::new(),
@@ -722,11 +758,11 @@ fn a_conversation_draws_blocks_a_day_header_and_meta_lines() {
     let buffer = frame(&mut app, 120, 34);
 
     assert!(contains(&buffer, "dinner tonight"), "a body");
-    assert!(contains(&buffer, "· Delivered"), "a delivery stamp");
+    assert!(contains(&buffer, "Delivered"), "a delivery stamp");
     // The receipt goes under the last thing you said and nowhere else, so the
     // older message's read stamp is not drawn.
     assert!(
-        !contains(&buffer, "· Read "),
+        !contains(&buffer, "Read "),
         "one stamp, on the newest of yours"
     );
     assert!(contains(&buffer, "Today"), "the day header");
@@ -740,11 +776,10 @@ fn the_day_band_takes_a_row_of_its_own_rather_than_covering_a_message() {
     let band = app.panes.day.expect("a day band");
     let convo = app.panes.conversation;
 
-    // One row, directly above the messages, on the lighter band the mockup
-    // gives it.
+    // One row, directly above the messages, on the same ground as them.
     assert_eq!(band.height, 1);
     assert_eq!(band.y + 1, convo.y);
-    assert_eq!(buffer[(band.x, band.y)].bg, app.theme.bg_light);
+    assert_eq!(buffer[(band.x, band.y)].bg, app.theme.bg_base);
 
     // The day is said, and nothing the message says is hidden under the band.
     assert!(contains(&buffer, "Today"));
@@ -795,22 +830,50 @@ fn a_thread_longer_than_the_pane_gets_the_mockups_scrollbar() {
 }
 
 #[test]
-fn rails_are_blue_for_you_green_for_them_and_per_person_in_a_group() {
+fn names_open_every_run_and_yours_is_the_one_accent() {
     let mut app = with_conversation(
         false,
         1,
         vec![
             message(1, false, 1, "theirs", 20),
             message(2, true, 0, "mine", 10),
+            message(3, true, 0, "and more", 9),
         ],
     );
     let buffer = frame(&mut app, 120, 34);
     let area = app.panes.conversation;
-    let rails: Vec<_> = (0..area.height)
-        .map(|y| buffer[(area.x + 1, area.y + y)].fg)
+    assert!(
+        contains(&buffer, "someone1  theirs"),
+        "their name opens their run"
+    );
+    assert!(contains(&buffer, "You  mine"), "your name opens yours");
+    assert!(
+        contains(&buffer, "  and more"),
+        "the run's second message is set in, nameless"
+    );
+
+    // The only accent in the pane is on `You`; nothing else is colored.
+    let accented: Vec<(u16, u16)> = (0..area.height)
+        .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+        .filter(|&(x, y)| buffer[(area.x + x, area.y + y)].fg == app.theme.accent_me)
         .collect();
-    assert!(rails.contains(&app.theme.accent_them), "the other person");
-    assert!(rails.contains(&app.theme.accent_me), "you");
+    assert_eq!(accented.len(), 3, "`You`, once: {accented:?}");
+
+    // The clock sits at the right edge of the pane.
+    let right: Vec<String> = (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buffer[(area.x + x, area.y + y)].symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect();
+    let clocks = right
+        .iter()
+        .filter(|row| row.ends_with(" AM") || row.ends_with(" PM"))
+        .count();
+    assert_eq!(clocks, 3, "one clock per message: {right:?}");
 
     let mut group = with_conversation(
         true,
@@ -822,22 +885,13 @@ fn rails_are_blue_for_you_green_for_them_and_per_person_in_a_group() {
         ],
     );
     let buffer = frame(&mut group, 120, 34);
-    let area = group.panes.conversation;
-    let rails: Vec<_> = (0..area.height)
-        .map(|y| buffer[(area.x + 1, area.y + y)].fg)
-        .collect();
-    for slot in 0..3 {
-        assert!(
-            rails.contains(&group.theme.participant(slot)),
-            "participant {slot} keeps their own color"
-        );
+    for who in ["someone1", "someone2", "someone3"] {
+        assert!(contains(&buffer, who), "{who} is named");
     }
-    // A group names its senders; a one-to-one chat does not.
-    assert!(contains(&buffer, "someone1"), "sender name in a group");
 }
 
 #[test]
-fn a_group_event_is_dim_italic_and_railless() {
+fn a_group_event_is_dim_italic_and_nameless() {
     let mut event = message(2, false, 1, "", 10);
     event.item_type = 2;
     event.group_action = Some(msgs::db::GroupAction::NameChange("Sunday".to_string()));
@@ -845,15 +899,9 @@ fn a_group_event_is_dim_italic_and_railless() {
     let mut app = with_conversation(true, 2, vec![message(1, false, 1, "hello", 20), event]);
     let buffer = frame(&mut app, 120, 34);
     assert!(contains(&buffer, "named the conversation"));
-
-    // The event's rail column is blank, unlike the message above it.
-    let area = app.panes.conversation;
-    let rails: Vec<_> = (0..area.height)
-        .map(|y| buffer[(area.x + 1, area.y + y)].symbol().to_string())
-        .collect();
     assert!(
-        rails.iter().any(|cell| cell == "▌"),
-        "the message has a rail"
+        contains(&buffer, "someone1  hello"),
+        "the message above has a name"
     );
 }
 
@@ -1029,6 +1077,10 @@ fn a_photo_scrolled_off_the_top_keeps_the_rows_that_are_still_in_view() {
 
     // A pane only a few rows tall cuts the picture off at both edges; the
     // protocol clips it rather than refusing to draw.
+    // The first short frame measures at the new height; the jump to the
+    // newest message then lands the way it would in the real app.
+    let _ = frame(&mut app, 120, 12);
+    app.update(Action::ToBottom);
     let short = frame(&mut app, 120, 12);
     let painted = half_blocks(&short);
     assert!(painted > 0, "some of the picture is still on screen");
@@ -1038,15 +1090,14 @@ fn a_photo_scrolled_off_the_top_keeps_the_rows_that_are_still_in_view() {
 }
 
 #[test]
-fn the_header_names_the_chat_the_service_and_the_counts() {
+fn the_header_names_the_chat_the_service_and_nothing_more() {
     let mut app = with_conversation(false, 1, vec![message(1, false, 1, "hi", 5)]);
-    app.open_chat_photos = 38;
     let buffer = frame(&mut app, 120, 34);
 
     assert!(contains(&buffer, "Fixture Chat"), "the name");
     assert!(contains(&buffer, "iMessage"), "the service");
     assert!(contains(&buffer, "someone1"), "the other party");
-    assert!(contains(&buffer, "38 photos"), "the photo count");
+    assert!(!contains(&buffer, " msg"), "no counts");
 }
 
 #[test]
@@ -1243,9 +1294,11 @@ fn an_empty_composer_names_the_chat_it_will_send_to() {
     let mut app = with_chats(vec![chat(1, "Fixture Chat", 2, "last line")]);
     app.update(Action::FocusPane(Focus::Composer));
     let buffer = frame(&mut app, 120, 34);
-    assert!(contains(&buffer, "message Fixture Chat…"));
-    assert!(contains(&buffer, "Enter send"), "the hints from the mockup");
-    assert!(contains(&buffer, "Ctrl+A attach"));
+    assert!(contains(&buffer, "Message Fixture Chat"));
+    assert!(
+        !contains(&buffer, "Enter send"),
+        "no hint bar; the keys are in ? help"
+    );
 }
 
 #[test]
@@ -1282,7 +1335,7 @@ fn a_refused_send_says_why_on_the_block_and_gives_the_draft_back() {
     let buffer = frame(&mut app, 140, 34);
     assert!(contains(&buffer, "Failed — Messages is not signed in"));
     assert!(
-        contains(&buffer, "› on my way in 20"),
+        contains(&buffer, "❯ on my way in 20"),
         "the draft came back"
     );
     assert_eq!(
@@ -1299,7 +1352,7 @@ fn ctrl_a_turns_the_composer_into_a_path_prompt() {
 
     let buffer = frame(&mut app, 120, 34);
     assert!(contains(&buffer, "attach"), "the box says what it wants");
-    assert!(contains(&buffer, "path to a file"));
+    assert!(contains(&buffer, "Path to a file"));
     assert!(!contains(&buffer, "look at this"), "the draft is put aside");
 
     press(&mut app, KeyCode::Esc, KeyModifiers::NONE);

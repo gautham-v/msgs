@@ -68,12 +68,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::new().fg(theme.border_active))
         .style(Style::new().bg(theme.bg_light).fg(theme.text_primary))
         .padding(Padding::horizontal(1))
-        .title_top(Span::styled(
-            " keys ",
-            Style::new()
-                .fg(theme.accent_me)
-                .add_modifier(Modifier::BOLD),
-        ))
+        .title_top(Span::styled(" keys ", Style::new().fg(theme.gray)))
         .title_bottom(Span::styled(
             " ↑↓ scroll · Esc close ",
             Style::new().fg(theme.gray),
@@ -130,10 +125,10 @@ fn groups(app: &App) -> Vec<Vec<Line<'static>>> {
             Span::styled(
                 padded,
                 Style::new()
-                    .fg(theme.accent_me)
+                    .fg(theme.text_secondary)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(*description, Style::new().fg(theme.text_secondary)),
+            Span::styled(*description, Style::new().fg(theme.gray)),
         ]);
         if let Some(last) = groups.last_mut() {
             last.push(row);
@@ -175,7 +170,7 @@ fn note_width(app: &App) -> usize {
 fn heading(scope: &str, theme: &Theme) -> Line<'static> {
     Line::from(Span::styled(
         scope.to_uppercase(),
-        Style::new().fg(theme.gray).add_modifier(Modifier::BOLD),
+        Style::new().fg(theme.gray),
     ))
 }
 

@@ -1,15 +1,17 @@
- / search chats…             │ Alex Nakamura · iMessage · +1 (555) 000-0001    4 msgs · 1 photo
- ● Fixture Group 5/18/22  1  │──────────────────────────────────────────────────────────────────
-   Bailey: named the conver… │ May 18, 2022
-▌● Alex Nakamura 5/18/22  1  │
-▌  still unread              │ ▌  first fixture message
-   iMessage;-;+15550000009   │ ▌  00:29  😂  Alex   ❤️  You
-                             │ ▌  recovered from the typedstream
-                             │ ▌  00:30
-                             │ ▌  ┄ 📷  photo.png · 2.0 KB · (not downloaded on this Mac) ┄
-                             │ ▌  00:31 · Read 00:33
-                             │ ▌  still unread
-                             │ ▌  00:34
+  / filter                   │ Alex Nakamura · iMessage · +1 (55…  2 unread in 2 chats · ? help
+                             │──────────────────────────────────────────────────────────────────
+  Fixture Group     5/18/22  │ May 18, 2022
+  Bailey: named the conver…  │
+                             │
+  Alex Nakamura     5/18/22  │ Alex  first fixture message                             12:29 AM
+  still unread               │         😂  Alex   ❤️  You
+                             │       recovered from the typedstream                    12:30 AM
+  iMessage;-;+15550000009    │
+                             │ You                                                     12:31 AM
+                             │      ┄ 📷  photo.png · 2.0 KB · (not downloaded on t… ┄
+                             │      Read 12:33 AM
+                             │
+                             │ Alex  still unread                                      12:34 AM
                              │
                              │
                              │
@@ -17,10 +19,8 @@
                              │
                              │
                              │
-                             │╭────────────────────────────────────────────────────────────────╮
-                             ││› message Alex Nakamura…                                        │
-                             │╰────────────────────────────────────────────────────────────────╯
-                             │ o open · s save · y copy · Ctrl+R react
-────────────────────────────────────────────────────────────────────────────────────────────────
- Messages.app unknown  │  2 unread in 2 chats  │  watching chat.db
- Tab focus list/convo · ↑↓ select · Enter open/send · Ctrl+K jump / search · ? help
+                             │
+                             │
+                             │ ╭──────────────────────────────────────────────────────────────╮
+                             │ │ ❯ Message Alex Nakamura                                      │
+                             │ ╰──────────────────────────────────────────────────────────────╯

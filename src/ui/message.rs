@@ -1,10 +1,17 @@
 //! One message, laid out as a block of terminal rows.
 //!
-//! A block is the mockup's `.blk`: a two-column accent rail, a body wrapped to
-//! the pane, and a meta line carrying the time, the delivery stamp, and any
-//! tapback chips. [`block`] is a pure function of a message and the width it is
-//! drawn at, so the whole grammar — who gets which color, where a line breaks,
-//! how tall the block ends up — is testable without a terminal.
+//! A block is the mockup's `.msg`: the sender's name, a gray label, opening
+//! the first line, the body wrapped to the pane, the clock right-aligned in a column of
+//! its own on that first line, and — only when there is something to say — a
+//! meta line under it with the delivery stamp, an edit mark, a picture's name,
+//! or the tapback chips (gray text, no box). The name is a column: every row after the first —
+//! a wrapped line, a chip, a picture, the meta line — is set in under the
+//! words, not under the name. Consecutive messages from one person within a
+//! few minutes form a run: the name is said once, and the rest sit in that
+//! same column with just their clock. A blank row opens each run and each day.
+//! [`block`] is a pure function of a message and the width it is drawn at, so
+//! the whole grammar — where a name goes, where a line breaks, how tall the
+//! block ends up — is testable without a terminal.
 //!
 //! The height of a block is the length of what [`block`] produces, so the
 //! scroll arithmetic in [`super::conversation`] and the drawing can never
@@ -24,28 +31,36 @@ use crate::send::{Delivery, Pending, PendingTapback};
 use crate::theme::Theme;
 use crate::ui::format::{bytes, clock, day_label, find_links, single_line, truncate, width, wrap};
 
-/// Blank column to the left of the rail.
+/// Blank column to the left of the words.
 pub const MARGIN_LEFT: u16 = 1;
-/// Columns the accent rail occupies.
-pub const RAIL: u16 = 2;
-/// Columns between the rail and the body.
-pub const GAP: u16 = 1;
-/// Blank column to the right of the body.
+/// Blank column to the right of the clock, where the scrollbar lives.
 pub const MARGIN_RIGHT: u16 = 1;
+/// Columns the clock takes: `12:15 PM`.
+pub const TIME: u16 = 8;
+/// Columns kept clear between the words and the clock.
+pub const TIME_GAP: u16 = 2;
 /// Every column a block spends on something other than words.
-pub const CHROME: u16 = MARGIN_LEFT + RAIL + GAP + MARGIN_RIGHT;
-
-/// The glyph drawn in the first column of the rail.
-pub const RAIL_GLYPH: &str = "▌";
+pub const CHROME: u16 = MARGIN_LEFT + TIME_GAP + TIME + MARGIN_RIGHT;
+/// How long a pause ends a run: two messages further apart than this from the
+/// same person each get their name.
+pub const RUN_GAP_SECONDS: i64 = 5 * 60;
 /// The left border of a quoted reply.
 const QUOTE_GLYPH: &str = "▏";
 /// The dashes that stand in for the mockup's dashed border on a file chip.
 const CHIP_EDGE: &str = "┄";
+/// What Messages says under a message it could not send.
+pub const NOT_DELIVERED: &str = "Not delivered";
 
 /// Cells left for words at a pane `columns` wide.
 #[must_use]
 pub fn body_width(columns: u16) -> usize {
     usize::from(columns.saturating_sub(CHROME)).max(1)
+}
+
+/// Cells a block's rows are drawn across: the words, the gap, and the clock.
+#[must_use]
+pub fn row_width(columns: u16) -> u16 {
+    columns.saturating_sub(MARGIN_LEFT + MARGIN_RIGHT).max(1)
 }
 
 /// A link inside a laid-out block, so a click can find it again.
@@ -72,7 +87,13 @@ pub struct Link {
 pub struct ImageSpot {
     /// First row within [`Block::lines`] the picture covers.
     pub row: u16,
-    /// Columns it covers, counted from the start of the body.
+    /// Column it starts at, counted from the start of the body: the name
+    /// column the rest of the block is set in.
+    pub column: u16,
+    /// The width the picture was measured against, which is what the cache
+    /// files it under; drawing asks with the same number.
+    pub room: u16,
+    /// Columns it covers, counted from [`ImageSpot::column`].
     pub columns: u16,
     /// Rows it covers.
     pub rows: u16,
@@ -83,14 +104,14 @@ pub struct ImageSpot {
 /// One message as rows ready to draw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
-    /// The day separator above this message, when the day changes here.
+    /// Whether a blank row opens the block: the air above a new run or a new
+    /// day. Never on the first message of the page.
+    pub gap: bool,
+    /// The day separator above this message, when the day changes here. It
+    /// takes two rows: the label, and a blank one under it.
     pub day: Option<String>,
-    /// The body rows, rail and margins excluded.
+    /// The rows, margins excluded, the clock already on the end of the first.
     pub lines: Vec<Line<'static>>,
-    /// Rail color. `None` for a system line, which the mockup draws railless.
-    pub rail: Option<Color>,
-    /// Whether the body sits on the lighter band your own messages get.
-    pub band: bool,
     /// Links in [`Block::lines`], for `Ctrl+L` and for clicks.
     pub links: Vec<Link>,
     /// Pictures drawn over [`Block::lines`], for the conversation to fill in.
@@ -98,11 +119,18 @@ pub struct Block {
 }
 
 impl Block {
-    /// Rows the block occupies, day separator included.
+    /// Rows above [`Block::lines`]: the blank row, and the day separator with
+    /// the blank row under it.
+    #[must_use]
+    pub fn lead(&self) -> u16 {
+        u16::from(self.gap) + 2 * u16::from(self.day.is_some())
+    }
+
+    /// Rows the block occupies, blank row and day separator included.
     #[must_use]
     pub fn height(&self) -> u16 {
         let lines = u16::try_from(self.lines.len()).unwrap_or(u16::MAX);
-        lines.saturating_add(u16::from(self.day.is_some()))
+        lines.saturating_add(self.lead())
     }
 }
 
@@ -180,48 +208,49 @@ impl Ctx<'_> {
         standing
     }
 
-    /// The rail color for a message.
-    ///
-    /// Yours is always the blue accent. In a one-to-one chat the other person
-    /// is the green one; in a group everybody keeps the color their position in
-    /// the participant list gives them, and that list is ordered by
-    /// `handle.ROWID`, so a color follows a person across sessions.
-    ///
-    /// The position is taken by person, not by row: somebody who is in a group
-    /// twice — an Apple ID and a phone number, which Contacts calls one name —
-    /// gets one color for both.
+    /// Whether the message at `index` continues the run above it: the same
+    /// person, a few minutes apart at most, on the same day. A run says its
+    /// name once; its later messages are set in under it.
     #[must_use]
-    pub fn accent(&self, message: &Message) -> Color {
-        if message.is_from_me {
-            return self.theme.accent_me;
-        }
-        let Some(chat) = self.chat else {
-            return self.theme.accent_them;
+    pub fn continues(&self, index: usize) -> bool {
+        let Some(message) = self.messages.get(index) else {
+            return false;
         };
-        if !chat.is_group {
-            return self.theme.accent_them;
+        let Some(previous) = index
+            .checked_sub(1)
+            .and_then(|before| self.messages.get(before))
+        else {
+            return false;
+        };
+        if message.is_announcement() || previous.is_announcement() {
+            return false;
         }
-        self.theme.participant(self.slot(message.handle_rowid))
+        let same_person = match (message.is_from_me, previous.is_from_me) {
+            (true, true) => true,
+            (false, false) => message.handle_rowid == previous.handle_rowid,
+            _ => false,
+        };
+        if !same_person || opens_a_day(self.messages, index) {
+            return false;
+        }
+        match (message.sent_at(), previous.sent_at()) {
+            (Some(now), Some(then)) => (now - then).num_seconds().abs() <= RUN_GAP_SECONDS,
+            _ => false,
+        }
     }
 
-    /// Which participant color a sender gets.
-    fn slot(&self, handle_rowid: Option<i64>) -> usize {
-        let Some((chat, rowid)) = self.chat.zip(handle_rowid) else {
-            return 0;
+    /// Whether the message at `index` would print the same clock as the one
+    /// above it.
+    #[must_use]
+    pub fn same_minute(&self, index: usize) -> bool {
+        let Some(now) = self.messages.get(index).and_then(Message::sent_at) else {
+            return false;
         };
-        let Some(sender) = chat
-            .participants
-            .iter()
-            .find(|handle| handle.rowid == rowid)
-        else {
-            return 0;
-        };
-        // The first row that is the same person, which is that row itself
-        // unless Contacts has joined two addresses under one name.
-        chat.participants
-            .iter()
-            .position(|handle| same_person(handle, sender))
-            .unwrap_or(0)
+        index
+            .checked_sub(1)
+            .and_then(|before| self.messages.get(before))
+            .and_then(Message::sent_at)
+            .is_some_and(|then| clock(then) == clock(now))
     }
 
     /// The name to show for whoever sent a message.
@@ -272,15 +301,6 @@ impl Ctx<'_> {
     }
 }
 
-/// Whether two participant rows are the same person: the same name where
-/// Contacts knows one, and otherwise the same address.
-fn same_person(left: &crate::db::Handle, right: &crate::db::Handle) -> bool {
-    match (left.name.as_ref(), right.name.as_ref()) {
-        (Some(left), Some(right)) if !left.is_empty() && !right.is_empty() => left == right,
-        _ => left.id.eq_ignore_ascii_case(&right.id),
-    }
-}
-
 /// Lay the `index`th message of the loaded page out for a pane `columns` wide.
 ///
 /// # Panics
@@ -290,69 +310,80 @@ fn same_person(left: &crate::db::Handle, right: &crate::db::Handle) -> bool {
 pub fn block(ctx: &Ctx<'_>, index: usize, columns: u16) -> Block {
     let Some(message) = ctx.messages.get(index) else {
         return Block {
+            gap: false,
             day: None,
             lines: Vec::new(),
-            rail: None,
-            band: false,
             links: Vec::new(),
             images: Vec::new(),
         };
     };
     let room = body_width(columns);
     let day = day_separator(ctx, index);
+    let continues = ctx.continues(index);
+    let gap = index > 0 && !continues;
 
     if message.is_announcement() {
-        return system_block(ctx, message, day, room);
+        return system_block(ctx, message, gap, day, room);
     }
 
     let theme = ctx.theme;
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<Link> = Vec::new();
+    // The name is a column. The head of a run puts the name in it on the
+    // first row; every other row of the run — wrapped lines, chips, pictures,
+    // the meta line, the later messages — is set in past it.
+    let name = ctx.sender(message);
+    let column = width(&name) + 2;
+    let words = room.saturating_sub(column).max(1);
+    let lead = || Span::raw(" ".repeat(column));
 
+    // A quoted reply opens with the name too, on the quote's row.
     if let Some(target) = ctx.quoted(message) {
-        lines.push(quote_line(ctx, target, room));
+        let mut line = quote_line(ctx, target, words);
+        line.spans.insert(0, lead());
+        lines.push(line);
     }
+    let first_row_names = !continues && lines.is_empty();
 
-    // In a group the sender's name opens the first body line, which is why the
-    // first line is wrapped to a narrower column than the rest.
-    let name = if ctx.is_group() {
-        Some(ctx.sender(message))
-    } else {
-        None
-    };
-    let prefix = name.as_ref().map_or(0, |name| width(name) + 2);
     let body = message.text.as_deref().unwrap_or_default();
-    let wrapped = wrap(body, room.saturating_sub(prefix), room);
+    let wrapped = wrap(body, words, words);
 
     for (row, text) in wrapped.iter().enumerate() {
         let mut spans = Vec::new();
-        let mut column = 0u16;
-        if row == 0
-            && let Some(name) = name.as_ref()
-        {
+        if row == 0 && first_row_names {
+            // A label, not a headline: regular weight, a step back from the
+            // words. `You` is the one word on the screen in the accent.
             spans.push(Span::styled(
                 name.clone(),
-                Style::new()
-                    .fg(ctx.accent(message))
-                    .add_modifier(Modifier::BOLD),
+                Style::new().fg(if message.is_from_me {
+                    theme.accent_me
+                } else {
+                    theme.text_secondary
+                }),
             ));
             spans.push(Span::raw("  "));
-            column = u16::try_from(prefix).unwrap_or(u16::MAX);
+        } else {
+            spans.push(lead());
         }
         let row_index = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-        let (text_spans, found) = link_spans(text, theme, row_index, column);
+        let (text_spans, found) = link_spans(
+            text,
+            theme,
+            row_index,
+            u16::try_from(column).unwrap_or(u16::MAX),
+        );
         spans.extend(text_spans);
         links.extend(found);
         lines.push(Line::from(spans));
     }
     // A body of nothing but an attachment leaves an empty row behind; the chip
-    // below says everything there is to say. A group keeps the row, because the
-    // sender's name is on it.
-    if body.is_empty() && name.is_none() && !message.attachments.is_empty() {
+    // or the picture below says everything there is to say. A run head keeps
+    // the row, because the sender's name is on it.
+    if body.is_empty() && continues && !message.attachments.is_empty() {
         lines.pop();
     }
 
-    let room_columns = u16::try_from(room).unwrap_or(u16::MAX);
+    let words_columns = u16::try_from(words).unwrap_or(u16::MAX);
     let mut images: Vec<ImageSpot> = Vec::new();
     let mut first_inline: Option<&AttachmentRef> = None;
 
@@ -362,41 +393,71 @@ pub fn block(ctx: &Ctx<'_>, index: usize, columns: u16) -> Block {
         }
         // A picture the terminal can draw takes rows of its own; the name and
         // the size then ride on the meta line, the way the mockup has them.
-        if let Some((columns, rows)) = ctx.images.cells(attachment, room_columns) {
+        if let Some((columns, rows)) = ctx.images.cells(attachment, words_columns) {
             images.push(ImageSpot {
                 row: u16::try_from(lines.len()).unwrap_or(u16::MAX),
+                column: u16::try_from(column).unwrap_or(u16::MAX),
+                room: words_columns,
                 columns,
                 rows,
                 attachment: index,
             });
             for _ in 0..rows {
-                lines.push(Line::default());
+                lines.push(Line::from(lead()));
             }
             if first_inline.is_none() {
                 first_inline = Some(attachment);
             }
             continue;
         }
-        lines.push(Line::from(chip_spans(attachment, theme, room)));
+        let mut spans = chip_spans(attachment, theme, words);
+        spans.insert(0, lead());
+        lines.push(Line::from(spans));
     }
 
     let note = first_inline.map(|attachment| inline_note(attachment, images.len()));
-    lines.extend(meta_lines(
+    for mut line in meta_lines(
         ctx,
         message,
-        room,
+        words,
         note.as_deref(),
         ctx.is_latest_mine(index),
-    ));
+    ) {
+        line.spans.insert(0, lead());
+        lines.push(line);
+    }
+
+    // The clock, right-aligned in its own column on the first row. Every row
+    // is at most `room` wide, so the padding lands the clock on the same
+    // column down the whole pane. Inside a run it is said once per minute:
+    // a continuation on the same minute as the message above stays bare.
+    if let Some(first) = lines.first_mut()
+        && !(continues && ctx.same_minute(index))
+    {
+        add_clock(first, message, room, theme);
+    }
 
     Block {
+        gap,
         day,
         lines,
-        rail: Some(ctx.accent(message)),
-        band: message.is_from_me,
         links,
         images,
     }
+}
+
+/// Put the clock on the end of a row, [`TIME_GAP`] past the widest a row can be.
+fn add_clock(line: &mut Line<'static>, message: &Message, room: usize, theme: &Theme) {
+    let Some(when) = message.sent_at() else {
+        return;
+    };
+    let used: usize = line.spans.iter().map(|span| width(&span.content)).sum();
+    let pad = room.saturating_sub(used) + usize::from(TIME_GAP);
+    line.spans.push(Span::raw(" ".repeat(pad)));
+    line.spans.push(Span::styled(
+        format!("{:>w$}", clock(when), w = usize::from(TIME)),
+        Style::new().fg(theme.gray),
+    ));
 }
 
 /// What the meta line says about the pictures drawn above it:
@@ -424,8 +485,14 @@ fn inline_note(attachment: &AttachmentRef, drawn: usize) -> String {
     name
 }
 
-/// A rename, a join, or a leave: dim, italic, and without a rail.
-fn system_block(ctx: &Ctx<'_>, message: &Message, day: Option<String>, room: usize) -> Block {
+/// A rename, a join, or a leave: dim, italic, and without a name or a clock.
+fn system_block(
+    ctx: &Ctx<'_>,
+    message: &Message,
+    gap: bool,
+    day: Option<String>,
+    room: usize,
+) -> Block {
     let style = Style::new()
         .fg(ctx.theme.system)
         .add_modifier(Modifier::ITALIC);
@@ -434,10 +501,9 @@ fn system_block(ctx: &Ctx<'_>, message: &Message, day: Option<String>, room: usi
         .map(|text| Line::from(Span::styled(text, style)))
         .collect();
     Block {
+        gap,
         day,
         lines,
-        rail: None,
-        band: false,
         links: Vec::new(),
         images: Vec::new(),
     }
@@ -556,7 +622,9 @@ fn chip_spans(attachment: &AttachmentRef, theme: &Theme, room: usize) -> Vec<Spa
     ]
 }
 
-/// The meta line, and the tapback chips that ride on the end of it.
+/// The meta line, and the tapback chips that ride on the end of it. Nothing
+/// at all when there is no stamp, no note, no send in flight, and no chip:
+/// the clock is already on the first row, so most messages end there.
 fn meta_lines(
     ctx: &Ctx<'_>,
     message: &Message,
@@ -565,27 +633,49 @@ fn meta_lines(
     stamp: bool,
 ) -> Vec<Line<'static>> {
     let theme = ctx.theme;
-    let meta = match note {
-        Some(note) => format!("{} · {note}", meta_text(message, stamp)),
-        None => meta_text(message, stamp),
+    let meta = match (meta_text(message, stamp), note) {
+        (meta, Some(note)) if meta.is_empty() => note.to_string(),
+        (meta, Some(note)) => format!("{meta} · {note}"),
+        (meta, None) => meta,
     };
     let chips = tapback_chips(ctx, message);
+    let pending = ctx.pending_note(message);
+    // Messages' own verdict on a message of yours, in the error color: the
+    // one thing on the meta line that is not gray, because it is the one
+    // thing that needs doing something about.
+    let failed = message.is_from_me && message.error != 0;
+    if meta.is_empty() && chips.is_empty() && pending.is_none() && !failed {
+        return Vec::new();
+    }
 
-    let mut spans = vec![Span::styled(
-        truncate(&meta, room),
-        Style::new().fg(theme.gray),
-    )];
-    let mut used = width(&meta).min(room);
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    if failed {
+        spans.push(Span::styled(NOT_DELIVERED, Style::new().fg(theme.error)));
+        used += width(NOT_DELIVERED);
+        if !meta.is_empty() {
+            spans.push(Span::styled(" · ", Style::new().fg(theme.gray)));
+            used += 3;
+        }
+    }
+    if !meta.is_empty() {
+        let meta = truncate(&meta, room.saturating_sub(used));
+        used += width(&meta);
+        spans.push(Span::styled(meta, Style::new().fg(theme.gray)));
+    }
     let mut lines = Vec::new();
 
     // `· Sending…` rides on the end of the meta line rather than taking a row
     // of its own, so a block does not change height when the send lands.
-    if let Some((note, color)) = ctx.pending_note(message) {
-        let room_left = room.saturating_sub(used + 1);
+    if let Some((note, color)) = pending {
+        let sep = usize::from(used > 0);
+        let room_left = room.saturating_sub(used + sep);
         if room_left > 0 {
             let note = truncate(&note, room_left);
-            used += width(&note) + 1;
-            spans.push(Span::raw(" "));
+            used += width(&note) + sep;
+            if sep > 0 {
+                spans.push(Span::raw(" "));
+            }
             spans.push(Span::styled(note, Style::new().fg(color)));
         }
     }
@@ -599,7 +689,7 @@ fn meta_lines(
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             format!(" {chip} "),
-            Style::new().bg(theme.bg_highlight).fg(theme.text_secondary),
+            Style::new().fg(theme.text_secondary),
         ));
         used += cells;
     }
@@ -607,29 +697,29 @@ fn meta_lines(
     lines
 }
 
-/// `18:02`, `18:06 · Delivered`, `18:02 · Read 18:05`, and `· Edited` on the
-/// end of any of them.
+/// What goes under a message besides its clock: `Delivered`, `Read 18:05`,
+/// `Edited`, or `Read 18:05 · Edited` — and nothing, for most messages.
 ///
 /// `stamp` says whether this message is the one the receipt belongs under —
-/// [`Ctx::is_latest_mine`] — so an older message of yours is just its clock,
-/// the way Messages.app draws it. The edit mark is not a receipt and goes on
+/// [`Ctx::is_latest_mine`] — so an older message of yours carries none, the
+/// way Messages.app draws it. The edit mark is not a receipt and goes on
 /// every edited message, whoever sent it: msgs cannot edit, but `chat.db`
 /// records what another device did and saying so is cheaper than surprising
 /// somebody with a body that changed under them.
 #[must_use]
 pub fn meta_text(message: &Message, stamp: bool) -> String {
-    let sent = message.sent_at().map(clock).unwrap_or_default();
-    let edited = if message.is_edited { " · Edited" } else { "" };
-    if !message.is_from_me || !stamp {
-        return format!("{sent}{edited}");
+    let mut parts = Vec::new();
+    if message.is_from_me && stamp {
+        if let Some(read) = message.read_at() {
+            parts.push(format!("Read {}", clock(read)));
+        } else if message.delivered_at().is_some() {
+            parts.push("Delivered".to_string());
+        }
     }
-    if let Some(read) = message.read_at() {
-        return format!("{sent} · Read {}{edited}", clock(read));
+    if message.is_edited {
+        parts.push("Edited".to_string());
     }
-    if message.delivered_at().is_some() {
-        return format!("{sent} · Delivered{edited}");
-    }
-    format!("{sent}{edited}")
+    parts.join(" · ")
 }
 
 /// The reactions standing on a message, as chip labels.
@@ -755,6 +845,7 @@ mod tests {
             date_read: 0,
             date_edited: 0,
             is_edited: false,
+            error: 0,
             text: (!text.is_empty()).then(|| text.to_string()),
             subject: None,
             attachments: Vec::new(),
@@ -849,24 +940,83 @@ mod tests {
     }
 
     #[test]
-    fn a_block_is_a_body_and_a_meta_line_under_a_day_separator() {
+    fn a_block_is_one_row_with_the_name_and_the_clock_under_a_day_separator() {
         let fixture = Fixture::new(false, vec![message(1, false, "yes!! 7?")]);
         let block = block(&fixture.ctx(), 0, 60);
 
         assert_eq!(block.day.as_deref(), Some("Today"));
-        assert_eq!(block.lines.len(), 2);
-        assert_eq!(text_of(&block.lines[0]), "yes!! 7?");
-        assert_eq!(block.height(), 3);
-        assert_eq!(block.rail, Some(Theme::default().accent_them));
-        assert!(!block.band);
+        assert!(!block.gap, "the first message of the page has no air above");
+        assert_eq!(block.lines.len(), 1, "no meta line without a stamp");
+        let row = text_of(&block.lines[0]);
+        assert!(row.starts_with("alex  yes!! 7?"), "{row}");
+        assert!(row.ends_with("6:20 PM"), "{row}");
+        assert_eq!(width(&row), usize::from(row_width(60)));
+        assert_eq!(
+            block.height(),
+            3,
+            "the day label, its blank row, the message"
+        );
     }
 
     #[test]
-    fn your_own_message_gets_the_band_and_the_blue_rail() {
-        let fixture = Fixture::new(false, vec![message(1, true, "on my way")]);
-        let block = block(&fixture.ctx(), 0, 60);
-        assert_eq!(block.rail, Some(Theme::default().accent_me));
-        assert!(block.band);
+    fn your_own_name_is_the_accent_and_theirs_is_gray() {
+        let fixture = Fixture::new(
+            false,
+            vec![message(1, true, "on my way"), {
+                let mut theirs = message(2, false, "ok");
+                theirs.date = stamp(9);
+                theirs
+            }],
+        );
+        let ctx = fixture.ctx();
+        let mine = block(&ctx, 0, 60);
+        assert_eq!(mine.lines[0].spans[0].content, "You");
+        assert_eq!(
+            mine.lines[0].spans[0].style.fg,
+            Some(Theme::default().accent_me)
+        );
+
+        let theirs = block(&ctx, 1, 60);
+        assert!(theirs.gap, "a new run opens with a blank row");
+        assert_eq!(theirs.lines[0].spans[0].content, "alex");
+        assert_eq!(
+            theirs.lines[0].spans[0].style.fg,
+            Some(Theme::default().text_secondary)
+        );
+        assert!(
+            !theirs.lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "a label, not a headline"
+        );
+    }
+
+    #[test]
+    fn a_run_says_the_name_once_and_sets_the_rest_in() {
+        let mut second = message(2, false, "or different saturday?");
+        second.date = stamp(9);
+        let mut later = message(3, false, "sunday for me");
+        later.date = stamp(2);
+        let fixture = Fixture::new(false, vec![message(1, false, "saturday?"), second, later]);
+        let ctx = fixture.ctx();
+
+        assert!(!ctx.continues(0));
+        assert!(ctx.continues(1), "a minute later, same person");
+        assert!(!ctx.continues(2), "seven minutes is a pause");
+
+        let head = block(&ctx, 0, 60);
+        let tail = block(&ctx, 1, 60);
+        assert!(text_of(&head.lines[0]).starts_with("alex  saturday?"));
+        assert!(!tail.gap, "no air inside a run");
+        let row = text_of(&tail.lines[0]);
+        assert!(
+            row.starts_with("      or different"),
+            "under the words, not the name: {row}"
+        );
+        assert!(row.ends_with("6:21 PM"), "{row}");
+        assert_eq!(width(&row), usize::from(row_width(60)));
+        assert!(block(&ctx, 2, 60).gap);
     }
 
     #[test]
@@ -887,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn a_group_names_the_sender_and_colors_them_by_participant_order() {
+    fn a_group_names_each_sender_and_another_person_ends_the_run() {
         let mut second = message(2, false, "in. keeping my keeper");
         second.handle_rowid = Some(2);
         let fixture = Fixture::new(true, vec![message(1, false, "who's in?"), second]);
@@ -895,17 +1045,11 @@ mod tests {
 
         let first = block(&ctx, 0, 60);
         assert!(text_of(&first.lines[0]).starts_with("alex  "));
-        assert_eq!(first.rail, Some(Theme::default().participant(0)));
 
+        assert!(!ctx.continues(1), "a different person");
         let second = block(&ctx, 1, 60);
+        assert!(second.gap);
         assert!(text_of(&second.lines[0]).starts_with("bailey  "));
-        assert_eq!(second.rail, Some(Theme::default().participant(1)));
-    }
-
-    #[test]
-    fn a_one_to_one_chat_shows_no_names() {
-        let fixture = Fixture::new(false, vec![message(1, false, "hello")]);
-        assert_eq!(text_of(&block(&fixture.ctx(), 0, 60).lines[0]), "hello");
     }
 
     #[test]
@@ -915,27 +1059,53 @@ mod tests {
         let narrow = block(&fixture.ctx(), 0, 30);
         let wide = block(&fixture.ctx(), 0, 100);
         assert!(narrow.height() > wide.height());
+        assert!(
+            text_of(&narrow.lines[1]).starts_with("      wrap"),
+            "wrapped lines sit under the words"
+        );
         for line in &narrow.lines {
-            assert!(width(&text_of(line)) <= body_width(30));
+            assert!(width(&text_of(line)) <= usize::from(row_width(30)));
         }
     }
 
     #[test]
     fn delivery_stamps_only_appear_on_your_own_messages() {
         let mut mine = message(1, true, "sent");
-        assert_eq!(meta_text(&mine, true), "18:20", "no stamp before delivery");
+        assert_eq!(meta_text(&mine, true), "", "no stamp before delivery");
 
         mine.date_delivered = stamp(9);
-        assert_eq!(meta_text(&mine, true), "18:20 · Delivered");
+        assert_eq!(meta_text(&mine, true), "Delivered");
 
         mine.date_read = stamp(8);
-        assert_eq!(meta_text(&mine, true), "18:20 · Read 18:22");
+        assert_eq!(meta_text(&mine, true), "Read 6:22 PM");
 
         // Incoming messages never carry a stamp, even when the column is set.
         let mut theirs = message(2, false, "got it");
         theirs.date_delivered = stamp(9);
         theirs.date_read = stamp(8);
-        assert_eq!(meta_text(&theirs, true), "18:20");
+        assert_eq!(meta_text(&theirs, true), "");
+    }
+
+    #[test]
+    fn a_message_messages_could_not_send_says_so_in_red() {
+        let mut mine = message(1, true, "hi there");
+        mine.error = 22;
+        let fixture = Fixture::new(false, vec![mine]);
+        let laid = block(&fixture.ctx(), 0, 60);
+        assert_eq!(laid.lines.len(), 2, "a meta line for the verdict");
+        let meta = &laid.lines[1];
+        let verdict = meta
+            .spans
+            .iter()
+            .find(|span| span.content.contains(NOT_DELIVERED))
+            .expect("the verdict");
+        assert_eq!(verdict.style.fg, Some(Theme::default().error));
+
+        // Somebody else's message never carries one, whatever the column says.
+        let mut theirs = message(2, false, "got it");
+        theirs.error = 22;
+        let fixture = Fixture::new(false, vec![theirs]);
+        assert_eq!(block(&fixture.ctx(), 0, 60).lines.len(), 1);
     }
 
     #[test]
@@ -943,15 +1113,15 @@ mod tests {
         let mut mine = message(1, true, "sent");
         mine.date_edited = stamp(5);
         mine.is_edited = true;
-        assert_eq!(meta_text(&mine, true), "18:20 · Edited");
+        assert_eq!(meta_text(&mine, true), "Edited");
         mine.date_delivered = stamp(9);
-        assert_eq!(meta_text(&mine, true), "18:20 · Delivered · Edited");
+        assert_eq!(meta_text(&mine, true), "Delivered · Edited");
         mine.date_read = stamp(8);
-        assert_eq!(meta_text(&mine, true), "18:20 · Read 18:22 · Edited");
+        assert_eq!(meta_text(&mine, true), "Read 6:22 PM · Edited");
 
         let mut theirs = message(2, false, "got it");
         theirs.is_edited = true;
-        assert_eq!(meta_text(&theirs, true), "18:20 · Edited");
+        assert_eq!(meta_text(&theirs, true), "Edited");
     }
 
     #[test]
@@ -978,10 +1148,12 @@ mod tests {
 
         let meta = |index: usize| {
             let block = block(&ctx, index, 60);
-            text_of(block.lines.last().expect("a meta line"))
+            text_of(block.lines.last().expect("a row"))
         };
         assert!(!meta(0).contains("Read"), "the older one is just its clock");
-        assert!(meta(1).contains("· Read"), "the newest of yours is stamped");
+        assert_eq!(block(&ctx, 0, 60).lines.len(), 1, "and no meta line");
+        assert!(meta(1).contains("Read"), "the newest of yours is stamped");
+        assert_eq!(block(&ctx, 1, 60).lines.len(), 2);
         assert!(!meta(2).contains("Read"));
     }
 
@@ -1053,17 +1225,17 @@ mod tests {
     }
 
     #[test]
-    fn a_group_event_is_a_railless_italic_line() {
+    fn a_group_event_is_an_italic_line_without_a_clock() {
         let mut event = message(3, false, "");
         event.item_type = 2;
         event.group_action = Some(GroupAction::NameChange("Sunday Football".to_string()));
         let fixture = Fixture::new(true, vec![event]);
         let block = block(&fixture.ctx(), 0, 80);
 
-        assert!(block.rail.is_none());
-        assert!(!block.band);
         assert_eq!(block.lines.len(), 1);
-        assert!(text_of(&block.lines[0]).contains("named the conversation"));
+        let row = text_of(&block.lines[0]);
+        assert!(row.contains("named the conversation"));
+        assert!(!row.ends_with("PM"), "{row}");
     }
 
     #[test]
@@ -1084,10 +1256,18 @@ mod tests {
         }];
         let fixture = Fixture::new(false, vec![photo]);
         let block = block(&fixture.ctx(), 0, 80);
-        assert_eq!(block.lines.len(), 2, "chip and meta, no empty body row");
-        let chip = text_of(&block.lines[0]);
+        assert_eq!(block.lines.len(), 2, "the name row and the chip, no meta");
+        let chip = text_of(&block.lines[1]);
         assert!(chip.contains("📄 draft-order.pdf · 84 KB"), "{chip}");
-        assert!(chip.starts_with(CHIP_EDGE), "the dashed edge: {chip}");
+        assert!(
+            chip.trim_start().starts_with(CHIP_EDGE),
+            "the dashed edge: {chip}"
+        );
+        assert!(chip.starts_with("      ┄"), "set in past the name: {chip}");
+        assert!(
+            text_of(&block.lines[0]).ends_with("6:20 PM"),
+            "the clock stays on the first row"
+        );
         assert!(block.images.is_empty(), "a pdf is never drawn inline");
     }
 
@@ -1120,15 +1300,21 @@ mod tests {
         let block = block(&fixture.ctx(), 0, 60);
 
         let spot = *block.images.first().expect("a reserved picture");
-        assert_eq!(spot.row, 0, "the picture opens the block");
+        assert_eq!(spot.row, 1, "the picture sits under the name row");
+        assert_eq!(spot.column, 6, "set in past `alex  `");
+        assert_eq!(spot.room, u16::try_from(body_width(60) - 6).unwrap());
         assert_eq!(spot.attachment, 0);
         // Twenty by ten cells at a ten-by-twenty font: five rows for the rows.
         assert_eq!((spot.columns, spot.rows), (20, 5));
-        assert_eq!(block.lines.len(), usize::from(spot.rows) + 1);
-        for row in 0..usize::from(spot.rows) {
-            assert_eq!(text_of(&block.lines[row]), "", "row {row} is left blank");
+        assert_eq!(block.lines.len(), usize::from(spot.rows) + 2);
+        for row in 1..=usize::from(spot.rows) {
+            assert_eq!(
+                text_of(&block.lines[row]).trim(),
+                "",
+                "row {row} is left blank"
+            );
         }
-        let meta = text_of(&block.lines[usize::from(spot.rows)]);
+        let meta = text_of(&block.lines[usize::from(spot.rows) + 1]);
         assert!(meta.contains("IMG_4412.jpg · 2.1 MB"), "{meta}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1153,7 +1339,7 @@ mod tests {
         }];
         let fixture = Fixture::new(false, vec![photo]);
         let block = block(&fixture.ctx(), 0, 120);
-        let chip = text_of(&block.lines[0]);
+        let chip = text_of(&block.lines[1]);
         assert!(chip.contains(NOT_DOWNLOADED), "{chip}");
         assert!(block.images.is_empty(), "nothing to draw");
     }
@@ -1168,7 +1354,7 @@ mod tests {
         assert_eq!(block.links.len(), 1);
         let link = &block.links[0];
         assert_eq!(link.row, 0);
-        assert_eq!(link.column, 10);
+        assert_eq!(link.column, 15, "past `You  menu here `");
         assert_eq!(link.url, "https://example.invalid/menu");
         assert!(
             block.lines[0]
@@ -1190,10 +1376,16 @@ mod tests {
         for columns in [20u16, 40, 80] {
             for index in 0..fixture.messages.len() {
                 let block = block(&ctx, index, columns);
-                let expected =
-                    u16::try_from(block.lines.len()).unwrap() + u16::from(block.day.is_some());
+                let expected = u16::try_from(block.lines.len()).unwrap() + block.lead();
                 assert_eq!(block.height(), expected);
                 assert!(block.height() >= 1);
+                for line in &block.lines {
+                    assert!(
+                        width(&text_of(line)) <= usize::from(row_width(columns)),
+                        "{columns}: {:?}",
+                        text_of(line)
+                    );
+                }
             }
         }
     }

@@ -81,6 +81,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, err: &DbError) {
     lines.push(super::composer::hint_line(
         app,
         &[("r", "retry"), ("?", "help"), ("q", "quit")],
+        "   ",
         width.saturating_sub(2),
     ));
 

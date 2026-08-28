@@ -35,7 +35,7 @@ const APP_CHAR: char = '\u{FFFD}';
 const COLUMNS: &str = "m.ROWID, m.guid, m.handle_id, h.id, h.service, m.service, \
      m.is_from_me, m.is_read, m.date, m.date_delivered, m.date_read, m.date_edited, \
      m.text, m.attributedBody, m.subject, m.reply_to_guid, m.thread_originator_guid, \
-     m.item_type, m.group_action_type, m.group_title, m.other_handle";
+     m.item_type, m.group_action_type, m.group_title, m.other_handle, m.error";
 
 /// Rows with an `associated_message_type` in this range react to another
 /// message rather than being one.
@@ -70,6 +70,9 @@ pub struct Message {
     pub date_edited: i64,
     /// Whether the message has been edited since it was sent.
     pub is_edited: bool,
+    /// Messages' own `error` code: nonzero when a message of yours could not
+    /// be delivered — the red `Not Delivered` under a bubble in Messages.app.
+    pub error: i64,
     /// Body text, from `text` or recovered from `attributedBody`.
     pub text: Option<String>,
     /// `message.subject`, which SMS threads occasionally carry.
@@ -785,6 +788,7 @@ fn row_to_message(row: &rusqlite::Row<'_>, chat_rowid: i64) -> rusqlite::Result<
         date_read: row.get::<_, Option<i64>>(10)?.unwrap_or_default(),
         date_edited,
         is_edited: date_edited != 0,
+        error: row.get::<_, Option<i64>>(21)?.unwrap_or_default(),
         text: body_text(text.as_deref(), attributed.as_deref()),
         subject: row.get(14)?,
         attachments: Vec::new(),

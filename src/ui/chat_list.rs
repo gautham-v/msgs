@@ -1,8 +1,9 @@
 //! The left pane: filter line on top, chat rows below, divider on the right.
 //!
-//! Each chat takes two rows — an unread dot, the name, the time and the unread
-//! badge on the first; the preview of the last message on the second — and an
-//! optional one-row heading opens each section. [`Shape`] is the pure geometry
+//! Each chat takes three rows — the name and the time on the first, the
+//! preview of the last message on the second, and a blank third so the list
+//! can breathe — and an optional one-row heading opens each section. Unread is a bold name and the time in the accent; the
+//! selected chat has the accent down its left edge and a lighter row. [`Shape`] is the pure geometry
 //! behind that: it decides which chat is drawn where, which row a click lands
 //! on, and how far to scroll to keep the selection visible, without a terminal
 //! or a database in sight.
@@ -17,16 +18,21 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::app::{App, Focus, TextField};
 use crate::db::Chat;
 use crate::theme::Theme;
-use crate::ui::format::{preview_line, relative_time, truncate, unread_badge, width};
+use crate::ui::format::{preview_line, relative_time, truncate, width};
 
-/// Rows one chat occupies: the name line and the preview line.
-pub const CHAT_ROWS: u16 = 2;
+/// Rows one chat occupies: the name line, the preview line, and a blank one.
+pub const CHAT_ROWS: u16 = 3;
+/// Rows of those that carry text, and take the selection or hover tint.
+pub const TEXT_ROWS: u16 = 2;
 
-/// Columns before the name: the selection bar, the unread dot, and a space.
-const GUTTER: usize = 3;
+/// Columns of air before the name.
+const GUTTER: usize = 2;
 
-/// One column of air is kept on the right so nothing touches the divider.
-const RIGHT_MARGIN: usize = 1;
+/// Columns of air kept on the right so nothing touches the divider.
+const RIGHT_MARGIN: usize = 2;
+
+/// Rows above the chat rows: the filter line and the blank row under it.
+pub const HEAD_ROWS: u16 = 2;
 
 /// The narrowest a name may be squeezed before the time is dropped instead.
 const MIN_NAME: usize = 6;
@@ -142,18 +148,20 @@ impl Shape {
 }
 
 /// Draw the pane. `area` is the whole pane, `rows` the selectable rows below
-/// the filter line and left of the divider.
-pub fn render(frame: &mut Frame, app: &App, area: Rect, rows: Rect) {
+/// the filter line and left of the divider. `docked` says the conversation is
+/// beside it and wants a divider; a list screen on a narrow terminal has
+/// neither.
+pub fn render(frame: &mut Frame, app: &App, area: Rect, rows: Rect, docked: bool) {
     let theme = &app.theme;
     let focused = app.focus == Focus::ChatList;
 
-    frame.render_widget(
-        Block::new()
+    let mut block = Block::new().style(Style::new().bg(theme.bg_dark));
+    if docked {
+        block = block
             .borders(Borders::RIGHT)
-            .border_style(Style::new().fg(theme.border_for(focused)))
-            .style(Style::new().bg(theme.bg_dark)),
-        area,
-    );
+            .border_style(Style::new().fg(theme.border_for(focused)));
+    }
+    frame.render_widget(block, area);
 
     render_filter_line(frame, app, Rect { height: 1, ..area });
 
@@ -181,8 +189,8 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, rows: Rect) {
             Entry::Section(title) => {
                 frame.render_widget(
                     Paragraph::new(Line::from(Span::styled(
-                        format!(" {title}"),
-                        Style::new().fg(theme.gray).add_modifier(Modifier::BOLD),
+                        format!("  {title}"),
+                        Style::new().fg(theme.gray),
                     ))),
                     Rect {
                         y: top,
@@ -226,7 +234,13 @@ fn render_chat(
         } else {
             theme.bg_hover
         };
-        frame.render_widget(Block::new().style(Style::new().bg(background)), area);
+        frame.render_widget(
+            Block::new().style(Style::new().bg(background)),
+            Rect {
+                height: area.height.min(TEXT_ROWS),
+                ..area
+            },
+        );
     }
 
     let columns = usize::from(area.width);
@@ -234,7 +248,7 @@ fn render_chat(
         Paragraph::new(name_line(theme, chat, selected, columns, now)),
         Rect { height: 1, ..area },
     );
-    if area.height >= CHAT_ROWS {
+    if area.height >= TEXT_ROWS {
         frame.render_widget(
             Paragraph::new(preview_row(theme, chat, selected, columns)),
             Rect {
@@ -246,7 +260,7 @@ fn render_chat(
     }
 }
 
-/// `▌● Name              2m  3`, with whatever fits.
+/// `  Name                 2m`, with whatever fits.
 fn name_line<'a>(
     theme: &Theme,
     chat: &Chat,
@@ -259,16 +273,10 @@ fn name_line<'a>(
         .last_message_at()
         .map(|when| relative_time(now, when))
         .unwrap_or_default();
-    let badge = unread_badge(chat.unread);
 
-    // The name gives up columns to the time and the badge, but never all of
-    // them: below a floor the badge goes first, then the time.
+    // The name gives up columns to the time, but never all of them: below a
+    // floor the time goes instead.
     let mut name_width = columns.saturating_sub(GUTTER + RIGHT_MARGIN);
-    let badge_width = width(&badge) + 3;
-    let show_badge = !badge.is_empty() && name_width >= badge_width + MIN_NAME;
-    if show_badge {
-        name_width -= badge_width;
-    }
     let time_width = width(&time) + 1;
     let show_time = !time.is_empty() && name_width >= time_width + MIN_NAME;
     if show_time {
@@ -279,33 +287,21 @@ fn name_line<'a>(
     let padding = name_width.saturating_sub(width(&name));
 
     let mut spans = vec![
-        marker(theme, selected),
-        Span::styled(
-            if unread { "●" } else { " " },
-            Style::new().fg(theme.accent_me),
-        ),
-        Span::raw(" "),
-        Span::styled(name, name_style(theme, unread)),
+        Span::raw(" ".repeat(GUTTER)),
+        Span::styled(name, name_style(theme, unread, selected)),
         Span::raw(" ".repeat(padding)),
     ];
     if show_time {
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(time, Style::new().fg(theme.gray)));
-    }
-    if show_badge {
-        spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            format!(" {badge} "),
-            Style::new()
-                .bg(theme.accent_me)
-                .fg(theme.bg_base)
-                .add_modifier(Modifier::BOLD),
+            time,
+            Style::new().fg(if unread { theme.accent_me } else { theme.gray }),
         ));
     }
     Line::from(spans)
 }
 
-/// `▌  You: pushed the fix, check CI`.
+/// `  You: pushed the fix, check CI`.
 fn preview_row<'a>(theme: &Theme, chat: &Chat, selected: bool, columns: usize) -> Line<'a> {
     let unread = chat.is_unread();
     let (prefix, body) = preview_line(chat);
@@ -318,29 +314,25 @@ fn preview_row<'a>(theme: &Theme, chat: &Chat, selected: bool, columns: usize) -
     } else {
         theme.gray
     };
+    let _ = selected;
     Line::from(vec![
-        marker(theme, selected),
-        Span::raw("  "),
+        Span::raw(" ".repeat(GUTTER)),
         Span::styled(prefix, Style::new().fg(theme.gray_dim)),
         Span::styled(body, Style::new().fg(body_color)),
     ])
 }
 
-/// The left bar that stands in for the mockup's selection outline.
-fn marker<'a>(theme: &Theme, selected: bool) -> Span<'a> {
-    if selected {
-        Span::styled("▌", Style::new().fg(theme.border_active))
-    } else {
-        Span::raw(" ")
-    }
-}
-
-fn name_style(theme: &Theme, unread: bool) -> Style {
-    let style = Style::new().fg(theme.text_primary);
+/// Read chats sit back in the secondary text; unread ones come forward in
+/// bold, and the selected one comes forward too.
+fn name_style(theme: &Theme, unread: bool, selected: bool) -> Style {
     if unread {
-        style.add_modifier(Modifier::BOLD)
+        Style::new()
+            .fg(theme.text_primary)
+            .add_modifier(Modifier::BOLD)
+    } else if selected {
+        Style::new().fg(theme.text_primary)
     } else {
-        style
+        Style::new().fg(theme.text_secondary)
     }
 }
 
@@ -352,17 +344,17 @@ fn render_filter_line(frame: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
     let line = match app.chat_filter.as_ref() {
         Some(field) => Line::from(vec![
-            Span::styled(" / ", Style::new().fg(theme.accent_me)),
+            Span::styled("  / ", Style::new().fg(theme.text_secondary)),
             Span::styled(
                 field.text().to_string(),
                 Style::new().fg(theme.text_primary),
             ),
-            Span::styled("▏", Style::new().fg(theme.accent_me)),
+            Span::styled("▏", Style::new().fg(theme.text_secondary)),
         ]),
-        None => Line::from(Span::styled(
-            " / search chats…",
-            Style::new().fg(theme.gray).add_modifier(Modifier::ITALIC),
-        )),
+        None => Line::from(vec![
+            Span::styled("  / ", Style::new().fg(theme.gray)),
+            Span::styled("filter", Style::new().fg(theme.gray)),
+        ]),
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -381,14 +373,14 @@ mod tests {
     }
 
     #[test]
-    fn a_list_without_pinning_is_two_rows_per_chat() {
-        let plan = shape(5, 0, 0, 6).plan();
+    fn a_list_without_pinning_is_three_rows_per_chat() {
+        let plan = shape(5, 0, 0, 9).plan();
         assert_eq!(
             plan,
             vec![
                 (0, Entry::Chat(0)),
-                (2, Entry::Chat(1)),
-                (4, Entry::Chat(2))
+                (3, Entry::Chat(1)),
+                (6, Entry::Chat(2))
             ]
         );
     }
@@ -401,30 +393,30 @@ mod tests {
             vec![
                 (0, Entry::Section("PINNED")),
                 (1, Entry::Chat(0)),
-                (3, Entry::Section("RECENT")),
-                (4, Entry::Chat(1)),
-                (6, Entry::Chat(2)),
-                (8, Entry::Chat(3)),
+                (4, Entry::Section("RECENT")),
+                (5, Entry::Chat(1)),
+                (8, Entry::Chat(2)),
+                (11, Entry::Chat(3)),
             ]
         );
     }
 
     #[test]
     fn a_chat_that_would_be_cut_in_half_is_left_out() {
-        let plan = shape(5, 0, 0, 5).plan();
+        let plan = shape(5, 0, 0, 8).plan();
         assert_eq!(plan.len(), 2, "only whole chats are drawn");
-        assert!(shape(5, 0, 0, 1).plan().is_empty());
+        assert!(shape(5, 0, 0, 2).plan().is_empty());
         assert!(shape(5, 0, 0, 0).plan().is_empty());
     }
 
     #[test]
-    fn a_click_finds_the_chat_on_either_of_its_two_rows() {
-        let shape = shape(5, 0, 1, 6);
+    fn a_click_finds_the_chat_on_any_of_its_rows() {
+        let shape = shape(5, 0, 1, 9);
         assert_eq!(shape.chat_at(0), Some(1));
-        assert_eq!(shape.chat_at(1), Some(1));
-        assert_eq!(shape.chat_at(2), Some(2));
-        assert_eq!(shape.chat_at(5), Some(3));
-        assert_eq!(shape.chat_at(6), None);
+        assert_eq!(shape.chat_at(2), Some(1), "the blank row too");
+        assert_eq!(shape.chat_at(3), Some(2));
+        assert_eq!(shape.chat_at(8), Some(3));
+        assert_eq!(shape.chat_at(9), None);
     }
 
     #[test]
@@ -432,26 +424,26 @@ mod tests {
         let shape = shape(4, 1, 0, 20);
         assert_eq!(shape.chat_at(0), None);
         assert_eq!(shape.chat_at(1), Some(0));
-        assert_eq!(shape.chat_at(3), None, "the RECENT heading");
-        assert_eq!(shape.chat_at(4), Some(1));
+        assert_eq!(shape.chat_at(4), None, "the RECENT heading");
+        assert_eq!(shape.chat_at(5), Some(1));
     }
 
     #[test]
     fn scrolling_follows_the_selection_both_ways() {
-        // Six rows hold three chats.
-        let down = shape(20, 0, 0, 6);
+        // Nine rows hold three chats.
+        let down = shape(20, 0, 0, 9);
         assert_eq!(down.offset_for(2), 0, "already visible");
         assert_eq!(down.offset_for(3), 1, "one chat further down");
         assert_eq!(down.offset_for(19), 17, "the very bottom");
 
-        let up = shape(20, 0, 10, 6);
+        let up = shape(20, 0, 10, 9);
         assert_eq!(up.offset_for(4), 4, "jumping above the window");
         assert_eq!(up.offset_for(11), 10, "still visible");
     }
 
     #[test]
     fn scrolling_accounts_for_the_row_a_heading_takes() {
-        let shape = shape(10, 2, 0, 6);
+        let shape = shape(10, 2, 0, 9);
         // PINNED, two pinned chats, RECENT, then the first recent chat is cut.
         assert_eq!(shape.plan().len(), 4);
         assert_eq!(shape.offset_for(2), 1);

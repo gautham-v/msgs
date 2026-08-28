@@ -273,9 +273,9 @@ fn a_person_is_found_in_the_palette_by_the_name_contacts_has_for_them() {
 }
 
 #[test]
-fn one_person_reached_at_two_addresses_keeps_one_color_in_a_group() {
-    // Contacts joins the two addresses under one name, so the rail follows the
-    // person rather than the row.
+fn one_person_reached_at_two_addresses_keeps_one_name_in_a_group() {
+    // Contacts joins the two addresses under one name, so the name opening a
+    // run follows the person rather than the row.
     let contacts = Contacts::from_names(std::collections::BTreeMap::from([
         (
             "+15550000001".to_string(),

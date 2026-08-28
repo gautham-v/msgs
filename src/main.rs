@@ -50,7 +50,7 @@ struct Cli {
     #[arg(long)]
     no_mouse: bool,
 
-    /// Use this palette instead of the config's: dark, light, or system.
+    /// Use this palette instead of the config's: dark, light, system, or terminal.
     #[arg(long, value_name = "NAME", value_parser = theme::BASES)]
     theme: Option<String>,
 
@@ -134,9 +134,11 @@ fn main() -> Result<()> {
 
     install_panic_hook();
     let mut terminal = setup_terminal(app.mouse_enabled)?;
-    // The terminal is asked what it can draw after the alternate screen is up
-    // and before a single key is read, because the answer comes back on stdin
-    // and would otherwise land in the event loop as keystrokes.
+    // The terminal is asked what it draws with, and what it can draw, after
+    // the alternate screen is up and before a single key is read, because the
+    // answers come back on stdin and would otherwise land in the event loop
+    // as keystrokes.
+    app.set_terminal_colors(theme::query_terminal(Duration::from_millis(150)));
     if !cli.no_images && app.config.images {
         app.enable_images(media::Images::detect());
         let _ = terminal.clear();

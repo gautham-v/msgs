@@ -477,17 +477,14 @@ fn opening_a_chat_measures_it_and_pins_it_to_its_newest_message() {
     assert_eq!(app.measured.heights.len(), app.message_rows.len());
     assert!(app.measured.heights.iter().all(|height| *height >= 1));
     assert_eq!(app.measured.by_guid.len(), app.message_rows.len());
-    assert_eq!(app.open_chat_photos, 0, "no pictures in the group");
 
     // A conversation shorter than a page has nothing above it, so scrolling up
     // settles rather than asking the database again and again.
     assert!(app.conversation_start_loaded);
     assert_eq!(app.load_older(), 0);
 
-    // The one-to-one chat carries the fixture's only picture.
     app.update(Action::SelectNext);
     assert_eq!(app.open_chat, Some(fixtures::CHAT_DIRECT));
-    assert_eq!(app.open_chat_photos, 1);
 }
 
 #[test]

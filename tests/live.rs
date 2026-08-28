@@ -521,15 +521,15 @@ fn the_status_line_says_how_fresh_the_screen_is() {
     let store = Store::new("status");
     let mut app = app_on(&store);
     let segments = msgs::ui::status::segments(&app);
-    assert_eq!(segments[2], "watching chat.db");
+    assert_eq!(segments[0], "watching chat.db");
 
     app.on_db_change();
     let segments = msgs::ui::status::segments(&app);
     assert!(
-        segments[2].starts_with("watching chat.db · "),
+        segments[0].starts_with("watching chat.db · "),
         "the watcher segment must carry the age of the last read"
     );
-    assert!(segments[2].ends_with("just now"));
+    assert!(segments[0].ends_with("just now"));
 }
 
 #[test]

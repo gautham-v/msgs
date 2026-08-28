@@ -23,7 +23,7 @@ use crate::send::{
     self, Delivery, Outbox, Outgoing, Pending, PendingTapback, Presence, REACTIONS, ReactFallback,
     Reaction, SendError, Service, Target,
 };
-use crate::theme::{self, Base, Theme};
+use crate::theme::{self, Base, TerminalColors, Theme};
 use crate::ui::Panes;
 use crate::ui::conversation::{Hits, Measured, Scroll};
 use crate::ui::message::{self, Ctx};
@@ -106,7 +106,8 @@ pub enum Action {
     FocusComposer,
     /// Show or hide the chat list.
     ToggleChatList,
-    /// `Ctrl+T`: the next theme base — dark, light, then the system's.
+    /// `Ctrl+T`: the next theme base — dark, light, the system's, then the
+    /// terminal's.
     CycleTheme,
     /// Move the selection up one row.
     SelectPrev,
@@ -534,6 +535,9 @@ pub struct App {
     /// The system's answer to "dark mode?", for [`Base::System`]. `None`
     /// until the probe answers, which reads as dark.
     pub system_dark: Option<bool>,
+    /// What the terminal said it draws with, for [`Base::Terminal`]. `None`
+    /// until [`App::set_terminal_colors`], or for good if it never answered.
+    pub terminal_colors: Option<TerminalColors>,
     /// The probe behind [`App::system_dark`]. [`Presence::off`] until
     /// something asks for it, so no test spawns one.
     pub appearance: Presence,
@@ -566,8 +570,6 @@ pub struct App {
     pub open_chat: Option<i64>,
     /// The open conversation's loaded page of messages, oldest first.
     pub message_rows: Vec<Message>,
-    /// Pictures in the open conversation, for the header.
-    pub open_chat_photos: i64,
     /// Set once the oldest message of the open chat is loaded, so scrolling up
     /// stops asking the database for a page that is not there.
     pub conversation_start_loaded: bool,
@@ -673,7 +675,7 @@ impl App {
     pub fn new(config: Config, mut warnings: Vec<String>) -> Self {
         let (theme_base, base_warning) = Theme::base_from(&config.theme);
         warnings.extend(base_warning);
-        let mut theme = Theme::for_base(theme_base, None);
+        let mut theme = Theme::for_base(theme_base, None, None);
         warnings.extend(theme.apply_overrides(&config.theme));
         let show_chat_list = config.show_chat_list;
         let mouse_enabled = config.mouse;
@@ -688,6 +690,7 @@ impl App {
             theme,
             theme_base,
             system_dark: None,
+            terminal_colors: None,
             appearance: Presence::off(),
             focus: Focus::ChatList,
             overlay_return: Focus::ChatList,
@@ -701,7 +704,6 @@ impl App {
             pinned_visible: 0,
             open_chat: None,
             message_rows: Vec::new(),
-            open_chat_photos: 0,
             conversation_start_loaded: false,
             convo: Scroll::default(),
             measured: Measured::default(),
@@ -852,29 +854,55 @@ impl App {
         self.appearance = Presence::watching_with(theme::system_is_dark);
     }
 
+    /// Take the terminal's answer to "what do you draw with?", asked once by
+    /// `main` after the alternate screen is up. `None` means it did not
+    /// answer, which the `terminal` base draws around.
+    pub fn set_terminal_colors(&mut self, colors: Option<TerminalColors>) {
+        self.terminal_colors = colors;
+        if self.theme_base == Base::Terminal {
+            self.rebuild_theme();
+            if colors.is_none() {
+                self.status
+                    .warnings
+                    .push("theme: the terminal did not say its colors; drawing on its ground with the dark palette".to_string());
+            }
+        }
+    }
+
     /// `Ctrl+T`: move to the next base and say which one.
     fn cycle_theme(&mut self) {
         self.theme_base = self.theme_base.next();
         self.rebuild_theme();
         let name = self.theme_base.name();
-        let toast = if self.theme_base == Base::System {
-            let showing = if self.theme_base.is_dark(self.system_dark) {
-                "dark"
-            } else {
-                "light"
-            };
-            format!("theme: {name} ({showing})")
-        } else {
-            format!("theme: {name}")
+        let toast = match self.theme_base {
+            Base::System => {
+                let showing = if self
+                    .theme_base
+                    .is_dark(self.system_dark, self.terminal_colors.as_ref())
+                {
+                    "dark"
+                } else {
+                    "light"
+                };
+                format!("theme: {name} ({showing})")
+            }
+            Base::Terminal if self.terminal_colors.is_none() => {
+                format!("theme: {name} (it did not say its colors)")
+            }
+            _ => format!("theme: {name}"),
         };
         self.status.toast(toast);
     }
 
-    /// Recompute [`App::theme`] from the base, the system's answer, and the
-    /// config's slot overrides. The overrides were already reported at
-    /// startup, so their warnings are not repeated here.
+    /// Recompute [`App::theme`] from the base, the system's and terminal's
+    /// answers, and the config's slot overrides. The overrides were already
+    /// reported at startup, so their warnings are not repeated here.
     fn rebuild_theme(&mut self) {
-        let mut theme = Theme::for_base(self.theme_base, self.system_dark);
+        let mut theme = Theme::for_base(
+            self.theme_base,
+            self.system_dark,
+            self.terminal_colors.as_ref(),
+        );
         let _ = theme.apply_overrides(&self.config.theme);
         self.theme = theme;
     }
@@ -1035,38 +1063,28 @@ impl App {
                 self.status.error(format!("chat list: {}", err.summary()));
             }
         }
-        self.adopt_draft();
+        // A draft that just became a real conversation is where the selection
+        // goes, not back to the row it was on before `Ctrl+N`.
+        let anchor = self.adopt_draft().or(anchor);
         self.refresh_anchored(true, anchor);
     }
 
     /// A `Ctrl+N` draft stops being a draft the moment Messages has made the
     /// conversation real: the list gains a row with that address, and the
-    /// selection moves onto it.
-    fn adopt_draft(&mut self) {
-        let Some(address) = self
+    /// selection moves onto it. Returns that row, for the refresh to anchor on.
+    fn adopt_draft(&mut self) -> Option<i64> {
+        let address = self
             .draft_target
             .as_ref()
-            .and_then(|target| target.identifier.clone())
-        else {
-            return;
-        };
-        let Some(rowid) = self
+            .and_then(|target| target.identifier.clone())?;
+        let rowid = self
             .chat_rows
             .iter()
             .find(|chat| chat_has_address(chat, &address))
-            .map(|chat| chat.rowid)
-        else {
-            return;
-        };
+            .map(|chat| chat.rowid)?;
         self.draft_target = None;
-        if let Some(position) = self
-            .chat_rows
-            .iter()
-            .position(|chat| chat.rowid == rowid)
-            .and_then(|index| self.visible_chats.iter().position(|i| *i == index))
-        {
-            self.chats.selected = position;
-        }
+        self.chat_filter = None;
+        Some(rowid)
     }
 
     /// Re-apply the filter, keep the selection on the chat it was on, and open
@@ -1191,13 +1209,9 @@ impl App {
         let Some(db) = self.db.as_ref() else {
             return;
         };
-        let photos = db
-            .attachment_counts(chat_rowid)
-            .map_or(0, |(_, photos)| photos);
         let page = db.messages_before(chat_rowid, None, PAGE);
 
         self.open_chat = Some(chat_rowid);
-        self.open_chat_photos = photos;
         match page {
             Ok(messages) => self.message_rows = messages,
             Err(err) => {
@@ -1793,9 +1807,9 @@ impl App {
         if self.db_error.is_some() && !self.focus.is_overlay() {
             return Focus::DbError;
         }
-        // A terminal narrowed under a focused chat list leaves the focus on a
-        // pane that is no longer drawn; the keys go to what is on screen.
-        if self.focus == Focus::ChatList && !self.chat_list_visible() {
+        // A hidden chat list cannot hold the keys; a narrow terminal's list
+        // screen can, because it is what is on screen.
+        if self.focus == Focus::ChatList && !self.chat_list_visible() && !self.list_screen() {
             return Focus::Conversation;
         }
         if self.focus == Focus::ChatList && self.chat_filter.is_some() {
@@ -1975,13 +1989,19 @@ impl App {
 
     /// Columns a palette result row has for a matched line.
     fn palette_columns(&self) -> usize {
-        let width = self.panes.status.width.max(40);
+        let width = self.panes.screen.width.max(40);
         crate::ui::palette::body_columns(Rect::new(0, 0, width, 1))
     }
 
     /// `Enter` in the palette: go where the selected row points.
     fn jump_to_selected(&mut self) {
         let Some(row) = self.jump.selected().cloned() else {
+            // Nothing matched, but what was typed is an address: `Enter`
+            // means the same as `Ctrl+N` here, a new message to it.
+            if jump::looks_like_address(self.palette.text()).is_some() {
+                self.start_new_chat();
+                return;
+            }
             self.close_overlay();
             return;
         };
@@ -2044,7 +2064,12 @@ impl App {
     /// else opens an empty conversation the composer can send into, which is
     /// the only way to start one when the database is read-only.
     fn start_new_chat(&mut self) {
+        // From anywhere else, `Ctrl+N` opens the palette to type the address
+        // into; a second `Ctrl+N` there starts the chat.
         if self.focus != Focus::Palette {
+            self.open_overlay(Focus::Palette);
+            self.status
+                .toast("type a phone number or email, then Ctrl+N");
             return;
         }
         let Some(address) = jump::looks_like_address(self.palette.text()) else {
@@ -2092,26 +2117,38 @@ impl App {
         self.draft_target = None;
     }
 
-    /// Whether the chat list is actually on screen: the toggle *and* enough
-    /// room for it. `Panes::default()` is width 0, before the first frame, so
-    /// the intent stands in until a real layout has been computed.
+    /// Whether the chat list is docked beside the conversation: the toggle
+    /// *and* enough room for it. `Panes::default()` is width 0, before the
+    /// first frame, so the intent stands in until a real layout has been
+    /// computed.
     pub fn chat_list_visible(&self) -> bool {
-        if self.panes.status.width == 0 {
+        if self.panes.screen.width == 0 {
             return self.show_chat_list;
         }
-        self.show_chat_list && self.panes.status.width >= MIN_WIDTH_FOR_CHAT_LIST
+        self.show_chat_list && self.panes.screen.width >= MIN_WIDTH_FOR_CHAT_LIST
     }
 
+    /// Whether the terminal is too narrow to dock the list, so the list is a
+    /// screen of its own that `Ctrl+B` swaps in for the conversation.
     fn too_narrow_for_the_chat_list(&self) -> bool {
-        self.panes.status.width > 0 && self.panes.status.width < MIN_WIDTH_FOR_CHAT_LIST
+        self.panes.screen.width > 0 && self.panes.screen.width < MIN_WIDTH_FOR_CHAT_LIST
+    }
+
+    /// Whether the list screen is what is on the terminal right now.
+    pub fn list_screen(&self) -> bool {
+        self.too_narrow_for_the_chat_list() && self.focus == Focus::ChatList
     }
 
     fn toggle_chat_list(&mut self) {
         if self.too_narrow_for_the_chat_list() {
-            // Flipping a flag the layout would override reads as a dead key.
-            self.status.toast(format!(
-                "the chat list needs {MIN_WIDTH_FOR_CHAT_LIST} columns"
-            ));
+            // No pane to show or hide: the list is a screen, and `Ctrl+B`
+            // goes to it and back.
+            if self.focus == Focus::ChatList {
+                self.chat_filter = None;
+                self.focus = Focus::Conversation;
+            } else {
+                self.focus = Focus::ChatList;
+            }
             return;
         }
         self.show_chat_list = !self.show_chat_list;
@@ -2265,7 +2302,12 @@ impl App {
     fn cancel(&mut self) {
         match self.focus {
             Focus::Help | Focus::Palette | Focus::Reactions => self.close_overlay(),
-            Focus::ChatList => self.chat_filter = None,
+            Focus::ChatList => {
+                // On the list screen a second `Esc` goes back to the thread.
+                if self.chat_filter.take().is_none() && self.too_narrow_for_the_chat_list() {
+                    self.focus = Focus::Conversation;
+                }
+            }
             Focus::Composer => {
                 // The attachment prompt is a layer in front of the composer, so
                 // `Esc` closes it and leaves the draft where it was.
@@ -2283,13 +2325,7 @@ impl App {
     }
 
     fn start_filter(&mut self) {
-        if self.too_narrow_for_the_chat_list() {
-            self.status.toast(format!(
-                "the chat list needs {MIN_WIDTH_FOR_CHAT_LIST} columns"
-            ));
-            return;
-        }
-        if !self.show_chat_list {
+        if !self.too_narrow_for_the_chat_list() && !self.show_chat_list {
             self.show_chat_list = true;
         }
         self.focus = Focus::ChatList;
@@ -2852,6 +2888,7 @@ fn echo_row(pending: &Pending) -> Message {
         date_read: 0,
         date_edited: 0,
         is_edited: false,
+        error: 0,
         text: Some(pending.text.clone()),
         subject: None,
         attachments: Vec::new(),
@@ -2957,7 +2994,7 @@ mod tests {
     fn tab_skips_a_chat_list_the_terminal_is_too_narrow_to_draw() {
         // The flag says the reader wants it, but nothing is drawn there.
         let mut app = app();
-        app.panes.status.width = MIN_WIDTH_FOR_CHAT_LIST - 1;
+        app.panes.screen.width = MIN_WIDTH_FOR_CHAT_LIST - 1;
         app.focus = Focus::Conversation;
         assert!(app.show_chat_list);
         app.update(Action::FocusNext);
@@ -2967,28 +3004,42 @@ mod tests {
     }
 
     #[test]
-    fn keys_leave_a_chat_list_the_terminal_narrowed_out_from_under() {
-        // Focused while there was room, then the terminal shrank.
+    fn a_focused_chat_list_keeps_the_keys_when_the_terminal_narrows() {
+        // Focused while there was room, then the terminal shrank: the list
+        // is now a screen of its own, and it is what the keys steer.
         let mut app = app();
         app.focus = Focus::ChatList;
-        app.panes.status.width = MIN_WIDTH_FOR_CHAT_LIST - 1;
-        assert_eq!(app.key_focus(), Focus::Conversation);
-        app.panes.status.width = MIN_WIDTH_FOR_CHAT_LIST;
+        app.panes.screen.width = MIN_WIDTH_FOR_CHAT_LIST - 1;
+        assert!(app.list_screen());
+        assert_eq!(app.key_focus(), Focus::ChatList);
+        app.panes.screen.width = MIN_WIDTH_FOR_CHAT_LIST;
+        assert!(!app.list_screen());
         assert_eq!(app.key_focus(), Focus::ChatList);
     }
 
     #[test]
-    fn a_narrow_terminal_explains_the_toggle_instead_of_flipping_it() {
+    fn a_narrow_terminal_swaps_the_list_screen_for_the_conversation() {
         let mut app = app();
-        app.panes.status.width = MIN_WIDTH_FOR_CHAT_LIST - 1;
+        app.panes.screen.width = MIN_WIDTH_FOR_CHAT_LIST - 1;
+        app.focus = Focus::Conversation;
         assert!(app.show_chat_list);
+        assert!(!app.chat_list_visible(), "not docked");
 
         app.update(Action::ToggleChatList);
-        assert!(app.show_chat_list);
-        assert!(!app.chat_list_visible());
-        let (text, is_error) = app.status.active_toast().expect("a toast explains it");
-        assert!(text.contains(&MIN_WIDTH_FOR_CHAT_LIST.to_string()));
-        assert!(!is_error);
+        assert!(app.list_screen());
+        assert!(app.show_chat_list, "the docking flag is untouched");
+        assert!(app.status.active_toast().is_none());
+
+        app.update(Action::Cancel);
+        assert!(!app.list_screen(), "Esc goes back to the thread");
+        assert_eq!(app.focus, Focus::Conversation);
+
+        app.update(Action::StartFilter);
+        assert!(app.list_screen(), "filtering opens the list screen");
+        app.update(Action::Cancel);
+        assert!(app.list_screen(), "the first Esc only clears the filter");
+        app.update(Action::Cancel);
+        assert_eq!(app.focus, Focus::Conversation);
     }
 
     #[test]
@@ -3289,6 +3340,21 @@ mod tests {
         assert_eq!(app.theme.bg_base, Theme::light().bg_base);
 
         app.update(Action::CycleTheme);
+        assert_eq!(app.theme_base, Base::Terminal);
+        assert_eq!(app.theme.bg_base, ratatui::style::Color::Reset);
+        assert_eq!(app.theme.accent_me, accent, "the override survives");
+        let brown = TerminalColors {
+            bg: (0x2b, 0x1f, 0x1a),
+            fg: Some((0xee, 0xe8, 0xd5)),
+        };
+        app.set_terminal_colors(Some(brown));
+        assert_eq!(
+            app.theme.bg_base,
+            ratatui::style::Color::Rgb(0x2b, 0x1f, 0x1a)
+        );
+        assert_eq!(app.theme.accent_me, accent, "the override survives");
+
+        app.update(Action::CycleTheme);
         assert_eq!(app.theme_base, Base::Dark);
         assert_eq!(app.theme.bg_base, Theme::default().bg_base);
     }
@@ -3394,6 +3460,7 @@ mod tests {
             date_read: 0,
             date_edited: 0,
             is_edited: false,
+            error: 0,
             text: Some("invented".to_string()),
             subject: None,
             attachments: Vec::new(),

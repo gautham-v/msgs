@@ -1,256 +1,654 @@
-<title>Msgs, an iMessage TUI</title>
+<title>msgs Quiet</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
 <style>
   :root {
-    --bg: #f2f3f5; --fg: #1e2024; --muted: #676a72; --rule: #d9dbe0; --card: #ffffff; --accent: #2f7fd6;
-    --t-base: #121214; --t-light: #1a1a1e; --t-dark: #0c0c0e; --t-hl: #232329; --t-hover: #1f1f25;
-    --t-text: #e4e4e7; --t-text2: #a1a1aa; --t-gray: #52525b; --t-graydim: #3a3a40;
-    --t-me: #5ea8ff; --t-them: #7ec699; --t-p2: #e5b567; --t-p3: #d17be0; --t-sys: #8a8a94;
-    --t-err: #e06c75; --t-fuzzy: #9dd0ff; --t-border: #2c2c33; --t-border-active: #5ea8ff;
+    --bg: #f3f2ef; --fg: #1f1e1b; --muted: #6d6a63; --rule: #dedbd4; --card: #fff; --accent: #2f6fd0;
+    /* the terminal being mocked: a warm dark ground, the way a terminal theme tends to be */
+    --t-base: #1c1a18; --t-side: #171513; --t-hl: #2a2724; --t-hover: #232019;
+    --t-text: #c8c8c8; --t-text2: #a9a49a; --t-gray: #6b665e; --t-graydim: #3d3a35;
+    --t-me: #7fb0ff; --t-err: #e06c75; --t-border: #2e2b27; --t-border-active: #7fb0ff;
   }
   @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) { --bg: #0e0e10; --fg: #e6e5e8; --muted: #9c9aa2; --rule: #2a2a30; --card: #17171a; --accent: #5ea8ff; }
+    :root:not([data-theme="light"]) { --bg: #111010; --fg: #e8e5e0; --muted: #9a968e; --rule: #2a2825; --card: #19181600; --accent: #7fb0ff; }
   }
-  :root[data-theme="dark"] { --bg: #0e0e10; --fg: #e6e5e8; --muted: #9c9aa2; --rule: #2a2a30; --card: #17171a; --accent: #5ea8ff; }
+  :root[data-theme="dark"] { --bg: #111010; --fg: #e8e5e0; --muted: #9a968e; --rule: #2a2825; --card: #19181600; --accent: #7fb0ff; }
 
   body { background: var(--bg); color: var(--fg); font-family: "IBM Plex Sans", system-ui, sans-serif; line-height: 1.5; margin: 0; }
-  main { max-width: 1040px; margin: 0 auto; padding: 48px 24px 96px; display: flex; flex-direction: column; gap: 60px; }
-  header h1 { font-family: "IBM Plex Mono", ui-monospace, monospace; font-weight: 600; font-size: 1.9rem; margin: 0 0 8px; letter-spacing: -0.01em; }
-  header p, section > p { max-width: 66ch; color: var(--muted); margin: 0; }
-  section { display: flex; flex-direction: column; gap: 16px; }
-  .eyebrow { font-family: "IBM Plex Mono", monospace; font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
-  h2 { font-size: 1.3rem; margin: 0; text-wrap: balance; }
-  kbd { font-family: "IBM Plex Mono", monospace; font-size: 0.8em; background: var(--bg); border: 1px solid var(--rule); border-radius: 3px; padding: 0 5px; }
-  code { font-family: "IBM Plex Mono", monospace; font-size: 0.9em; }
+  main { max-width: 1060px; margin: 0 auto; padding: 48px 24px 96px; display: flex; flex-direction: column; gap: 56px; }
+  h1 { font-family: "IBM Plex Mono", ui-monospace, monospace; font-weight: 600; font-size: 1.8rem; margin: 0 0 8px; letter-spacing: -0.01em; }
+  h2 { font-size: 1.25rem; margin: 0; text-wrap: balance; }
+  header p, section > p, .two p { max-width: 66ch; color: var(--muted); margin: 0; }
+  section { display: flex; flex-direction: column; gap: 14px; }
+  .eyebrow { font-family: "IBM Plex Mono", monospace; font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+  kbd, code { font-family: "IBM Plex Mono", monospace; font-size: 0.85em; }
+  kbd { border: 1px solid var(--rule); border-radius: 3px; padding: 0 5px; }
+  ul.rules { margin: 0; padding-left: 1.2em; color: var(--muted); max-width: 70ch; display: flex; flex-direction: column; gap: 4px; }
+  ul.rules b { color: var(--fg); font-weight: 500; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 760px) { .two { grid-template-columns: 1fr; } }
 
-  .term { background: var(--t-base); color: var(--t-text); border-radius: 6px; border: 1px solid var(--t-border); overflow-x: auto; box-shadow: 0 12px 32px rgba(0,0,0,.28); font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 13px; line-height: 1.45; }
-  .titlebar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--t-border); font-size: 0.72rem; color: var(--t-gray); }
-  .titlebar i { width: 10px; height: 10px; border-radius: 50%; background: #2e2e35; display: inline-block; }
-  .titlebar span { margin-left: 8px; }
-  .screen { min-width: 780px; display: flex; flex-direction: column; }
-  .split { display: grid; grid-template-columns: 260px 1fr; }
-  .split.wide { grid-template-columns: 1fr; }
+  /* terminal frame */
+  .term { background: var(--t-base); color: var(--t-text); border-radius: 6px; border: 1px solid var(--t-border); overflow-x: auto; box-shadow: 0 12px 32px rgba(0,0,0,.28); font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 13px; line-height: 1.5; font-variant-numeric: tabular-nums; }
+  .titlebar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; font-size: 0.72rem; color: var(--t-gray); }
+  .titlebar i { width: 10px; height: 10px; border-radius: 50%; background: #2e2b27; display: inline-block; }
+  .titlebar span { margin-left: auto; margin-right: auto; }
+  .screen { min-width: 820px; display: grid; grid-template-columns: 250px 1fr; }
+  .screen.solo { grid-template-columns: 1fr; min-width: 0; }
 
-  /* chat list */
-  .chats { border-right: 1px solid var(--t-border); background: var(--t-dark); padding: 8px 0; display: flex; flex-direction: column; }
-  .chats .search { margin: 0 10px 8px; border: 1px solid var(--t-border); border-radius: 3px; padding: 3px 8px; color: var(--t-gray); }
-  .chat { display: grid; grid-template-columns: 6px 1fr auto; gap: 8px; padding: 4px 10px 4px 8px; align-items: start; }
-  .chat .dot { width: 6px; height: 6px; border-radius: 50%; margin-top: 7px; }
-  .chat .dot.on { background: var(--t-me); }
-  .chat .name { color: var(--t-text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .chat .prev { color: var(--t-gray); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 175px; }
-  .chat .time { color: var(--t-gray); font-size: 12px; }
-  .chat.unread .name { color: #fff; font-weight: 600; } .chat.unread .prev { color: var(--t-text2); }
-  .chat.sel { background: var(--t-hl); outline: 1px solid var(--t-border-active); outline-offset: -1px; }
-  .chat.hover { background: var(--t-hover); }
-  .chat .badge { background: var(--t-me); color: var(--t-base); border-radius: 8px; padding: 0 6px; font-size: 11px; font-weight: 600; }
-  .grp { color: var(--t-gray); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; padding: 6px 10px 2px; }
+  /* sidebar */
+  .side { background: var(--t-side); border-right: 1px solid var(--t-border); padding: 6px 0 8px; display: flex; flex-direction: column; }
+  .side .filter { color: var(--t-gray); padding: 2px 14px 6px; }
+  .side .filter b { color: var(--t-text2); font-weight: 400; }
+  .grp { color: var(--t-gray); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; padding: 8px 14px 2px; }
+  .chat { display: grid; grid-template-columns: 1fr auto; column-gap: 10px; padding: 3px 14px 3px 12px; border-left: 2px solid transparent; }
+  .chat .name { color: var(--t-text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chat .prev { color: var(--t-gray); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; grid-column: 1 / -1; }
+  .chat .time { color: var(--t-gray); }
+  .chat.unread .name { color: var(--t-text); font-weight: 600; }
+  .chat.unread .prev { color: var(--t-text2); }
+  .chat.unread .time { color: var(--t-me); }
+  .chat.sel { background: var(--t-hl); }
+  .chat.sel .name { color: var(--t-text); }
+  .chat.sel.edge { border-left-color: var(--t-me); }
 
   /* conversation */
-  .convo { display: flex; flex-direction: column; min-height: 420px; }
-  .hd { padding: 6px 16px; border-bottom: 1px solid var(--t-border); color: var(--t-text2); display: flex; justify-content: space-between; }
+  .convo { display: flex; flex-direction: column; min-height: 460px; }
+  .hd { padding: 4px 18px 6px; display: flex; gap: 10px; color: var(--t-gray); border-bottom: 1px solid var(--t-border); }
   .hd b { color: var(--t-text); font-weight: 600; }
-  .scroll { position: relative; padding: 10px 0; display: flex; flex-direction: column; gap: 6px; flex: 1; }
-  .scroll .bar { position: absolute; right: 0; top: 0; bottom: 0; width: 6px; background: var(--t-dark); }
-  .scroll .bar i { position: absolute; left: 1px; right: 1px; background: var(--t-gray); border-radius: 2px; }
-  .day { text-align: center; color: var(--t-gray); font-size: 12px; padding: 2px 0; }
-  .day.sticky { background: var(--t-light); color: var(--t-text2); border-bottom: 1px solid var(--t-border); text-align: left; padding: 2px 16px; }
-  .blk { display: grid; grid-template-columns: 2px 1fr; margin: 0 16px 0 12px; }
-  .blk .rail { border-radius: 1px; background: var(--t-graydim); }
-  .blk .body { padding: 3px 0 3px 12px; white-space: pre-wrap; }
-  .blk.me .rail { background: var(--t-me); }
-  .blk.me .body { background: var(--t-light); border-radius: 0 3px 3px 0; }
-  .blk.them .rail { background: var(--t-them); }
-  .blk.p2 .rail { background: var(--t-p2); }
-  .blk.p3 .rail { background: var(--t-p3); }
-  .blk.sys .rail { background: transparent; }
-  .blk.sys .body { color: var(--t-gray); font-style: italic; }
-  .blk.sel .body { outline: 1px solid var(--t-border-active); outline-offset: -1px; background: var(--t-hl); }
-  .who { font-weight: 600; } .who.me { color: var(--t-me); } .who.them { color: var(--t-them); } .who.p2 { color: var(--t-p2); } .who.p3 { color: var(--t-p3); }
-  .meta { color: var(--t-gray); font-size: 12px; }
-  .tap { color: var(--t-text2); font-size: 12px; background: var(--t-hl); border-radius: 8px; padding: 0 6px; }
-  .img { display: inline-block; width: 220px; height: 120px; border-radius: 3px; background: linear-gradient(135deg, #2a3a4a, #3d5a4f 60%, #6b8a5a); border: 1px solid var(--t-border); vertical-align: top; position: relative; }
-  .img::after { content: "IMG_4412.jpg · 2.1 MB"; position: absolute; left: 6px; bottom: 4px; color: #cfd6dc; font-size: 11px; }
-  .file { color: var(--t-text2); border: 1px dashed var(--t-border); border-radius: 3px; padding: 1px 8px; display: inline-block; }
-  .reply { border-left: 2px solid var(--t-graydim); color: var(--t-gray); padding-left: 8px; font-size: 12px; margin-bottom: 2px; }
-  .link { color: var(--t-me); text-decoration: underline; text-decoration-color: var(--t-graydim); }
-  .cur { background: var(--t-text); color: var(--t-base); }
-  .typing { color: var(--t-gray); font-size: 12px; padding: 0 28px; }
+  .hd .right { margin-left: auto; }
+  .scroll { padding: 8px 0 6px; display: flex; flex-direction: column; flex: 1; }
+  .day { color: var(--t-gray); padding: 10px 18px 2px; }
+  .day:first-child { padding-top: 2px; }
+  .msg { display: grid; grid-template-columns: 1fr auto; column-gap: 16px; padding: 1px 18px; }
+  .msg.first { margin-top: 8px; }
+  .msg .body { white-space: pre-wrap; }
+  .msg .who { font-weight: 600; margin-right: 10px; }
+  .msg .who.me { color: var(--t-me); }
+  .msg .time { color: var(--t-gray); text-align: right; }
+  .msg.cont { padding-left: 18px; }
+  .msg.sel { background: var(--t-hl); }
+  .msg.sys .body { color: var(--t-gray); font-style: italic; }
+  .tap { color: var(--t-text2); font-size: 12px; margin-left: 10px; }
+  .att { color: var(--t-text2); }
+  .att .k { color: var(--t-gray); }
+  .pic { width: 150px; height: 100px; margin: 3px 0 2px; border-radius: 3px; background: linear-gradient(135deg, #5a4d3d, #2c2723 60%, #3a5d55); }
+  .mark { color: var(--t-gray); }
+  .cursor { color: var(--t-me); }
+  .compose { border-top: 1px solid var(--t-border); padding: 6px 18px; color: var(--t-gray); }
+  .compose i { color: var(--t-me); font-style: normal; margin-right: 8px; }
+  .compose .draft { color: var(--t-text); }
+  /* the boxed input, Grok's */
+  .box { margin: 6px 12px 0; border: 1px solid var(--t-border); border-radius: 4px; padding: 5px 10px; color: var(--t-gray); }
+  .box i { color: var(--t-text2); font-style: normal; margin-right: 8px; }
+  .box.focus { border-color: var(--t-text2); }
+  .box .draft { color: var(--t-text); }
+  .box.focus .cur { color: var(--t-text); }
+  .under { text-align: right; padding: 1px 14px 4px; color: var(--t-gray); font-size: 12px; }
+  .under b { color: var(--t-text2); font-weight: 400; }
+  /* narrow frames */
+  .narrow { min-width: 0; width: 100%; grid-template-columns: 1fr; position: relative; }
+  .narrow .convo { min-height: 380px; }
+  .three { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  @media (max-width: 1000px) { .three { grid-template-columns: 1fr; } }
+  .three .term { font-size: 12px; }
+  .popup { position: absolute; inset: 22px 28px 40px; background: var(--t-base); border: 1px solid var(--t-text2); border-radius: 3px; display: flex; flex-direction: column; }
+  .popup .ptitle { display: flex; padding: 0 10px; margin-top: -9px; }
+  .popup .ptitle b { background: var(--t-base); padding: 0 6px; color: var(--t-text); font-weight: 600; }
+  .popup .ptitle .x { margin-left: auto; background: var(--t-base); padding: 0 6px; color: var(--t-gray); }
+  .popup .side { background: transparent; border-right: 0; flex: 1; }
+  .popup .foot { border-top: 1px solid var(--t-border); justify-content: center; padding-bottom: 6px; }
+  .dim > .side, .dim > .convo, .dim > .foot { opacity: .35; }
+  .drawer { position: absolute; left: 0; top: 0; bottom: 0; width: 62%; background: var(--t-side); border-right: 1px solid var(--t-text2); display: flex; flex-direction: column; }
+  .drawer .side { flex: 1; border-right: 0; }
+  .full .side { border-right: 0; background: var(--t-base); }
+  .full .hd { border-bottom: 1px solid var(--t-border); }
+  .cap ul { margin: 6px 0 0; padding-left: 1.1em; }
+  /* a light terminal, for the light-mode frames */
+  .term.light { --t-base: #f0f0f0; --t-side: #ececec; --t-hl: #dedede; --t-hover: #e4e4e4; --t-text: #3a3a3a; --t-text2: #6a6a6a; --t-gray: #9a9a9a; --t-graydim: #c4c4c4; --t-me: #1f6fe5; --t-border: #d8d8d8; --t-border-active: #bdbdbd; box-shadow: 0 12px 32px rgba(0,0,0,.12); }
+  .term.light .titlebar i { background: #d0d0d0; }
+  .term.light .pic { background: linear-gradient(135deg, #c9b8a3, #e3ddd5 60%, #a9cfc6); }
+  .tapchip { color: var(--t-text2); font-size: 12px; margin-left: 10px; }
+  .tapchip.old { background: var(--t-hl); border-radius: 3px; padding: 0 6px; }
+  .side.wrong { background: #d9d9d9; border-right-color: #7a7a7a; }
+  .status-under { text-align: right; padding: 1px 14px 4px; color: var(--t-gray); font-size: 12px; }
+  .status-under b { color: var(--t-text2); font-weight: 400; }
+  del { color: var(--t-gray); text-decoration: line-through; }
+  /* calmer type variants */
+  .calm .msg .who { font-weight: 400; color: var(--t-text2); }
+  .calm .msg .who.me { color: var(--t-me); }
+  .calm .hd b { font-weight: 400; }
+  .calmer .msg .who { font-weight: 400; color: var(--t-text2); }
+  .calmer .msg .who.me { color: var(--t-text2); }
+  .calmer .hd b { font-weight: 400; }
+  .calmer .chat.unread .time { color: var(--t-text); }
+  /* help modal */
+  .helpwrap { position: relative; min-height: 420px; }
+  .help { position: absolute; inset: 14px 60px; background: var(--t-base); border: 1px solid var(--t-border-active); border-radius: 3px; padding: 10px 14px 8px; display: flex; flex-direction: column; gap: 2px; font-size: 12.5px; }
+  .help .ht { display: flex; margin: -19px 0 6px -4px; }
+  .help .ht span { background: var(--t-base); padding: 0 6px; color: var(--t-gray); }
+  .help .hh { color: var(--t-gray); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; margin-top: 8px; }
+  .help .hr { display: grid; grid-template-columns: 110px 1fr; }
+  .help .hr b { font-weight: 600; color: var(--t-text2); }
+  .help .hr.old b { color: var(--t-me); }
+  .help .hr span { color: var(--t-gray); }
+  .help .hr.old span { color: var(--t-text); }
+  .help .hb { margin-top: auto; display: flex; justify-content: center; color: var(--t-gray); }
+  .help .hb b { color: var(--t-text2); font-weight: 500; margin-right: 4px; }
+  .help.old { border-color: var(--t-me); } .help.old .ht span { color: var(--t-me); }
+  .under2 { display: flex; padding: 2px 14px 6px; color: var(--t-gray); font-size: 12px; }
+  .under2 b { color: var(--t-text2); font-weight: 500; }
+  .under2 .r { margin-left: auto; }
+  .side .sfoot { margin-top: auto; padding: 6px 14px 0; color: var(--t-gray); font-size: 12px; }
+  .side .sfoot b { color: var(--t-text2); font-weight: 500; }
+  .foot { display: flex; gap: 22px; padding: 4px 18px 8px; color: var(--t-gray); border-top: 1px solid var(--t-border); grid-column: 1 / -1; }
+  .foot b { color: var(--t-text2); font-weight: 500; }
+  .foot .right { margin-left: auto; }
+  .foot .live { color: var(--t-text2); }
 
-  .prompt { margin: 6px 16px 6px 12px; border: 1px solid var(--t-border-active); border-radius: 4px; padding: 6px 10px; white-space: pre-wrap; display: grid; grid-template-columns: 16px 1fr; }
-  .prompt.idle { border-color: var(--t-border); }
-  .prompt .pfx { color: var(--t-me); }
-  .prompt .hint { color: var(--t-gray); }
-  .infrow { padding: 0 16px 4px 24px; color: var(--t-gray); font-size: 12px; white-space: pre; }
-  .status { padding: 3px 16px; color: var(--t-text2); font-size: 12px; white-space: pre; border-top: 1px solid var(--t-border); }
-  .keys { padding: 4px 16px 8px; color: var(--t-gray); font-size: 12px; white-space: pre; }
-  .keys b { color: var(--t-text2); font-weight: 500; }
-  .g { color: var(--t-them); } .m { color: var(--t-me); } .w { color: var(--t-p2); } .e { color: var(--t-err); } .dim { color: var(--t-gray); } .sec { color: var(--t-text2); } .fz { color: var(--t-fuzzy); font-weight: 600; }
-
-  /* palette */
-  .overlay { position: relative; }
-  .overlay .dimmed { opacity: .35; }
-  .palette { position: absolute; left: 50%; top: 36px; transform: translateX(-50%); width: 540px; background: var(--t-light); border: 1px solid var(--t-border-active); border-radius: 5px; box-shadow: 0 16px 40px rgba(0,0,0,.5); white-space: pre; }
-  .palette .in { padding: 8px 12px; border-bottom: 1px solid var(--t-border); }
-  .palette .row { padding: 2px 12px; color: var(--t-text2); }
-  .palette .row.on { background: var(--t-hl); color: var(--t-text); }
-  .palette .foot { padding: 6px 12px; color: var(--t-gray); font-size: 12px; border-top: 1px solid var(--t-border); }
-
-  .notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
-  .note { background: var(--card); border: 1px solid var(--rule); border-radius: 6px; padding: 14px 16px; font-size: 0.9rem; }
-  .note h3 { margin: 0 0 6px; font-size: 0.78rem; font-family: "IBM Plex Mono", monospace; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
-  .note ul { margin: 0; padding-left: 18px; } .note li { margin: 2px 0; }
-  .tablewrap { overflow-x: auto; }
-  table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule); vertical-align: top; }
-  th { font-family: "IBM Plex Mono", monospace; font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
+  /* before/after anatomy */
+  .anat { padding: 12px 18px 14px; }
+  .anat .blk { display: grid; grid-template-columns: 2px 1fr; margin: 2px 0; }
+  .anat .rail { background: var(--t-me); }
+  .anat .rail.them { background: #7ec699; }
+  .anat .rail.p2 { background: #e5b567; }
+  .anat .body2 { padding: 2px 0 2px 10px; background: #221f1c; }
+  .anat .body3 { padding: 2px 0 2px 10px; }
+  .anat .c1 { color: var(--t-me); font-weight: 600; } .anat .c2 { color: #7ec699; font-weight: 600; } .anat .c3 { color: #e5b567; font-weight: 600; }
+  .anat .t { color: var(--t-gray); }
+  .cap { font-size: 0.8rem; color: var(--muted); margin-top: 6px; }
 </style>
 
 <main>
 <header>
-  <div class="eyebrow">msgs · iMessage in the terminal · three surfaces</div>
-  <h1>Msgs, an iMessage TUI</h1>
-  <p>A reader with a send box, honestly scoped: read everything from <code>chat.db</code>, send text and files through Messages.app, tapbacks via imsg. Same visual grammar as the jot mockups — accent rail per sender, lighter band for your own messages, bordered composer, shortcuts bar — because it's the same Grok Build lineage. Names below are placeholders.</p>
+  <div class="eyebrow">design proposal</div>
+  <h1>msgs, quieter</h1>
+  <p>One accent, no rails, timestamps on the right. The conversation reads like a transcript: sender, text, and a gray time at the edge of the line. Everything else — bands, colored names, the second line under every message — goes.</p>
 </header>
 
-<!-- SURFACE 1 -->
 <section>
-  <div class="eyebrow">Surface 1 · default</div>
-  <h2>Chats + conversation</h2>
-  <p>Chat list on the left (recent-first, unread bold with a count, pinned on top), conversation on the right. Rail color: blue is you, green the other person; in groups each participant gets their own color. Tapbacks sit under the message as a chip. Images render inline with the kitty graphics protocol (Ghostty supports it); anything else is a file chip you can <kbd>o</kbd>pen.</p>
-  <div class="term"><div class="titlebar"><i></i><i></i><i></i><span>msgs</span></div>
-  <div class="screen"><div class="split">
-    <div class="chats">
-      <div class="search">/ search chats…</div>
-      <div class="grp">Pinned</div>
-      <div class="chat unread sel"><div class="dot on"></div><div><div class="name">Priya</div><div class="prev">sounds good, see you at 7</div></div><div class="time">2m <span class="badge">2</span></div></div>
-      <div class="chat"><div class="dot"></div><div><div class="name">Family</div><div class="prev">Mom: 📷 Photo</div></div><div class="time">1h</div></div>
-      <div class="grp">Recent</div>
-      <div class="chat unread"><div class="dot on"></div><div><div class="name">Sunday Football 🏈</div><div class="prev">Dev: who's in for the draft?</div></div><div class="time">14m <span class="badge">5</span></div></div>
-      <div class="chat hover"><div class="dot"></div><div><div class="name">Marcus</div><div class="prev">You: pushed the fix, check CI</div></div><div class="time">3h</div></div>
-      <div class="chat"><div class="dot"></div><div><div class="name">+1 (415) 555-0132</div><div class="prev">Your Amazon order has shipped</div></div><div class="time">5h</div></div>
-      <div class="chat"><div class="dot"></div><div><div class="name">Aisha</div><div class="prev">👍 to "lunch thursday?"</div></div><div class="time">Tue</div></div>
-      <div class="chat"><div class="dot"></div><div><div class="name">Apt 4B</div><div class="prev">Sam: landlord says friday</div></div><div class="time">Mon</div></div>
-      <div class="chat"><div class="dot"></div><div><div class="name">Dad</div><div class="prev">You: yep will call tonight</div></div><div class="time">Sun</div></div>
-    </div>
-    <div class="convo">
-      <div class="hd"><span><b>Priya</b> <span class="dim">· iMessage · +1 (650) 555-0198</span></span><span class="dim">1,204 msgs · 38 photos</span></div>
-      <div class="scroll">
-        <div class="bar"><i style="top:70%;height:28%"></i></div>
-        <div class="day sticky">Today</div>
-        <div class="blk me"><div class="rail"></div><div class="body">dinner tonight? that thai place near you
-<span class="meta">18:02 · Read 18:05</span></div></div>
-        <div class="blk them"><div class="rail"></div><div class="body">yes!! 7?
-<span class="meta">18:05</span></div></div>
-        <div class="blk me"><div class="rail"></div><div class="body">perfect. here's the menu btw <span class="link">https://maps.apple.com/…</span>
-<span class="meta">18:06 · Delivered</span> <span class="tap">❤️ Priya</span></div></div>
-        <div class="blk them"><div class="rail"></div><div class="body"><span class="img"></span>
-<span class="meta">18:31 · IMG_4412.jpg</span></div></div>
-        <div class="blk them sel"><div class="rail"></div><div class="body">sounds good, see you at 7
-<span class="meta">18:33</span></div></div>
-        <div class="typing">Priya is typing…  <span class="dim">(not available — Messages doesn't expose this)</span></div>
-      </div>
-      <div class="prompt"><span class="pfx">›</span><span>on my way in 20<span class="cur"> </span></span></div>
-      <div class="infrow">Enter send · Shift+Enter newline · Ctrl+A attach · Ctrl+R react to selected</div>
-    </div>
-  </div>
-  <div class="status">Messages.app running  │  3 unread in 2 chats  │  watching chat.db</div>
-  <div class="keys"><b>Tab</b> focus list/convo  <b>↑↓</b> select  <b>Enter</b> open/send  <b>Ctrl+K</b> jump to chat  <b>o</b> open attachment  <b>y</b> copy  <b>?</b> help</div>
-  </div></div>
-  <div class="notes">
-    <div class="note"><h3>Read side (all real)</h3><ul><li>Text incl. attributedBody messages</li><li>Tapbacks, replies, edits, attachments</li><li>Delivered / Read timestamps for your messages</li></ul></div>
-    <div class="note"><h3>Write side</h3><ul><li>Send text + files (AppleScript)</li><li>Tapbacks (imsg helper)</li><li>New chat to a number or contact</li></ul></div>
-    <div class="note"><h3>Not possible — shown honestly</h3><ul><li>Typing indicators (mocked above, greyed)</li><li>Marking a chat read in Messages.app</li><li>Edit / unsend / in-thread reply</li></ul></div>
-  </div>
-</section>
-
-<!-- SURFACE 2 -->
-<section>
-  <div class="eyebrow">Surface 2</div>
-  <h2>Group chat — one color per person, threaded replies</h2>
-  <p>Groups are where the accent rail earns its keep: each participant keeps a stable color across the whole thread, so you can skim who said what without reading names. A reply-to shows the quoted line above the message. Joins, renames, and "X reacted" events render as dim system lines instead of full blocks.</p>
-  <div class="term"><div class="titlebar"><i></i><i></i><i></i><span>msgs — Sunday Football 🏈</span></div>
-  <div class="screen"><div class="split wide">
-    <div class="convo">
-      <div class="hd"><span><b>Sunday Football 🏈</b> <span class="dim">· 6 people</span></span><span class="dim">Ctrl+B shows chat list</span></div>
-      <div class="scroll">
-        <div class="bar"><i style="top:76%;height:22%"></i></div>
-        <div class="day sticky">Today</div>
-        <div class="blk p2"><div class="rail"></div><div class="body"><span class="who p2">Dev</span>  who's in for the draft? sunday 3pm
-<span class="meta">17:40</span> <span class="tap">👍 3</span></div></div>
-        <div class="blk them"><div class="rail"></div><div class="body"><span class="who them">Marcus</span>  in. I'm keeping my keeper this year
-<span class="meta">17:42</span></div></div>
-        <div class="blk p3"><div class="rail"></div><div class="body"><span class="who p3">Aisha</span>  <span class="reply">↳ Dev: who's in for the draft? sunday 3pm</span>can we do 4? I have a thing
-<span class="meta">17:45</span></div></div>
-        <div class="blk sys"><div class="rail"></div><div class="body">Dev renamed the group to "Sunday Football 🏈"</div></div>
-        <div class="blk me"><div class="rail"></div><div class="body"><span class="who me">You</span>  4 works. I'll bring the leaguemate rankings
-<span class="meta">17:51 · Delivered</span></div></div>
-        <div class="blk p2 sel"><div class="rail"></div><div class="body"><span class="who p2">Dev</span>  <span class="file">📄 draft-order.pdf · 84 KB</span>
-<span class="meta">18:10</span></div></div>
-      </div>
-      <div class="prompt idle"><span class="pfx">›</span><span class="hint">message Sunday Football 🏈…</span></div>
-      <div class="infrow">selected: draft-order.pdf · <b>o</b> open · <b>s</b> save to ~/Downloads · <b>Ctrl+R</b> react</div>
-    </div>
-  </div>
-  <div class="status">Messages.app running  │  Sunday Football 🏈  │  5 unread here</div>
-  <div class="keys"><b>Ctrl+B</b> chat list  <b>↑↓</b> select message  <b>r</b> reply-quote  <b>Ctrl+R</b> react  <b>o</b> open  <b>Ctrl+K</b> jump  <b>Esc</b> back</div>
-  </div></div>
-</section>
-
-<!-- SURFACE 3 -->
-<section>
-  <div class="eyebrow">Surface 3</div>
-  <h2>Jump palette — people, chats, and message search</h2>
-  <p><kbd>Ctrl+K</kbd> from anywhere. Type a name to switch chats; type more words to full-text search across all messages (SQLite FTS over <code>chat.db</code> text, built once on first launch, incremental after). Results show who, where, when, and the matched line. <kbd>Enter</kbd> jumps to that message in its conversation with it selected.</p>
-  <div class="term"><div class="titlebar"><i></i><i></i><i></i><span>msgs</span></div>
-  <div class="screen overlay">
-    <div class="dimmed"><div class="split">
-      <div class="chats">
-        <div class="search">/ search chats…</div>
-        <div class="chat"><div class="dot"></div><div><div class="name">Priya</div><div class="prev">sounds good, see you at 7</div></div><div class="time">2m</div></div>
-        <div class="chat"><div class="dot"></div><div><div class="name">Family</div><div class="prev">Mom: 📷 Photo</div></div><div class="time">1h</div></div>
-        <div class="chat"><div class="dot"></div><div><div class="name">Sunday Football 🏈</div><div class="prev">Dev: 📄 draft-order.pdf</div></div><div class="time">14m</div></div>
-        <div class="chat"><div class="dot"></div><div><div class="name">Marcus</div><div class="prev">You: pushed the fix</div></div><div class="time">3h</div></div>
-        <div class="chat"><div class="dot"></div><div><div class="name">Aisha</div><div class="prev">👍 to "lunch thursday?"</div></div><div class="time">Tue</div></div>
+  <div class="eyebrow">the whole screen</div>
+  <h2>Chat list + conversation</h2>
+  <div class="term">
+    <div class="titlebar"><i></i><i></i><i></i><span>msgs</span></div>
+    <div class="screen">
+      <div class="side">
+        <div class="filter">/ <b>filter</b></div>
+        <div class="grp">Pinned</div>
+        <div class="chat unread"><span class="name">Sarah</span><span class="time">11:28</span><span class="prev">Can you send the invoice?</span></div>
+        <div class="chat"><span class="name">Mom</span><span class="time">Tue</span><span class="prev">Call me when you land</span></div>
+        <div class="grp">Recent</div>
+        <div class="chat sel"><span class="name">Queso Lasers</span><span class="time">11:28</span><span class="prev">Jamieson: Yeah same - in the car</span></div>
+        <div class="chat unread"><span class="name">Dev Team</span><span class="time">10:02</span><span class="prev">Priya: merged, deploying now</span></div>
+        <div class="chat"><span class="name">Garrett</span><span class="time">Mon</span><span class="prev">You: see you there</span></div>
+        <div class="chat"><span class="name">+1 (415) 555‑0142</span><span class="time">Sun</span><span class="prev">Your package was delivered</span></div>
+        <div class="chat"><span class="name">Caro &amp; Garrett</span><span class="time">Aug 19</span><span class="prev">Caro: 🎉</span></div>
+        <div class="chat"><span class="name">Landlord</span><span class="time">Aug 12</span><span class="prev">You: Rent is sent, thanks</span></div>
       </div>
       <div class="convo">
-        <div class="hd"><span><b>Priya</b></span></div>
+        <div class="hd"><b>Queso Lasers</b><span>iMessage · 2 people</span><span class="right">6,554 msgs · 399 photos</span></div>
         <div class="scroll">
-          <div class="blk me"><div class="rail"></div><div class="body">dinner tonight?</div></div>
-          <div class="blk them"><div class="rail"></div><div class="body">yes!! 7?</div></div>
-          <div class="blk them"><div class="rail"></div><div class="body">sounds good, see you at 7</div></div>
+          <div class="day">Tuesday</div>
+          <div class="msg first"><div class="body"><span class="who me">You</span>Hey guys, cancelling the launch. Don't think pricing makes sense rn<span class="tap">👍 1</span></div><div class="time">08:26</div></div>
+          <div class="msg first"><div class="body"><span class="who">Jamieson</span>Make it free for the masses!!!!</div><div class="time">09:44</div></div>
+          <div class="msg first"><div class="body"><span class="who me">You</span>I mean there's a generous free tier but still feel like it's not competitive</div><div class="time">09:45</div></div>
+
+          <div class="day">Today</div>
+          <div class="msg first"><div class="body"><span class="who me">You</span>Wait I lost track - are y'all popping the question this Saturday?</div><div class="time">10:43</div></div>
+          <div class="msg cont"><div class="body">Or different Saturday?</div><div class="time"></div></div>
+          <div class="msg first"><div class="body"><span class="who">Jamieson</span>Sunday for me!</div><div class="time">10:52</div></div>
+          <div class="msg first"><div class="body"><span class="who me">You</span>Oh sick!</div><div class="time">10:53</div></div>
+          <div class="msg first"><div class="body"><span class="who">Garrett</span>Tomorrow for me!</div><div class="time">11:16</div></div>
+          <div class="msg first sel"><div class="body"><span class="who me">You</span>Dude I'm hyped! Send pics</div><div class="time">11:23</div></div>
+          <div class="msg first"><div class="body"><span class="who">Garrett</span>Will do! I'm going to stop texting about it now so Caro doesn't see my texts haha</div><div class="time">11:27</div></div>
+          <div class="msg cont"><div class="body">We're both wfh today</div><div class="time"></div></div>
+          <div class="msg first"><div class="body"><span class="who me">You</span>Ok ok sounds good!</div><div class="time">11:27</div></div>
+          <div class="msg cont"><div class="body"><div class="pic"></div><span class="att">tmp.gif <span class="k">· 2.3 MB</span></span></div><div class="time">11:28</div></div>
+          <div class="msg first"><div class="body"><span class="who">Jamieson</span>Yeah same - in the car with Laurel and was so quickly wiping the</div><div class="time">11:28</div></div>
         </div>
-        <div class="prompt idle"><span class="pfx">›</span><span class="hint"></span></div>
+        <div class="box focus"><i>❯</i><span class="draft">Sounds good, see you Sat</span><span class="cur">▏</span></div>
+        <div class="status-under">watching chat.db · 2 unread</div>
       </div>
+      <div class="foot"><span><b>Enter</b> send</span><span><b>Alt+Enter</b> newline</span><span><b>Ctrl+A</b> attach</span><span><b>Ctrl+R</b> react</span><span><b>?</b> help</span></div>
     </div>
-    <div class="status">Messages.app running</div><div class="keys"><b>Esc</b> close</div></div>
-    <div class="palette">
-      <div class="in"><span class="m">›</span> thai<span class="cur"> </span></div>
-      <div class="row on">▸ <span class="fz">Thai</span> Basil group <span class="dim">                                       chat · 3 people</span></div>
-      <div class="row">  <b>Priya</b>   dinner tonight? that <span class="fz">thai</span> place near you       <span class="dim">today 18:02</span></div>
-      <div class="row">  <b>Marcus</b>  the <span class="fz">thai</span> spot on valencia was great        <span class="dim">Aug 12</span></div>
-      <div class="row">  <b>Family</b>  Mom: <span class="fz">thai</span> curry recipe attached            <span class="dim">Jul 30</span></div>
-      <div class="row">  <b>Aisha</b>   <span class="fz">thai</span>? or sushi                            <span class="dim">Jul 3</span></div>
-      <div class="foot">1 chat · 4 messages · <b>Enter</b> jump · <b>Ctrl+N</b> new message to "thai" · <b>Tab</b> filter: chats / messages / photos</div>
-    </div>
-  </div></div>
+  </div>
+  <ul class="rules">
+    <li><b>One accent, and it never marks chrome.</b> The blue is on your own name and on the time of an unread chat — content, not furniture. Selection and focus are monochrome: the selected chat is a lighter row, the focused input is a brighter gray border. Nothing that is "where you are" is blue.</li>
+    <li><b>Timestamps sit in a right column.</b> Every message gets a time on its first line, right-aligned to the pane edge. It doesn't compete with the text and lines up top to bottom.</li>
+    <li><b>Runs collapse.</b> Consecutive messages from the same person show the name once; the rest are indented under it with just their time. That turns the two-line-per-message rhythm into one line.</li>
+    <li><b>No rails, no bands.</b> Your messages aren't tinted. The selected message is the only thing with a background, and the day label is a plain gray line, not a centered band.</li>
+    <li><b>The input is a box, Grok's box.</b> A hairline rounded border with a <code>❯</code> prompt, gray at rest and a step brighter when it has focus. The status line sits right-aligned under it in small gray, the way Grok puts <code>Grok 4.6 · always-approve</code> there; keys live in the footer and nowhere else.</li>
+  </ul>
 </section>
 
-<!-- BUILD NOTES -->
 <section>
-  <div class="eyebrow">Under the hood</div>
-  <h2>How each surface maps to the backend</h2>
-  <div class="tablewrap"><table>
-    <tr><th>Need</th><th>Rust crate route</th><th>imsg route</th></tr>
-    <tr><td>Chat list, unread counts</td><td><code>chat</code>, <code>chat_message_join</code> tables via <code>imessage-database</code></td><td><code>imsg chats --json</code></td></tr>
-    <tr><td>Message bodies (incl. attributedBody)</td><td>built-in typedstream parser</td><td>parsed by IMsgCore</td></tr>
-    <tr><td>Live updates</td><td>watch <code>chat.db-wal</code> with <code>notify</code>, re-query since last ROWID</td><td><code>imsg watch --ndjson</code> stream</td></tr>
-    <tr><td>Send text / file</td><td><code>osascript</code> to Messages.app</td><td><code>imsg send</code></td></tr>
-    <tr><td>Tapbacks (send)</td><td>not available without porting the helper</td><td><code>imsg send --reaction</code></td></tr>
-    <tr><td>Inline images</td><td colspan="2">read attachment path from DB → kitty graphics protocol in Ghostty/Kitty/WezTerm; chafa fallback elsewhere</td></tr>
-    <tr><td>Full-text search</td><td colspan="2">your own SQLite FTS5 index next to the app, rebuilt incrementally from either source</td></tr>
-    <tr><td>Contact names</td><td colspan="2">AddressBook SQLite (<code>~/Library/Application Support/AddressBook</code>) or <code>contacts</code> CLI; cache to disk</td></tr>
-  </table></div>
-  <p>Order of work: surface 1 read-only → send box → surface 3 palette → surface 2 group polish → inline images → tapbacks. Read-only surface 1 alone is a useful app and is roughly a week of evenings with ratatui.</p>
+  <div class="eyebrow">the input</div>
+  <h2>Rest, focus, attach</h2>
+  <div class="three">
+    <div>
+      <div class="term"><div class="screen solo"><div class="convo" style="min-height:0">
+        <div class="box"><i>❯</i>message Queso Lasers…</div>
+        <div class="under"><b>Tab</b> compose</div>
+      </div></div></div>
+      <div class="cap">At rest: gray border, gray prompt, italic placeholder.</div>
+    </div>
+    <div>
+      <div class="term"><div class="screen solo"><div class="convo" style="min-height:0">
+        <div class="box focus"><i>❯</i><span class="draft">Sounds good, see you Sat</span><span class="cur">▏</span></div>
+        <div class="under"><b>Enter</b> send · <b>Alt+Enter</b> newline · <b>Ctrl+A</b> attach</div>
+      </div></div></div>
+      <div class="cap">Focused: the border steps up to the secondary text gray. That is the whole focus signal.</div>
+    </div>
+    <div>
+      <div class="term"><div class="screen solo"><div class="convo" style="min-height:0">
+        <div class="box focus"><i>❯</i><span class="draft">~/Desktop/receipt.pdf</span><span class="cur">▏</span></div>
+        <div class="under"><b>attach</b> · <b>Enter</b> send · <b>Esc</b> cancel</div>
+      </div></div></div>
+      <div class="cap">Attaching: the mode is named in the line under the box instead of a label on the border.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="eyebrow">narrow terminals</div>
+  <h2>Where the chat list goes when there is no room beside the conversation</h2>
+  <p>Under 90 columns the list is hidden today and <kbd>Ctrl+B</kbd> does nothing. Three ways to bring it back on a narrow screen. All three keep <kbd>Ctrl+B</kbd> as the key, and <kbd>Esc</kbd> or <kbd>Enter</kbd> puts the conversation back.</p>
+  <div class="three">
+
+    <div>
+      <div class="term"><div class="screen narrow dim">
+        <div class="convo">
+          <div class="hd"><b>Queso Lasers</b><span>2 people</span></div>
+          <div class="scroll">
+            <div class="msg first"><div class="body"><span class="who">Garrett</span>Tomorrow for me!</div><div class="time">11:16</div></div>
+            <div class="msg first"><div class="body"><span class="who me">You</span>Dude I'm hyped! Send pics</div><div class="time">11:23</div></div>
+            <div class="msg first"><div class="body"><span class="who">Garrett</span>Will do! I'm going to stop texting about it now</div><div class="time">11:27</div></div>
+            <div class="msg cont"><div class="body">We're both wfh today</div><div class="time">11:27</div></div>
+          </div>
+          <div class="box"><i>❯</i>message Queso Lasers…</div>
+        </div>
+        <div class="foot"><span><b>Ctrl+B</b> chats</span><span class="right live">2 unread</span></div>
+        <div class="popup">
+          <div class="ptitle"><b>Chats</b><span class="x">[×]</span></div>
+          <div class="side">
+            <div class="filter">/ <b>filter</b></div>
+            <div class="chat unread"><span class="name">Sarah</span><span class="time">11:28</span><span class="prev">Can you send the invoice?</span></div>
+            <div class="chat sel"><span class="name">Queso Lasers</span><span class="time">11:28</span><span class="prev">Jamieson: Yeah same</span></div>
+            <div class="chat unread"><span class="name">Dev Team</span><span class="time">10:02</span><span class="prev">Priya: merged</span></div>
+            <div class="chat"><span class="name">Garrett</span><span class="time">Mon</span><span class="prev">You: see you there</span></div>
+            <div class="chat"><span class="name">Mom</span><span class="time">Tue</span><span class="prev">Call me when you land</span></div>
+          </div>
+          <div class="foot"><span><b>↑↓</b> select</span><span><b>Enter</b> open</span><span><b>Esc</b> close</span></div>
+        </div>
+      </div></div>
+      <div class="cap"><b>A. Pop-up</b>, Grok's Agents panel. A bordered box with its title on the border and <code>[×]</code>, floated over the dimmed conversation, its own keys along its bottom edge.
+        <ul><li>Feels like the palette (<kbd>Ctrl+K</kbd>) — same overlay grammar, one less thing to learn</li><li>Costs 4 columns of border on a screen that is already narrow</li><li>Dimming the conversation is a style the app does not use anywhere else yet</li></ul></div>
+    </div>
+
+    <div>
+      <div class="term"><div class="screen narrow full">
+        <div class="side">
+          <div class="hd"><b>Chats</b><span>24</span><span class="right">/ filter</span></div>
+          <div class="grp">Pinned</div>
+          <div class="chat unread"><span class="name">Sarah</span><span class="time">11:28</span><span class="prev">Can you send the invoice?</span></div>
+          <div class="grp">Recent</div>
+          <div class="chat sel"><span class="name">Queso Lasers</span><span class="time">11:28</span><span class="prev">Jamieson: Yeah same - in the car with Laurel</span></div>
+          <div class="chat unread"><span class="name">Dev Team</span><span class="time">10:02</span><span class="prev">Priya: merged, deploying now</span></div>
+          <div class="chat"><span class="name">Garrett</span><span class="time">Mon</span><span class="prev">You: see you there</span></div>
+          <div class="chat"><span class="name">Mom</span><span class="time">Tue</span><span class="prev">Call me when you land</span></div>
+          <div class="chat"><span class="name">+1 (415) 555‑0142</span><span class="time">Sun</span><span class="prev">Your package was delivered</span></div>
+          <div class="chat"><span class="name">Landlord</span><span class="time">Aug 12</span><span class="prev">You: Rent is sent, thanks</span></div>
+        </div>
+        <div class="foot"><span><b>Enter</b> open</span><span><b>/</b> filter</span><span><b>Esc</b> back</span><span class="right live">2 unread</span></div>
+      </div></div>
+      <div class="cap"><b>B. Full screen</b>, Grok's <code>/sessions</code>. The list takes the whole terminal — same rows, full width for previews, headings and counts in the header. <kbd>Enter</kbd> opens the chat and replaces it with the conversation.
+        <ul><li>Nothing is squeezed: the widest previews of any option</li><li>It is a real second screen, so the chat list gets the same treatment on every width — the pane on a wide terminal is just this, docked</li><li>You lose sight of the conversation while choosing, which is fine for a phone-sized terminal</li></ul></div>
+    </div>
+
+    <div>
+      <div class="term"><div class="screen narrow">
+        <div class="convo">
+          <div class="hd"><b>Queso Lasers</b><span>2 people</span></div>
+          <div class="scroll">
+            <div class="msg first"><div class="body"><span class="who">Garrett</span>Tomorrow for me!</div><div class="time">11:16</div></div>
+            <div class="msg first"><div class="body"><span class="who me">You</span>Dude I'm hyped! Send pics</div><div class="time">11:23</div></div>
+            <div class="msg first"><div class="body"><span class="who">Garrett</span>Will do! I'm going to stop texting about it now</div><div class="time">11:27</div></div>
+            <div class="msg cont"><div class="body">We're both wfh today</div><div class="time">11:27</div></div>
+          </div>
+          <div class="box"><i>❯</i>message Queso Lasers…</div>
+        </div>
+        <div class="foot"><span><b>Ctrl+B</b> chats</span><span class="right live">2 unread</span></div>
+        <div class="drawer">
+          <div class="side">
+            <div class="filter">/ <b>filter</b></div>
+            <div class="chat unread"><span class="name">Sarah</span><span class="time">11:28</span><span class="prev">Can you send the invoice?</span></div>
+            <div class="chat sel"><span class="name">Queso Lasers</span><span class="time">11:28</span><span class="prev">Jamieson: Yeah same</span></div>
+            <div class="chat unread"><span class="name">Dev Team</span><span class="time">10:02</span><span class="prev">Priya: merged</span></div>
+            <div class="chat"><span class="name">Garrett</span><span class="time">Mon</span><span class="prev">You: see you there</span></div>
+            <div class="chat"><span class="name">Mom</span><span class="time">Tue</span><span class="prev">Call me</span></div>
+          </div>
+        </div>
+      </div></div>
+      <div class="cap"><b>C. Drawer.</b> The same pane as on a wide terminal, slid over the left two-thirds of the conversation, with a brighter divider. Nothing else changes; the conversation keeps drawing behind it.
+        <ul><li>The cheapest to build: it is the existing pane, drawn last</li><li>Keeps the conversation partly in view, so arrowing through chats previews nothing but you never lose your place</li><li>Half-covered messages can read as a glitch on the narrowest screens</li></ul></div>
+    </div>
+  </div>
+  <p><b>Recommendation: B.</b> It is honest about the width — a narrow terminal is a phone, and a phone shows one thing at a time — and it makes the chat list one surface with one set of rows instead of a pane that becomes a box that becomes a drawer. A is the runner-up if you want the conversation to stay visible.</p>
+</section>
+
+<section>
+  <div class="eyebrow">saying things once</div>
+  <h2>Three duplicates, and where each thing goes instead</h2>
+  <div class="two">
+    <div>
+      <div class="term"><div class="screen solo"><div class="convo" style="min-height:0">
+        <div class="scroll" style="padding-top:6px">
+          <div class="msg first"><div class="body"><span class="who me">You</span>Hey guys, cancelling the launch.<span class="tapchip old">👍 1</span></div><div class="time">8:26 AM</div></div>
+          <div class="msg first"><div class="body"><span class="who me">You</span>Wait I lost track - are y'all popping the question this Saturday?</div><div class="time">10:43 AM</div></div>
+          <div class="msg cont"><div class="body">Or different Saturday?</div><div class="time">10:43 AM</div></div>
+          <div class="msg first"><div class="body"><span class="who">Garrett</span>Will do! I'm going to stop texting about it</div><div class="time">11:27 AM</div></div>
+          <div class="msg cont"><div class="body">We're both wfh today</div><div class="time">11:27 AM</div></div>
+        </div>
+        <div class="box focus"><i>❯</i><span class="draft">on my way</span><span class="cur">▏</span></div>
+        <div class="under"><b>Enter</b> send · <b>Alt+Enter</b> newline · <b>Ctrl+A</b> attach</div>
+      </div>
+      <div class="foot"><span><b>Enter</b> send</span><span><b>Alt+Enter</b> newline</span><span><b>Ctrl+A</b> attach</span><span><b>?</b> help</span><span class="right live">watching chat.db · no unread · Messages.app not running</span></div>
+      </div></div>
+      <div class="cap">Now. The composer's keys appear under the box <em>and</em> in the footer. A run repeats the same clock on every line. The tapback chip sits in its own box.</div>
+    </div>
+    <div>
+      <div class="term"><div class="screen solo"><div class="convo" style="min-height:0">
+        <div class="scroll" style="padding-top:6px">
+          <div class="msg first"><div class="body"><span class="who me">You</span>Hey guys, cancelling the launch.<span class="tapchip">👍 1</span></div><div class="time">8:26 AM</div></div>
+          <div class="msg first"><div class="body"><span class="who me">You</span>Wait I lost track - are y'all popping the question this Saturday?</div><div class="time">10:43 AM</div></div>
+          <div class="msg cont"><div class="body">Or different Saturday?</div><div class="time"></div></div>
+          <div class="msg first"><div class="body"><span class="who">Garrett</span>Will do! I'm going to stop texting about it</div><div class="time">11:27 AM</div></div>
+          <div class="msg cont"><div class="body">We're both wfh today</div><div class="time"></div></div>
+        </div>
+        <div class="box focus"><i>❯</i><span class="draft">on my way</span><span class="cur">▏</span></div>
+        <div class="status-under">watching chat.db · no unread · <b>Messages.app not running</b></div>
+      </div>
+      <div class="foot"><span><b>Enter</b> send</span><span><b>Alt+Enter</b> newline</span><span><b>Ctrl+A</b> attach</span><span><b>Ctrl+R</b> react</span><span><b>?</b> help</span></div>
+      </div></div>
+      <div class="cap">Proposed. <b>Keys live in the footer only</b>, which already follows focus. <b>Status moves under the box</b>, right-aligned in small gray — exactly where Grok keeps <code>Grok 4.6 · always-approve</code> — and the one part worth noticing (Messages.app not running) reads a step brighter. <b>A run's clock is said once per minute</b>: a continuation gets a clock only when its minute differs from the line above. <b>Tapback chips lose their box</b> and become gray text on the line under the message.</div>
+    </div>
+  </div>
+  <ul class="rules">
+    <li><b>Footer</b> — chat list focused: <code>Enter open   / filter   Ctrl+B list   Ctrl+K jump   ? help</code>. Conversation: <code>o open   s save   y copy   Ctrl+R react   Ctrl+K jump   ? help</code>. Composer: <code>Enter send   Alt+Enter newline   Ctrl+A attach   Ctrl+R react   ? help</code>. Toasts replace the status under the box, not the footer.</li>
+    <li><b>Under the box</b> — <code>watching chat.db · no unread · Messages.app not running</code>, dropping from the right when tight. Nothing else ever goes there.</li>
+    <li><b>Clock rule</b> — the head of a run always has one; a continuation has one only if <code>clock(this) ≠ clock(previous)</code>. The picture line under "Ok ok sounds good!" keeps its <code>11:28 AM</code> because the minute changed.</li>
+  </ul>
+</section>
+
+<section>
+  <div class="eyebrow">light mode</div>
+  <h2>A light terminal: the sidebar is the same paper, a shade off</h2>
+  <div class="two">
+    <div>
+      <div class="term light"><div class="screen" style="min-width:0;grid-template-columns:200px 1fr">
+        <div class="side wrong">
+          <div class="filter">/ <b>filter</b></div>
+          <div class="chat sel"><span class="name">Queso Lasers</span><span class="time">2h</span><span class="prev">Jamieson: Yeah same</span></div>
+          <div class="chat"><span class="name">34428</span><span class="time">2h</span><span class="prev">DCU: Message for</span></div>
+          <div class="chat"><span class="name">Ian Propper</span><span class="time">3h</span><span class="prev">And I've worked with</span></div>
+          <div class="chat"><span class="name">Sham Shelkay</span><span class="time">3h</span><span class="prev">https://maps.app.goo</span></div>
+        </div>
+        <div class="convo" style="min-height:0">
+          <div class="hd"><b>Queso Lasers</b><span>2 people</span></div>
+          <div class="scroll" style="padding-top:6px">
+            <div class="msg first"><div class="body"><span class="who">Jamieson</span>Make it free for the masses!!!!</div><div class="time">9:44 AM</div></div>
+            <div class="msg first"><div class="body"><span class="who me">You</span>I mean there's a generous free tier</div><div class="time">9:45 AM</div></div>
+            <div class="msg first"><div class="body"><span class="who">Jamieson</span>Sunday for me!</div><div class="time">10:52 AM</div></div>
+          </div>
+          <div class="box"><i>❯</i>message Queso Lasers…</div>
+          <div class="status-under">watching chat.db · no unread</div>
+        </div>
+        <div class="foot"><span><b>Enter</b> open</span><span><b>/</b> filter</span><span><b>?</b> help</span></div>
+      </div></div>
+      <div class="cap">Now, on a light Ghostty. The list sits on a gray that reads as a different material, and the divider is a dark line down the middle of the screen.</div>
+    </div>
+    <div>
+      <div class="term light"><div class="screen" style="min-width:0;grid-template-columns:200px 1fr">
+        <div class="side">
+          <div class="filter">/ <b>filter</b></div>
+          <div class="chat sel"><span class="name">Queso Lasers</span><span class="time">2h</span><span class="prev">Jamieson: Yeah same</span></div>
+          <div class="chat"><span class="name">34428</span><span class="time">2h</span><span class="prev">DCU: Message for</span></div>
+          <div class="chat"><span class="name">Ian Propper</span><span class="time">3h</span><span class="prev">And I've worked with</span></div>
+          <div class="chat"><span class="name">Sham Shelkay</span><span class="time">3h</span><span class="prev">https://maps.app.goo</span></div>
+        </div>
+        <div class="convo" style="min-height:0">
+          <div class="hd"><b>Queso Lasers</b><span>2 people</span></div>
+          <div class="scroll" style="padding-top:6px">
+            <div class="msg first"><div class="body"><span class="who">Jamieson</span>Make it free for the masses!!!!</div><div class="time">9:44 AM</div></div>
+            <div class="msg first"><div class="body"><span class="who me">You</span>I mean there's a generous free tier</div><div class="time">9:45 AM</div></div>
+            <div class="msg first"><div class="body"><span class="who">Jamieson</span>Sunday for me!</div><div class="time">10:52 AM</div></div>
+          </div>
+          <div class="box"><i>❯</i>message Queso Lasers…</div>
+          <div class="status-under">watching chat.db · no unread</div>
+        </div>
+        <div class="foot"><span><b>Enter</b> open</span><span><b>/</b> filter</span><span><b>?</b> help</span></div>
+      </div></div>
+      <div class="cap">Proposed. The list is the page, 1–2% darker (<code>#ececec</code> on <code>#f0f0f0</code>) — enough to tell the panes apart, not enough to be a color. The divider is the ordinary hairline (<code>#d8d8d8</code>); when the list has focus it steps to <code>#bdbdbd</code>, not to a dark gray. The selected row is <code>#dedede</code>. Same rule for <code>--theme terminal</code> on any light ground: list = ground mixed 2% toward black, active border = 25% toward the text, not 55%.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="eyebrow">help</div>
+  <h2>The key list in gray</h2>
+  <div class="two">
+    <div>
+      <div class="term"><div class="helpwrap">
+        <div class="help old">
+          <div class="ht"><span>keys</span></div>
+          <div class="hh">Global</div>
+          <div class="hr old"><b>Tab</b><span>switch focus: chat list → conversation → composer</span></div>
+          <div class="hr old"><b>Enter</b><span>open chat / send message</span></div>
+          <div class="hr old"><b>Ctrl+K</b><span>jump palette: chats, people, message search</span></div>
+          <div class="hr old"><b>Ctrl+N</b><span>new message to a number or address, via the palette</span></div>
+          <div class="hr old"><b>Esc</b><span>close the overlay / leave the composer</span></div>
+          <div class="hr old"><b>q / Ctrl+C</b><span>quit</span></div>
+          <div class="hh">List</div>
+          <div class="hr old"><b>↑↓ / k j</b><span>select chat or message</span></div>
+          <div class="hr old"><b>g / G</b><span>jump to top / bottom</span></div>
+          <div class="hh">Conversation</div>
+          <div class="hr old"><b>o</b><span>open the selected attachment</span></div>
+          <div class="hr old"><b>y</b><span>copy the selected message</span></div>
+          <div class="hb"><b>↑↓</b> scroll · <b>Esc</b> close</div>
+        </div>
+      </div></div>
+      <div class="cap">Now: every key in the accent, the title and border blue, descriptions in full text color. Thirty blue words on one screen.</div>
+    </div>
+    <div>
+      <div class="term"><div class="helpwrap">
+        <div class="help">
+          <div class="ht"><span>keys</span></div>
+          <div class="hh">Global</div>
+          <div class="hr"><b>Tab</b><span>switch focus: chat list → conversation → composer</span></div>
+          <div class="hr"><b>Enter</b><span>open chat / send message</span></div>
+          <div class="hr"><b>Ctrl+K</b><span>jump palette: chats, people, message search</span></div>
+          <div class="hr"><b>Ctrl+N</b><span>new message to a number or address, via the palette</span></div>
+          <div class="hr"><b>Esc</b><span>close the overlay / leave the composer</span></div>
+          <div class="hr"><b>q / Ctrl+C</b><span>quit</span></div>
+          <div class="hh">List</div>
+          <div class="hr"><b>↑↓ / k j</b><span>select chat or message</span></div>
+          <div class="hr"><b>g / G</b><span>jump to top / bottom</span></div>
+          <div class="hh">Conversation</div>
+          <div class="hr"><b>o</b><span>open the selected attachment</span></div>
+          <div class="hr"><b>y</b><span>copy the selected message</span></div>
+          <div class="hb"><b>↑↓</b> scroll · <b>Esc</b> close</div>
+        </div>
+      </div></div>
+      <div class="cap">Proposed: keys in bold secondary gray, descriptions in the dim gray, headings the same uppercase gray the sidebar uses, the border the focused-pane gray, the title in gray. The same treatment goes to the palette and the reaction picker.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="eyebrow">no footer</div>
+  <h2>Where <code>? help</code> and the unread count go without a bottom bar</h2>
+  <p>The footer is two rows (the rule and the bar) for four characters. Two places they could live instead; both give the conversation two more rows and drop the last horizontal line on the screen.</p>
+  <div class="two">
+    <div>
+      <div class="term"><div class="screen" style="min-width:0;grid-template-columns:200px 1fr">
+        <div class="side">
+          <div class="filter">/ <b>filter</b></div>
+          <div class="chat sel"><span class="name">Queso Lasers</span><span class="time">2h</span><span class="prev">Jamieson: Yeah same</span></div>
+          <div class="chat unread"><span class="name">Dev Team</span><span class="time">10:02</span><span class="prev">Priya: merged</span></div>
+          <div class="chat"><span class="name">Ian Propper</span><span class="time">3h</span><span class="prev">And I've worked with</span></div>
+          <div class="chat"><span class="name">Sham Shelkay</span><span class="time">3h</span><span class="prev">https://maps.app.goo</span></div>
+          <div class="sfoot"><b>?</b> help</div>
+        </div>
+        <div class="convo" style="min-height:0">
+          <div class="hd"><b>Queso Lasers</b><span>2 people</span></div>
+          <div class="scroll" style="padding-top:6px">
+            <div class="msg first"><div class="body"><span class="who">Jamieson</span>Make it free for the masses!!!!</div><div class="time">9:44 AM</div></div>
+            <div class="msg first"><div class="body"><span class="who me">You</span>I mean there's a generous free tier</div><div class="time">9:45 AM</div></div>
+            <div class="msg first"><div class="body"><span class="who">Jamieson</span>Sunday for me!</div><div class="time">10:52 AM</div></div>
+          </div>
+          <div class="box"><i>❯</i>message Queso Lasers…</div>
+          <div class="under2"><span class="r">1 unread</span></div>
+        </div>
+      </div></div>
+      <div class="cap"><b>A. In the sidebar's last row.</b> <code>? help</code> sits at the bottom of the list, where the eye goes for navigation. Unread and toasts go on the row under the box, right-aligned. When the list is hidden with <kbd>Ctrl+B</kbd> the hint goes with it — by then you know the key.</div>
+    </div>
+    <div>
+      <div class="term"><div class="screen" style="min-width:0;grid-template-columns:200px 1fr">
+        <div class="side">
+          <div class="filter">/ <b>filter</b></div>
+          <div class="chat sel"><span class="name">Queso Lasers</span><span class="time">2h</span><span class="prev">Jamieson: Yeah same</span></div>
+          <div class="chat unread"><span class="name">Dev Team</span><span class="time">10:02</span><span class="prev">Priya: merged</span></div>
+          <div class="chat"><span class="name">Ian Propper</span><span class="time">3h</span><span class="prev">And I've worked with</span></div>
+          <div class="chat"><span class="name">Sham Shelkay</span><span class="time">3h</span><span class="prev">https://maps.app.goo</span></div>
+        </div>
+        <div class="convo" style="min-height:0">
+          <div class="hd"><b>Queso Lasers</b><span>2 people</span></div>
+          <div class="scroll" style="padding-top:6px">
+            <div class="msg first"><div class="body"><span class="who">Jamieson</span>Make it free for the masses!!!!</div><div class="time">9:44 AM</div></div>
+            <div class="msg first"><div class="body"><span class="who me">You</span>I mean there's a generous free tier</div><div class="time">9:45 AM</div></div>
+            <div class="msg first"><div class="body"><span class="who">Jamieson</span>Sunday for me!</div><div class="time">10:52 AM</div></div>
+          </div>
+          <div class="box"><i>❯</i>message Queso Lasers…</div>
+          <div class="under2"><span><b>?</b> help</span><span class="r">1 unread</span></div>
+        </div>
+      </div></div>
+      <div class="cap"><b>B. Under the box.</b> One row, always there: <code>? help</code> at the left, unread — or a toast — at the right, in the small gray Grok uses under its prompt. Nothing depends on whether the list is showing, and on a narrow terminal the same row sits under the list screen.</div>
+    </div>
+  </div>
+  <p><b>Recommendation: B.</b> It is one rule — the row under the box is the app's one line of quiet chrome — and it never moves or disappears. A is prettier when the list is open, but it splits "where do I look" across two panes.</p>
+</section>
+
+<section>
+  <div class="eyebrow">type</div>
+  <h2>Names as labels, not headlines</h2>
+  <p>Everything in the thread is set in the same weight and near the same gray: bold names, bright body text, a bold title. Two ways to let the words be the loudest thing on the screen.</p>
+  <div class="two">
+    <div>
+      <div class="term"><div class="screen solo calm"><div class="convo" style="min-height:0">
+        <div class="hd"><b>Queso Lasers</b><span>iMessage · 2 people</span></div>
+        <div class="scroll" style="padding-top:8px">
+          <div class="day">Today</div>
+          <div class="msg first"><div class="body"><span class="who me">You</span>Wait I lost track - are y'all popping the question this Saturday?</div><div class="time">10:43 AM</div></div>
+          <div class="msg cont"><div class="body">Or different Saturday?</div><div class="time"></div></div>
+          <div class="msg first"><div class="body"><span class="who">Jamieson</span>Sunday for me!</div><div class="time">10:52 AM</div></div>
+          <div class="msg first"><div class="body"><span class="who me">You</span>Oh sick!</div><div class="time">10:53 AM</div></div>
+          <div class="msg first"><div class="body"><span class="who">Garrett</span>Tomorrow for me!</div><div class="time">11:16 AM</div></div>
+          <div class="msg first"><div class="body"><span class="who me">You</span>Dude I'm hyped! Send pics</div><div class="time">11:23 AM</div></div>
+          <div class="msg first"><div class="body"><span class="who">Garrett</span>Will do! I'm going to stop texting about it now so Caro doesn't see my texts haha</div><div class="time">11:27 AM</div></div>
+          <div class="msg cont"><div class="body">We're both wfh today</div><div class="time"></div></div>
+        </div>
+        <div class="box"><i>❯</i>Message Queso Lasers</div>
+        <div class="under2"><span><b>?</b> help</span><span class="r">1 unread</span></div>
+      </div></div></div>
+      <div class="cap"><b>A. Names step back, You keeps the blue.</b> Names in regular weight, in the secondary gray; the body in the text color, so it is the brightest thing on the line. The header title drops its bold too. <code>You</code> stays the one blue word, regular weight.</div>
+    </div>
+    <div>
+      <div class="term"><div class="screen solo calmer"><div class="convo" style="min-height:0">
+        <div class="hd"><b>Queso Lasers</b><span>iMessage · 2 people</span></div>
+        <div class="scroll" style="padding-top:8px">
+          <div class="day">Today</div>
+          <div class="msg first"><div class="body"><span class="who me">You</span>Wait I lost track - are y'all popping the question this Saturday?</div><div class="time">10:43 AM</div></div>
+          <div class="msg cont"><div class="body">Or different Saturday?</div><div class="time"></div></div>
+          <div class="msg first"><div class="body"><span class="who">Jamieson</span>Sunday for me!</div><div class="time">10:52 AM</div></div>
+          <div class="msg first"><div class="body"><span class="who me">You</span>Oh sick!</div><div class="time">10:53 AM</div></div>
+          <div class="msg first"><div class="body"><span class="who">Garrett</span>Tomorrow for me!</div><div class="time">11:16 AM</div></div>
+          <div class="msg first"><div class="body"><span class="who me">You</span>Dude I'm hyped! Send pics</div><div class="time">11:23 AM</div></div>
+          <div class="msg first"><div class="body"><span class="who">Garrett</span>Will do! I'm going to stop texting about it now so Caro doesn't see my texts haha</div><div class="time">11:27 AM</div></div>
+          <div class="msg cont"><div class="body">We're both wfh today</div><div class="time"></div></div>
+        </div>
+        <div class="box"><i>❯</i>Message Queso Lasers</div>
+        <div class="under2"><span><b>?</b> help</span><span class="r">1 unread</span></div>
+      </div></div></div>
+      <div class="cap"><b>B. All gray.</b> The same, and <code>You</code> is a gray label like every other name — it is a word, it does not need a color to be found. The sidebar's unread time goes from blue to the text color, so the accent is left to links alone.</div>
+    </div>
+  </div>
+  <p><b>Recommendation: A.</b> It gives the words the page. One blue word per run is a cheap way to find your own side of the conversation when scanning, and it is the only color on the screen. B is the answer if the blue still reads as noise after living with A for a day — it is a one-line change.</p>
+</section>
+
+<section>
+  <div class="eyebrow">anatomy</div>
+  <h2>A message row, before and after</h2>
+  <div class="two">
+    <div>
+      <div class="term">
+        <div class="anat">
+          <div class="blk"><div class="rail"></div><div class="body2"><span class="c1">You</span>  Wait I lost track - are y'all popping the question this Saturday?<br><span class="t">10:43</span></div></div>
+          <div class="blk"><div class="rail"></div><div class="body2"><span class="c1">You</span>  Or different Saturday?<br><span class="t">10:43</span></div></div>
+          <div class="blk"><div class="rail p2"></div><div class="body3"><span class="c3">Jamieson</span>  Sunday for me!<br><span class="t">10:52</span></div></div>
+          <div class="blk"><div class="rail them"></div><div class="body3"><span class="c2">Garrett</span>  Tomorrow for me!<br><span class="t">11:16</span></div></div>
+        </div>
+      </div>
+      <div class="cap">Now: a rail, a band behind your own messages, a color per person, and a time on its own line. Four messages take eight rows and three colors.</div>
+    </div>
+    <div>
+      <div class="term">
+        <div class="anat" style="padding-left:0;padding-right:0">
+          <div class="msg first" style="margin-top:0"><div class="body"><span class="who me">You</span>Wait I lost track - are y'all popping the question this Saturday?</div><div class="time">10:43</div></div>
+          <div class="msg cont"><div class="body">Or different Saturday?</div><div class="time"></div></div>
+          <div class="msg first"><div class="body"><span class="who">Jamieson</span>Sunday for me!</div><div class="time">10:52</div></div>
+          <div class="msg first"><div class="body"><span class="who">Garrett</span>Tomorrow for me!</div><div class="time">11:16</div></div>
+        </div>
+      </div>
+      <div class="cap">Proposed: the same four messages in four rows and one color. The blank row between senders does the work the rails did.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="eyebrow">the panel</div>
+  <h2>Chat list states</h2>
+  <p>Two lines per chat: name and time, then the preview. The list is a shade darker than the conversation, which is the only thing that separates them besides the rule.</p>
+  <div class="two">
+    <div>
+      <div class="term"><div class="screen solo"><div class="side" style="border-right:0">
+        <div class="grp">Recent</div>
+        <div class="chat"><span class="name">Garrett</span><span class="time">Mon</span><span class="prev">You: see you there</span></div>
+        <div class="chat unread"><span class="name">Dev Team</span><span class="time">10:02</span><span class="prev">Priya: merged, deploying now</span></div>
+        <div class="chat sel"><span class="name">Queso Lasers</span><span class="time">11:28</span><span class="prev">Jamieson: Yeah same - in the car</span></div>
+        <div class="chat sel unread"><span class="name">Sarah</span><span class="time">11:28</span><span class="prev">Can you send the invoice?</span></div>
+      </div></div></div>
+      <div class="cap">Read · unread · selected · selected and unread. Unread is bold plus a blue time — no badge, no dot. The selection is a lighter row and nothing else: no edge, no outline, no blue.</div>
+    </div>
+    <div>
+      <div class="term"><div class="screen solo"><div class="side" style="border-right:0">
+        <div class="filter">/ <b>gar</b><span class="cursor">▏</span></div>
+        <div class="chat sel"><span class="name"><span style="color:var(--t-me)">Gar</span>rett</span><span class="time">Mon</span><span class="prev">You: see you there</span></div>
+        <div class="chat"><span class="name">Caro &amp; <span style="color:var(--t-me)">Gar</span>rett</span><span class="time">Aug 19</span><span class="prev">Caro: 🎉</span></div>
+        <div class="chat"><span class="name">Mar<span style="color:var(--t-me)">gar</span>et</span><span class="time">Jul 30</span><span class="prev">Margaret: thank you!!</span></div>
+      </div></div></div>
+      <div class="cap">Filtering. The matched letters take the accent, and the group headings drop out while a filter is live.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="eyebrow">what changes in the code</div>
+  <h2>Mapping to slots and layout</h2>
+  <ul class="rules">
+    <li><b>Theme.</b> <code>accent_them</code> and <code>participants</code> stop being drawn; the block rail goes, so <code>gray_dim</code> is left to quote borders. <code>bg_light</code> no longer sits behind your messages — it stays for overlays.</li>
+    <li><b>ui::message::block.</b> The rail column and its <code>MARGIN_LEFT</code> become a plain 2‑column indent; the time moves from a trailing line into a right column of width 5 (<code>HH:MM</code>) on the first row, so wrapping happens against <code>width − 5 − gap</code>. Height comes from the same number as before.</li>
+    <li><b>Runs.</b> A block whose sender matches the one above within a few minutes drops its name line and indents by the name column. Same rule the chat list already uses for "You:" in previews.</li>
+    <li><b>Chrome.</b> The shortcuts bar and the status line merge into one row; the composer loses its border box for a top rule.</li>
+    <li><b>Keeps.</b> Tapback chips, attachment lines, the day band, selection highlight, the light theme (same rules on a light ground) and the terminal base from earlier today — the mixes already produce this gray ladder.</li>
+  </ul>
 </section>
 </main>

@@ -91,10 +91,11 @@ pub fn day_label(now: DateTime<Local>, when: DateTime<Local>) -> String {
     when.format("%B %-d, %Y").to_string()
 }
 
-/// The wall-clock time on a meta line, `18:02`.
+/// The wall-clock time beside a message, `6:02 PM`: a twelve-hour clock with
+/// no leading zero, the way Messages.app and Grok write it.
 #[must_use]
 pub fn clock(when: DateTime<Local>) -> String {
-    when.format("%H:%M").to_string()
+    when.format("%-I:%M %p").to_string()
 }
 
 /// A count with thousands separators, as the header writes it: `1,204`.
@@ -130,16 +131,6 @@ pub fn bytes(size: i64) -> String {
         }
     }
     format!("{:.1} GB", size / (KB * KB * KB))
-}
-
-/// The unread badge, capped so a runaway group cannot widen the column.
-#[must_use]
-pub fn unread_badge(count: i64) -> String {
-    match count {
-        n if n <= 0 => String::new(),
-        n if n > 99 => "99+".to_string(),
-        n => n.to_string(),
-    }
 }
 
 /// The preview line of a chat, split into the `You: ` / `Name: ` prefix and the
@@ -532,14 +523,6 @@ mod tests {
     }
 
     #[test]
-    fn the_unread_badge_is_capped() {
-        assert_eq!(unread_badge(0), "");
-        assert_eq!(unread_badge(-1), "");
-        assert_eq!(unread_badge(7), "7");
-        assert_eq!(unread_badge(120), "99+");
-    }
-
-    #[test]
     fn bodies_collapse_onto_one_line() {
         assert_eq!(single_line("two\nlines"), "two lines");
         assert_eq!(single_line("  padded \t out  "), "padded out");
@@ -566,8 +549,10 @@ mod tests {
 
     #[test]
     fn the_clock_is_twenty_four_hour() {
-        assert_eq!(clock(at(2025, 8, 27, 18, 2)), "18:02");
-        assert_eq!(clock(at(2025, 8, 27, 6, 5)), "06:05");
+        assert_eq!(clock(at(2025, 8, 27, 18, 2)), "6:02 PM");
+        assert_eq!(clock(at(2025, 8, 27, 6, 5)), "6:05 AM");
+        assert_eq!(clock(at(2025, 8, 27, 0, 5)), "12:05 AM");
+        assert_eq!(clock(at(2025, 8, 27, 12, 30)), "12:30 PM");
     }
 
     #[test]

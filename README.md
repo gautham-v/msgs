@@ -33,8 +33,9 @@ Reactions need [`imsg`](https://github.com/steipete/imsg) (`brew install steipet
 | `Tab` | switch focus: chat list → conversation → composer | everywhere |
 | `Enter` | open chat / send message | everywhere |
 | `Ctrl+K` | jump palette: chats, people, message search | everywhere |
+| `Ctrl+N` | new message to a number or address, via the palette | everywhere |
 | `Ctrl+B` | toggle the chat list | everywhere |
-| `Ctrl+T` | cycle the theme: dark / light / system | everywhere |
+| `Ctrl+T` | cycle the theme: dark / light / system / terminal | everywhere |
 | `Esc` | close the overlay / leave the composer | everywhere |
 | `?` | this help | everywhere |
 | `q` / `Ctrl+C` | quit | everywhere |
@@ -56,7 +57,6 @@ Reactions need [`imsg`](https://github.com/steipete/imsg) (`brew install steipet
 | `Ctrl+W` | delete the word before the cursor | any text field |
 | `Ctrl+U` | clear the whole field | any text field |
 | `Tab` | cycle the filter: all / chats / messages / photos | jump palette |
-| `Ctrl+N` | new message to a typed number or address | jump palette |
 | `←` `→` | choose a reaction | react picker |
 | `1`–`6` | send that reaction straight away | react picker |
 | `Enter` | send it, or take back one of yours | react picker |

@@ -1,4 +1,5 @@
-//! The bordered send box and the hint row beneath it.
+//! The send box: a rounded hairline box with the `❯` prompt and the draft, a
+//! column in from either edge of the pane.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -7,11 +8,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
 use crate::app::{App, Focus};
-use crate::keymap;
 
 /// Draw the composer, and place the terminal cursor in it when it has focus.
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
-    if area.width < 3 || area.height < 3 {
+    if area.width < 5 || area.height < 3 {
         return;
     }
     let theme = &app.theme;
@@ -19,41 +19,54 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let attaching = app.attach_prompt.as_ref();
     let field = attaching.unwrap_or(&app.composer);
 
+    // A column of air either side, the way the mockup insets the box. The
+    // border is gray, and a step brighter while the box has focus: that is
+    // the whole focus signal.
+    let boxed = Rect {
+        x: area.x + 1,
+        width: area.width - 2,
+        ..area
+    };
     let mut block = Block::new()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme.border_for(focused)))
         .style(Style::new().bg(theme.bg_base));
+    // The path prompt names itself on the border, so the box is never
+    // mistaken for the draft it is standing in front of.
     if attaching.is_some() {
         block = block.title_top(Line::from(Span::styled(
             " attach ",
-            Style::new()
-                .fg(theme.accent_me)
-                .add_modifier(Modifier::BOLD),
+            Style::new().fg(theme.text_secondary),
         )));
     }
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = block.inner(boxed);
+    frame.render_widget(block, boxed);
 
     let text = field.text();
     let (cursor_row, cursor_column) = cursor_cell(text, field.cursor());
     // Keep the cursor line visible once the draft is taller than the box.
     let scroll = cursor_row.saturating_sub(usize::from(inner.height).saturating_sub(1));
 
+    let prompt = Style::new().fg(if focused {
+        theme.text_secondary
+    } else {
+        theme.gray
+    });
     let mut lines: Vec<Line> = Vec::new();
     if text.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled(PROMPT, Style::new().fg(theme.accent_me)),
+            Span::styled(PROMPT, prompt),
             Span::styled(
                 placeholder(app, attaching.is_some(), inner.width),
-                Style::new().fg(theme.gray).add_modifier(Modifier::ITALIC),
+                Style::new().fg(theme.gray),
             ),
         ]));
     } else {
         for (index, raw) in text.split('\n').enumerate() {
-            let marker = if index == 0 { PROMPT } else { "  " };
+            let marker = if index == 0 { PROMPT } else { "   " };
             lines.push(Line::from(vec![
-                Span::styled(marker, Style::new().fg(theme.accent_me)),
+                Span::styled(marker, prompt),
                 Span::styled(raw.to_string(), Style::new().fg(theme.text_primary)),
             ]));
         }
@@ -77,23 +90,24 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// The `› ` marker in front of the first line of the draft.
-const PROMPT: &str = "› ";
-const PROMPT_WIDTH: u16 = 2;
+/// The `❯ ` marker in front of the first line of the draft, a cell in from
+/// the border.
+const PROMPT: &str = " ❯ ";
+const PROMPT_WIDTH: u16 = 3;
 
-/// The dim line shown in an empty box: `message Priya…`, or what the path
+/// The dim line shown in an empty box: `Message Priya`, or what the path
 /// prompt is waiting for.
 fn placeholder(app: &App, attaching: bool, width: u16) -> String {
     if attaching {
-        return "path to a file — ~ works…".to_string();
+        return "Path to a file — ~ works".to_string();
     }
     let Some(chat) = app.current_chat() else {
-        return "message…".to_string();
+        return "Message".to_string();
     };
     // The name is content, so it is truncated to the box rather than allowed
     // to push the layout around.
     let room = usize::from(width.saturating_sub(PROMPT_WIDTH + 10)).max(8);
-    format!("message {}…", super::format::truncate(&chat.title(), room))
+    format!("Message {}", super::format::truncate(&chat.title(), room))
 }
 
 /// Translate a byte offset into `(line, column)` in characters.
@@ -104,45 +118,21 @@ fn cursor_cell(text: &str, cursor: usize) -> (usize, usize) {
     (row, column)
 }
 
-/// The context hints from the mockup, one line under the composer.
-pub fn render_info_row(frame: &mut Frame, app: &App, area: Rect) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let hints: &[(&str, &str)] = match app.focus {
-        Focus::Composer if app.attach_prompt.is_some() => {
-            &[("Enter", "attach and send"), ("Esc", "cancel")]
-        }
-        Focus::Composer => &[
-            ("Enter", "send"),
-            ("Alt+Enter", "newline"),
-            ("Ctrl+A", "attach"),
-            ("Ctrl+R", "react to selected"),
-        ],
-        Focus::ChatList => &[
-            ("Enter", "open"),
-            ("/", "filter"),
-            ("Ctrl+B", "hide list"),
-            ("Ctrl+K", "jump"),
-        ],
-        _ => &[
-            ("o", "open"),
-            ("s", "save"),
-            ("y", "copy"),
-            ("Ctrl+R", "react"),
-        ],
-    };
-    frame.render_widget(Paragraph::new(hint_line(app, hints, area.width)), area);
-}
-
-/// `key label · key label` with the keys picked out, fitted to `columns`.
-pub(crate) fn hint_line<'a>(app: &App, hints: &[(&'a str, &'a str)], columns: u16) -> Line<'a> {
+/// `key label   key label` with the keys picked out, fitted to `columns`.
+/// `sep` goes between pairs and is always three cells wide, which is what
+/// the fitting counts on.
+pub(crate) fn hint_line<'a>(
+    app: &App,
+    hints: &[(&'a str, &'a str)],
+    sep: &'static str,
+    columns: u16,
+) -> Line<'a> {
     let theme = &app.theme;
     let fitted = super::format::fit_hints(hints, usize::from(columns));
     let mut spans = vec![Span::raw(" ")];
     for (index, (keys, label)) in fitted.into_iter().enumerate() {
         if index > 0 {
-            spans.push(Span::styled(" · ", Style::new().fg(theme.gray_dim)));
+            spans.push(Span::styled(sep, Style::new().fg(theme.gray_dim)));
         }
         spans.push(Span::styled(
             keys.into_owned(),
@@ -150,17 +140,12 @@ pub(crate) fn hint_line<'a>(app: &App, hints: &[(&'a str, &'a str)], columns: u1
                 .fg(theme.text_secondary)
                 .add_modifier(Modifier::BOLD),
         ));
-        if let Some(label) = label {
+        if let Some(label) = label.filter(|label| !label.is_empty()) {
             spans.push(Span::raw(" "));
             spans.push(Span::styled(label, Style::new().fg(theme.gray)));
         }
     }
     Line::from(spans)
-}
-
-/// The condensed shortcuts bar along the bottom of the screen.
-pub fn shortcut_bar_line(app: &App, columns: u16) -> Line<'static> {
-    hint_line(app, keymap::SHORTCUT_BAR, columns)
 }
 
 #[cfg(test)]

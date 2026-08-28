@@ -48,12 +48,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::new().fg(theme.border_active))
         .style(Style::new().bg(theme.bg_light).fg(theme.text_primary))
         .padding(Padding::horizontal(1))
-        .title_top(Span::styled(
-            " react ",
-            Style::new()
-                .fg(theme.accent_me)
-                .add_modifier(Modifier::BOLD),
-        ))
+        .title_top(Span::styled(" react ", Style::new().fg(theme.gray)))
         .title_bottom(Span::styled(footer(picker), Style::new().fg(theme.gray)));
     let inner = block.inner(modal);
     frame.render_widget(block, modal);

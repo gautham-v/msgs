@@ -19,8 +19,8 @@ use std::collections::HashMap;
 
 use crate::app::App;
 use crate::db::{Chat, Message};
-use crate::ui::format::{day_label, thousands, truncate};
-use crate::ui::message::{self, CHROME, Ctx, GAP, MARGIN_LEFT, RAIL, RAIL_GLYPH};
+use crate::ui::format::{day_label, truncate, width};
+use crate::ui::message::{self, CHROME, Ctx, MARGIN_LEFT};
 
 /// Cached row heights of the loaded page, plus the index replies are resolved
 /// through.
@@ -281,8 +281,8 @@ impl Hits {
     }
 }
 
-/// Chat name on the left, counts on the right, with a rule underneath when
-/// there is a row to spare for it.
+/// The chat's name and address, with a rule underneath when there is a row
+/// to spare for it.
 pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -290,40 +290,38 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
     let title = Rect { height: 1, ..area };
 
-    let left = match app.selected_chat() {
-        Some(chat) => Line::from(vec![
-            Span::styled(
-                format!(" {}", truncate(&chat.title(), title_room(area))),
-                Style::new()
-                    .fg(theme.text_primary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(subtitle(chat), Style::new().fg(theme.gray)),
-        ]),
-        None => Line::from(vec![
-            Span::styled(
-                " no conversation",
-                Style::new()
-                    .fg(theme.text_secondary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" · pick a chat on the left", Style::new().fg(theme.gray)),
-        ]),
+    // The chrome sits on the right of this row; the title stops short of
+    // it, the address giving way first and the name last.
+    let reserved = usize::from(super::status::reserved(app, title.width)) + 2;
+    let room = usize::from(title.width).saturating_sub(reserved + 1);
+    let (name, rest, name_color) = match app.selected_chat() {
+        // A `Ctrl+N` draft has no row yet: the header is the address it will
+        // go to, so the pane never claims to be the chat selected behind it.
+        _ if app.draft_target.is_some() => {
+            let address = app
+                .draft_target
+                .as_ref()
+                .and_then(|target| target.identifier.as_deref())
+                .map(crate::db::handle::display_name)
+                .unwrap_or_default();
+            (address, " · new message".to_string(), theme.text_primary)
+        }
+        Some(chat) => (chat.title(), subtitle(chat), theme.text_primary),
+        None => (
+            "no conversation".to_string(),
+            " · pick a chat on the left".to_string(),
+            theme.text_secondary,
+        ),
     };
-    frame.render_widget(Paragraph::new(left), title);
-
-    if let Some(chat) = app.selected_chat()
-        && area.width >= 40
-    {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                counts(chat, app.open_chat_photos),
-                Style::new().fg(theme.gray),
-            )))
-            .alignment(Alignment::Right),
-            title,
-        );
-    }
+    let name = truncate(&name, room.min(title_room(area)));
+    let rest = truncate(&rest, room.saturating_sub(width(&name)));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {name}"), Style::new().fg(name_color)),
+            Span::styled(rest, Style::new().fg(theme.gray)),
+        ])),
+        title,
+    );
 
     if area.height >= 2 {
         let rule = Rect {
@@ -341,9 +339,9 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Half the header, so a long chat name cannot push the service off the row.
+/// Most of the header, so a long chat name cannot push the service off the row.
 fn title_room(area: Rect) -> usize {
-    usize::from(area.width).saturating_sub(2) / 2
+    usize::from(area.width).saturating_sub(2) * 2 / 3
 }
 
 /// `· iMessage · +1 (650) 555-0198` for one person, `· iMessage · 6 people`
@@ -369,26 +367,6 @@ pub fn subtitle(chat: &Chat) -> String {
         return String::new();
     }
     format!(" · {}", parts.join(" · "))
-}
-
-/// `1,204 msgs · 38 photos`, with the photo half left off when there are none.
-#[must_use]
-pub fn counts(chat: &Chat, photos: i64) -> String {
-    let messages = chat.message_count;
-    let mut out = format!(
-        "{} msg{}",
-        thousands(messages),
-        if messages == 1 { "" } else { "s" }
-    );
-    if photos > 0 {
-        out.push_str(&format!(
-            " · {} photo{}",
-            thousands(photos),
-            if photos == 1 { "" } else { "s" }
-        ));
-    }
-    out.push(' ');
-    out
 }
 
 /// Draw the message blocks, and report where they landed.
@@ -433,100 +411,78 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
         contacts: &app.contacts,
     };
     let heights = &app.measured.heights;
-    let body = Rect {
-        x: area.x + MARGIN_LEFT + RAIL,
-        width: area.width - MARGIN_LEFT - RAIL - message::MARGIN_RIGHT,
-        y: area.y,
-        height: 1,
-    };
-    let text_x = body.x + GAP;
-    let text_width = body.width - GAP;
-    // The width the blocks were laid out at, which is what a picture is filed
-    // under in the cache.
-    let room = u16::try_from(message::body_width(area.width)).unwrap_or(u16::MAX);
-
+    // The rows: the words, the gap, and the clock, between the two margins.
+    let text_x = area.x + MARGIN_LEFT;
+    let text_width = message::row_width(area.width);
     let visible = app.convo.visible(heights, area.height);
     for entry in &visible {
         let block = message::block(&ctx, entry.index, area.width);
         let selected = app.messages.selected == entry.index;
-        let day_rows = u16::from(block.day.is_some());
+        let lead = block.lead();
+        // The label's row: after the blank row, if there is one. The row
+        // after the label is blank too.
+        let day_row = u16::from(block.gap);
 
         for offset in 0..entry.rows {
             let row = entry.skip + offset;
             let y = area.y + entry.y + offset;
             hits.rows[usize::from(entry.y + offset)] = Some(entry.index);
 
-            if row < day_rows {
-                // The band above the pane already names this day when the
-                // separator is the very first thing on screen; leave the row
-                // empty rather than say it twice.
-                let named_by_band = app.panes.day.is_some() && entry.y == 0 && entry.skip == 0;
+            if row < lead {
+                // The blank row is just that. The separator names the day —
+                // unless the band above the pane already does, when it is the
+                // very first thing on screen; then the row stays empty rather
+                // than say it twice.
+                if row != day_row || block.day.is_none() {
+                    continue;
+                }
+                let named_by_band = app.panes.day.is_some() && entry.y + offset == 0;
                 let label = if named_by_band {
                     String::new()
                 } else {
                     block.day.clone().unwrap_or_default()
                 };
                 frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled(label, Style::new().fg(theme.gray))))
-                        .alignment(Alignment::Center),
+                    Paragraph::new(Line::from(Span::styled(label, Style::new().fg(theme.gray)))),
                     Rect {
+                        x: text_x,
                         y,
+                        width: text_width,
                         height: 1,
-                        ..area
                     },
                 );
                 continue;
             }
 
-            let Some(line) = block.lines.get(usize::from(row - day_rows)) else {
+            let Some(line) = block.lines.get(usize::from(row - lead)) else {
                 continue;
             };
-            let strip = Rect { y, ..body };
+            let strip = Rect {
+                x: text_x,
+                y,
+                width: text_width,
+                height: 1,
+            };
 
-            // The band behind your own messages, and the outline the selected
-            // block gets, both live behind the words rather than around them.
+            // The selected block is the one thing drawn on a background, and
+            // it lives behind the words rather than around them.
             if selected {
                 frame.render_widget(
                     BlockWidget::new().style(Style::new().bg(theme.bg_highlight)),
                     strip,
                 );
-            } else if block.band {
-                frame.render_widget(
-                    BlockWidget::new().style(Style::new().bg(theme.bg_light)),
-                    strip,
-                );
             }
 
-            if let Some(rail) = block.rail {
-                frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled(RAIL_GLYPH, Style::new().fg(rail)))),
-                    Rect {
-                        x: area.x + MARGIN_LEFT,
-                        y,
-                        width: RAIL,
-                        height: 1,
-                    },
-                );
-            }
-
-            frame.render_widget(
-                Paragraph::new(line.clone()),
-                Rect {
-                    x: text_x,
-                    y,
-                    width: text_width,
-                    height: 1,
-                },
-            );
+            frame.render_widget(Paragraph::new(line.clone()), strip);
         }
 
-        // Pictures go on after the rows they sit over, so the band and the
-        // selection tint are underneath rather than over them. A block taller
-        // than the pane hands the picture a negative offset and the protocol
-        // clips the rows that scrolled past the top edge.
+        // Pictures go on after the rows they sit over, so the selection tint
+        // is underneath rather than over them. A block taller than the pane
+        // hands the picture a negative offset and the protocol clips the rows
+        // that scrolled past the top edge.
         for spot in &block.images {
-            let top = i32::from(entry.y) + i32::from(spot.row) + i32::from(day_rows)
-                - i32::from(entry.skip);
+            let top =
+                i32::from(entry.y) + i32::from(spot.row) + i32::from(lead) - i32::from(entry.skip);
             let Some(attachment) = app
                 .message_rows
                 .get(entry.index)
@@ -534,16 +490,22 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
             else {
                 continue;
             };
+            let x = text_x.saturating_add(spot.column);
             let strip = Rect {
-                x: text_x,
+                x,
                 y: area.y,
-                width: spot.columns.min(text_width),
+                width: spot.columns.min(text_width.saturating_sub(spot.column)),
                 height: area.height,
             };
+            if strip.width == 0 {
+                continue;
+            }
             let offset = i16::try_from(top.clamp(i32::from(i16::MIN), i32::from(i16::MAX)))
                 .unwrap_or_default();
+            // Asked at the width the block measured it at, which is the key
+            // the cache holds it under.
             app.images
-                .render(frame.buffer_mut(), strip, offset, attachment, room);
+                .render(frame.buffer_mut(), strip, offset, attachment, spot.room);
 
             // Where it actually landed, so a click can open it. The rect comes
             // from the very numbers the block reserved and `render` drew into,
@@ -567,7 +529,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
         }
 
         for link in &block.links {
-            let Some(offset) = (link.row + day_rows).checked_sub(entry.skip) else {
+            let Some(offset) = (link.row + lead).checked_sub(entry.skip) else {
                 continue;
             };
             if offset >= entry.rows {
@@ -652,7 +614,7 @@ fn thumb(total: u32, viewport: u16, above: u32) -> Option<(u16, u16)> {
 }
 
 /// The day of the topmost message on screen, held on a row of its own between
-/// the header and the messages — the mockup's `.day.sticky`.
+/// the header and the messages, set like the separators below it.
 ///
 /// The band always names the day, even when the topmost block's own separator
 /// is on screen: a blank band read as a rendering gap rather than a choice.
@@ -661,10 +623,6 @@ pub fn render_day_band(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let theme = &app.theme;
-    frame.render_widget(
-        BlockWidget::new().style(Style::new().bg(theme.bg_light)),
-        area,
-    );
     let Some(first) = app
         .convo
         .visible(&app.measured.heights, app.panes.conversation.height.max(1))
@@ -679,10 +637,7 @@ pub fn render_day_band(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw(" "),
-            Span::styled(
-                day_label(Local::now(), when),
-                Style::new().fg(theme.text_secondary),
-            ),
+            Span::styled(day_label(Local::now(), when), Style::new().fg(theme.gray)),
         ])),
         area,
     );
@@ -873,30 +828,5 @@ mod tests {
         let (start, length) = thumb(100_000, 20, 99_999).expect("a bar");
         assert_eq!(length, 1);
         assert_eq!(start, 19);
-    }
-
-    #[test]
-    fn counts_read_as_a_sentence_and_drop_what_is_not_there() {
-        let mut chat = crate::db::Chat {
-            rowid: 1,
-            guid: "g".to_string(),
-            identifier: None,
-            display_name: None,
-            service: None,
-            style: 45,
-            is_group: false,
-            participants: Vec::new(),
-            last_message_date: 0,
-            last_message_rowid: 0,
-            preview: None,
-            message_count: 1204,
-            unread_count: 0,
-            unread: 0,
-            is_pinned: None,
-        };
-        assert_eq!(counts(&chat, 38), "1,204 msgs · 38 photos ");
-        assert_eq!(counts(&chat, 0), "1,204 msgs ");
-        chat.message_count = 1;
-        assert_eq!(counts(&chat, 1), "1 msg · 1 photo ");
     }
 }

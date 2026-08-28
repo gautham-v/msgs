@@ -1227,6 +1227,7 @@ dependencies = [
  "dirs",
  "image",
  "imessage-database",
+ "libc",
  "notify",
  "nucleo-matcher",
  "ratatui",

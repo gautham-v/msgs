@@ -26,16 +26,11 @@ use ratatui::widgets::Block;
 use crate::app::{App, Focus};
 use crate::config::MIN_WIDTH_FOR_CHAT_LIST;
 
-/// Below this many rows the shortcuts bar is dropped to keep message rows.
-pub const MIN_HEIGHT_FOR_SHORTCUTS: u16 = 12;
-/// Below this many rows the composer hint row goes too.
-pub const MIN_HEIGHT_FOR_INFO_ROW: u16 = 10;
-/// Below this many rows the rule above the status line goes.
-pub const MIN_HEIGHT_FOR_RULE: u16 = 8;
-
 /// Where each part of the screen was drawn on the last frame.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Panes {
+    /// The whole terminal, which is how the app learns its size.
+    pub screen: Rect,
     /// The whole chat list pane, `None` when it is hidden or the terminal is
     /// too narrow for it.
     pub chat_list: Option<Rect>,
@@ -49,49 +44,76 @@ pub struct Panes {
     pub day: Option<Rect>,
     /// The scrolling message area.
     pub conversation: Rect,
-    /// The bordered send box.
+    /// The send box.
     pub composer: Rect,
-    /// The hint row under the composer.
-    pub info_row: Option<Rect>,
-    /// The horizontal rule between the panes and the status line.
-    pub rule: Option<Rect>,
-    /// The status line.
+    /// The row the chrome shares with the header — or the filter line, on
+    /// the list screen: `? help` and the unread count or a toast, right-aligned
+    /// on it. Nothing of its own, so no row is spent on it.
     pub status: Rect,
-    /// The shortcuts bar under the status line.
-    pub shortcuts: Option<Rect>,
 }
 
 /// Split `area` into panes according to the app's current state.
 ///
-/// Rules, in the order they give way as the terminal shrinks: the shortcuts
-/// bar, the composer hint row, the rule above the status line, then the
-/// composer's extra lines. The chat list is hidden below
-/// [`MIN_WIDTH_FOR_CHAT_LIST`] columns regardless of the toggle.
+/// The only rule as the terminal shrinks is that the composer gives up its
+/// extra lines before the conversation gives up its last row. Below
+/// [`MIN_WIDTH_FOR_CHAT_LIST`] columns the chat list is not docked beside the
+/// conversation: it is a screen of its own, drawn instead of the conversation
+/// while it has focus, and nothing while it does not.
 #[must_use]
 pub fn compute(area: Rect, app: &App) -> Panes {
-    let mut rest = area;
+    if list_screen(area, app) {
+        let (list, rows) = list_rows(area, false);
+        return Panes {
+            screen: area,
+            chat_list: Some(list),
+            chat_list_rows: Some(rows),
+            header: empty_at(area),
+            day: None,
+            conversation: empty_at(area),
+            composer: empty_at(area),
+            status: Rect {
+                height: 1.min(area.height),
+                ..list
+            },
+        };
+    }
 
-    let shortcuts = take_bottom(&mut rest, 1, area.height >= MIN_HEIGHT_FOR_SHORTCUTS);
-    let status = take_bottom(&mut rest, 1, true).unwrap_or(empty_at(area));
-    // A one-row rule separating the panes from the status line.
-    let rule = take_bottom(&mut rest, 1, area.height >= MIN_HEIGHT_FOR_RULE);
-
-    let (chat_list, chat_list_rows, convo) = split_chat_list(rest, app);
-    let (header, day, conversation, composer, info_row) =
-        split_conversation(convo, app, area.height >= MIN_HEIGHT_FOR_INFO_ROW);
+    let (chat_list, chat_list_rows, convo) = split_chat_list(area, app);
+    let (header, day, conversation, composer) = split_conversation(convo, app);
+    let status = Rect {
+        height: 1.min(header.height),
+        ..header
+    };
 
     Panes {
+        screen: area,
         chat_list,
         chat_list_rows,
         header,
         day,
         conversation,
         composer,
-        info_row,
-        rule,
         status,
-        shortcuts,
     }
+}
+
+/// Whether the chat list takes the whole terminal: too narrow to dock it,
+/// and the list is what has focus.
+#[must_use]
+pub fn list_screen(area: Rect, app: &App) -> bool {
+    area.width < MIN_WIDTH_FOR_CHAT_LIST && app.focus == Focus::ChatList && app.db_error.is_none()
+}
+
+/// The list pane and its selectable rows: under the filter line and the
+/// blank row beneath it, and left of the divider when there is one.
+fn list_rows(list: Rect, divider: bool) -> (Rect, Rect) {
+    let rows = Rect::new(
+        list.x,
+        list.y.saturating_add(chat_list::HEAD_ROWS),
+        list.width.saturating_sub(u16::from(divider)),
+        list.height.saturating_sub(chat_list::HEAD_ROWS),
+    );
+    (list, rows)
 }
 
 fn split_chat_list(area: Rect, app: &App) -> (Option<Rect>, Option<Rect>, Rect) {
@@ -104,27 +126,16 @@ fn split_chat_list(area: Rect, app: &App) -> (Option<Rect>, Option<Rect>, Rect) 
     let width = app.config.chat_list_width.min(area.width / 2).max(1);
     let list = Rect::new(area.x, area.y, width, area.height);
     let convo = Rect::new(area.x + width, area.y, area.width - width, area.height);
-    // Row 0 is the filter line; the last column is the divider.
-    let rows = Rect::new(
-        list.x,
-        list.y.saturating_add(1),
-        list.width.saturating_sub(1),
-        list.height.saturating_sub(1),
-    );
+    let (list, rows) = list_rows(list, true);
     (Some(list), Some(rows), convo)
 }
 
-fn split_conversation(
-    area: Rect,
-    app: &App,
-    show_info_row: bool,
-) -> (Rect, Option<Rect>, Rect, Rect, Option<Rect>) {
+fn split_conversation(area: Rect, app: &App) -> (Rect, Option<Rect>, Rect, Rect) {
     let mut rest = area;
     // Header text plus the rule under it.
     let header_height = if area.height >= 6 { 2 } else { 1 };
     let header = take_top(&mut rest, header_height, true).unwrap_or(empty_at(area));
 
-    let info_row = take_bottom(&mut rest, 1, show_info_row);
     // The composer grows with the draft but always leaves one message row.
     let wanted = app.composer_height();
     let composer_height = wanted.min(rest.height.saturating_sub(1)).max(1);
@@ -136,7 +147,7 @@ fn split_conversation(
     let room_for_a_band = !app.message_rows.is_empty() && rest.height >= 3;
     let day = take_top(&mut rest, 1, room_for_a_band);
 
-    (header, day, rest, composer, info_row)
+    (header, day, rest, composer)
 }
 
 fn take_top(rest: &mut Rect, rows: u16, when: bool) -> Option<Rect> {
@@ -180,7 +191,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // went wrong instead, and leave the layout empty so stray clicks hit
     // nothing.
     if app.db_error.is_some() {
-        app.panes = Panes::default();
+        app.panes = Panes {
+            screen: area,
+            ..Panes::default()
+        };
         let app: &App = app;
         if let Some(err) = app.db_error.as_ref() {
             db_error::render(frame, app, area, err);
@@ -201,7 +215,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.prepare_conversation(panes.conversation);
 
     if let (Some(list), Some(rows)) = (panes.chat_list, panes.chat_list_rows) {
-        chat_list::render(frame, app, list, rows);
+        chat_list::render(frame, app, list, rows, panes.conversation.width > 0);
     }
     conversation::render_header(frame, app, panes.header);
     if let Some(day) = panes.day {
@@ -210,16 +224,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let hits = conversation::render(frame, app, panes.conversation);
     app.hits = hits;
     composer::render(frame, app, panes.composer);
-    if let Some(info_row) = panes.info_row {
-        composer::render_info_row(frame, app, info_row);
-    }
-    if let Some(rule) = panes.rule {
-        status::render_rule(frame, app, rule);
-    }
+    // Last on its row, so it sits over the tail of a long title or filter.
     status::render(frame, app, panes.status);
-    if let Some(shortcuts) = panes.shortcuts {
-        status::render_shortcuts(frame, app, shortcuts);
-    }
 
     match app.focus {
         Focus::Palette => palette::render(frame, app, area),
@@ -269,16 +275,10 @@ mod tests {
     }
 
     fn all_rects(panes: &Panes) -> Vec<Rect> {
-        let mut rects = vec![
-            panes.header,
-            panes.conversation,
-            panes.composer,
-            panes.status,
-        ];
+        // `status` shares the header's row on purpose, so it is not here.
+        let mut rects = vec![panes.header, panes.conversation, panes.composer];
         rects.extend(panes.chat_list);
         rects.extend(panes.day);
-        rects.extend(panes.info_row);
-        rects.extend(panes.shortcuts);
         rects.retain(|rect| rect.width > 0 && rect.height > 0);
         rects
     }
@@ -287,16 +287,24 @@ mod tests {
     fn wide_terminal_shows_every_pane() {
         let panes = compute(Rect::new(0, 0, 120, 40), &app());
         assert!(panes.chat_list.is_some());
-        assert!(panes.info_row.is_some());
-        assert!(panes.shortcuts.is_some());
         assert!(panes.conversation.height > 20);
     }
 
     #[test]
-    fn narrow_terminal_hides_the_chat_list() {
+    fn narrow_terminal_makes_the_chat_list_a_screen_of_its_own() {
         let mut app = app();
         assert!(app.show_chat_list);
-        let panes = compute(Rect::new(0, 0, MIN_WIDTH_FOR_CHAT_LIST - 1, 40), &app);
+        // The list has focus at startup, so a narrow terminal opens on it.
+        let narrow = Rect::new(0, 0, MIN_WIDTH_FOR_CHAT_LIST - 1, 40);
+        let panes = compute(narrow, &app);
+        let list = panes.chat_list.expect("the list screen");
+        assert_eq!(list.width, narrow.width);
+        assert_eq!(panes.conversation.width, 0);
+        assert_eq!(panes.composer.width, 0);
+
+        // Focus on the conversation, and the list is gone entirely.
+        app.focus = Focus::Conversation;
+        let panes = compute(narrow, &app);
         assert!(panes.chat_list.is_none());
         assert_eq!(panes.conversation.width, MIN_WIDTH_FOR_CHAT_LIST - 1);
 
@@ -309,17 +317,24 @@ mod tests {
     }
 
     #[test]
-    fn a_toggle_on_a_narrow_terminal_leaves_the_layout_alone() {
+    fn a_toggle_on_a_narrow_terminal_swaps_the_list_screen_in_and_out() {
         use crate::app::Action;
 
         let narrow = Rect::new(0, 0, MIN_WIDTH_FOR_CHAT_LIST - 1, 40);
         let mut app = app();
+        app.focus = Focus::Conversation;
         app.panes = compute(narrow, &app);
         assert!(app.panes.chat_list.is_none());
 
         app.update(Action::ToggleChatList);
         let panes = compute(narrow, &app);
-        assert!(panes.chat_list.is_none());
+        assert!(panes.chat_list.is_some(), "Ctrl+B brings the list screen");
+        assert_eq!(panes.conversation.width, 0);
+
+        app.panes = panes;
+        app.update(Action::ToggleChatList);
+        let panes = compute(narrow, &app);
+        assert!(panes.chat_list.is_none(), "and takes it away again");
         assert_eq!(panes.conversation.width, MIN_WIDTH_FOR_CHAT_LIST - 1);
     }
 
@@ -337,14 +352,12 @@ mod tests {
     fn short_terminal_drops_chrome_before_message_rows() {
         let app = app();
         let tall = compute(Rect::new(0, 0, 120, 40), &app);
-        assert!(tall.shortcuts.is_some() && tall.info_row.is_some());
+        assert_eq!(tall.status.y, tall.header.y, "on the header's row");
+        assert_eq!(tall.status.height, 1);
+        assert_eq!(tall.screen.width, 120);
 
-        let medium = compute(Rect::new(0, 0, 120, MIN_HEIGHT_FOR_SHORTCUTS - 1), &app);
-        assert!(medium.shortcuts.is_none());
-        assert!(medium.info_row.is_some());
-
-        let short = compute(Rect::new(0, 0, 120, MIN_HEIGHT_FOR_INFO_ROW - 1), &app);
-        assert!(short.info_row.is_none());
+        let short = compute(Rect::new(0, 0, 120, 7), &app);
+        assert!(short.status.height == 1);
         assert!(short.conversation.height >= 1);
     }
 

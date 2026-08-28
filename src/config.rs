@@ -153,7 +153,7 @@ mod tests {
             [theme]
             base = "light"
             accent_me = "#ff8800"
-            participant1 = "#00ffcc"
+            gray = "#00ffcc"
             "##,
         );
         assert!(warnings.is_empty());

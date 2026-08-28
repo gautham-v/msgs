@@ -41,13 +41,18 @@ pub const BINDINGS: &[Binding] = &[
         scope: "global",
     },
     Binding {
+        keys: "Ctrl+N",
+        description: "new message to a number or address, via the palette",
+        scope: "global",
+    },
+    Binding {
         keys: "Ctrl+B",
         description: "toggle the chat list",
         scope: "global",
     },
     Binding {
         keys: "Ctrl+T",
-        description: "cycle the theme: dark / light / system",
+        description: "cycle the theme: dark / light / system / terminal",
         scope: "global",
     },
     Binding {
@@ -156,11 +161,6 @@ pub const BINDINGS: &[Binding] = &[
         scope: "palette",
     },
     Binding {
-        keys: "Ctrl+N",
-        description: "new message to a typed number or address",
-        scope: "palette",
-    },
-    Binding {
         keys: "← →",
         description: "choose a reaction",
         scope: "react picker",
@@ -216,6 +216,7 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
                 return Some(Action::ToggleChatList);
             }
             KeyCode::Char('a') if focus != Focus::DbError => return Some(Action::Attach),
+            KeyCode::Char('n') if focus != Focus::DbError => return Some(Action::NewChat),
             KeyCode::Char('r') if focus != Focus::DbError => return Some(Action::React),
             KeyCode::Char('l') if focus != Focus::DbError => return Some(Action::OpenLink),
             _ => {}
@@ -249,12 +250,10 @@ fn reaction_keys(key: KeyEvent) -> Option<Action> {
     }
 }
 
-/// The palette is a text field with two keys of its own: `Tab` cycles the
-/// filter instead of moving focus, and `Ctrl+N` addresses a new message.
+/// The palette is a text field with a key of its own: `Tab` cycles the
+/// filter instead of moving focus. (`Ctrl+N` is global, and inside the
+/// palette it addresses a new message to what has been typed.)
 fn palette_keys(key: KeyEvent, ctrl: bool, alt: bool, shift: bool) -> Option<Action> {
-    if ctrl && key.code == KeyCode::Char('n') {
-        return Some(Action::NewChat);
-    }
     match key.code {
         KeyCode::Tab | KeyCode::BackTab => Some(Action::PaletteFilter),
         KeyCode::PageUp => Some(Action::PageUp),

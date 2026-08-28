@@ -110,7 +110,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 /// `› thai`, or the placeholder when nothing has been typed.
 fn input_line(theme: &Theme, query: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled("› ", Style::new().fg(theme.accent_me)),
+        Span::styled("❯ ", Style::new().fg(theme.text_secondary)),
         if query.is_empty() {
             Span::styled(
                 "jump to a chat, or search messages…",
@@ -177,7 +177,7 @@ pub fn row_line(theme: &Theme, row: &Row, selected: bool, columns: u16) -> Line<
     let room = usize::from(columns).saturating_sub(width_of(&row.meta) + 1);
     let mut spans = vec![Span::styled(
         if selected { "▸ " } else { "  " },
-        Style::new().fg(theme.accent_me),
+        Style::new().fg(theme.text_secondary),
     )];
 
     let name = Style::new()

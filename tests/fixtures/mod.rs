@@ -788,6 +788,7 @@ CREATE TABLE message (
     cache_has_attachments INTEGER DEFAULT 0,
     item_type INTEGER DEFAULT 0,
     other_handle INTEGER DEFAULT 0,
+    error INTEGER DEFAULT 0,
     group_title TEXT,
     group_action_type INTEGER DEFAULT 0,
     associated_message_guid TEXT,
