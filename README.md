@@ -51,21 +51,24 @@ honest list of what msgs cannot do.
 ## Install
 
 ```
+brew install gautham-v/tap/msgs
+```
+
+That installs the universal (arm64 + x86_64) binary from the latest
+[release](https://github.com/gautham-v/msgs/releases). To build from source
+instead, with a Rust toolchain:
+
+```
 cargo install --path .        # from a clone, into ~/.cargo/bin
 brew install --HEAD --build-from-source packaging/msgs.rb
 ```
 
-Both build the release profile: whole-program optimization, one codegen unit,
-stripped — a 4 MB binary that starts in under a tenth of a second on a
-200,000-message database.
-
-`packaging/msgs.rb` is a Homebrew formula stub rather than a live tap: no tap
-exists yet, and the URL and checksum in it are placeholders until a `v*` tag is
-pushed, at which point `.github/workflows/release.yml` builds a universal
-(arm64 + x86_64) binary, attaches `msgs-<version>-macos-universal.tar.gz` and
-its `.sha256` to the release, and prints the checksum to paste into the
-formula. The formula carries no `license` field because the repository has no
-LICENSE file yet.
+Every path builds the release profile: whole-program optimization, one codegen
+unit, stripped — a 4 MB binary that starts in under a tenth of a second on a
+200,000-message database. `.github/workflows/release.yml` builds the binary on
+each `v*` tag and attaches it with its `.sha256` to the release;
+`packaging/msgs.rb` mirrors the formula in
+[gautham-v/homebrew-tap](https://github.com/gautham-v/homebrew-tap).
 
 ## Requirements
 
@@ -633,3 +636,5 @@ the repository holds a real name, number, or message.
 `.github/workflows/ci.yml` runs all four on macOS for every push and pull
 request; `.github/workflows/release.yml` builds the universal binary on a `v*`
 tag. `packaging/msgs.rb` is the Homebrew formula that installs it.
+
+MIT licensed; see [LICENSE](LICENSE).

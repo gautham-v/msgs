@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A terminal client for iMessage on macOS"
 repository = "https://github.com/gautham-v/msgs"
+license = "MIT"
 readme = "README.md"
 keywords = ["imessage", "macos", "tui", "ratatui", "terminal"]
 categories = ["command-line-utilities"]
