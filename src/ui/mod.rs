@@ -223,6 +223,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     let hits = conversation::render(frame, app, panes.conversation);
     app.hits = hits;
+    // A released drag is copied here rather than in `on_mouse`: the words it
+    // covered are cells of the frame that just drew them, so they are read
+    // back off this buffer instead of a copy of it kept on the app. The toast
+    // still lands on this frame, because the status line is drawn below.
+    if app.copy_selection_pending
+        && let Some(selection) = app.selection
+    {
+        let text = conversation::selection_text(frame.buffer_mut(), panes.conversation, &selection);
+        app.copy_dragged(&text);
+    }
     composer::render(frame, app, panes.composer);
     // Last on its row, so it sits over the tail of a long title or filter.
     status::render(frame, app, panes.status);

@@ -62,7 +62,7 @@ Reactions need [`imsg`](https://github.com/steipete/imsg) (`brew install steipet
 | `Enter` | send it, or take back one of yours | react picker |
 | `r` / `Enter` | try to open chat.db again | first run |
 
-The mouse works too: click to select, click a link or picture to open it, wheel to scroll.
+The mouse works too: click to select, drag across the conversation to copy what you drag over, click a link or picture to open it, wheel to scroll. `--no-mouse` hands the mouse back to the terminal.
 
 ## Limits
 

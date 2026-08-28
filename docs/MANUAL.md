@@ -91,7 +91,7 @@ Flags:
 |---|---|
 | `--db <PATH>` | read this database instead of `~/Library/Messages/chat.db` |
 | `--config <PATH>` | read this config file instead of the default |
-| `--no-mouse` | do not capture the mouse |
+| `--no-mouse` | do not capture the mouse; the terminal's own selection works instead |
 | `--theme <NAME>` | `dark`, `light`, `system`, or `terminal`; overrides `base` in the config's `[theme]` |
 | `--redact` | mask phone numbers and addresses on screen (`+1 (•••) •••-••39`), for a demo or a screenshot; names and message bodies still show |
 | `--check` | print a readiness report (Full Disk Access, database, row counts, unread, read state, live updates, Messages.app and whether it is running, `osascript`, `imsg`, search index, contacts, terminal graphics) and exit |
@@ -186,6 +186,21 @@ message block to select it, click a link to open it, click the `↓ N new` pill
 to go to what it is counting, and roll the wheel over a pane to scroll it
 without moving focus. The jump palette and the help modal are keyboard-only —
 they swallow clicks so a stray one cannot act on the screen behind them.
+
+Dragging across the conversation selects text, the way a terminal's own
+selection does: everything between the two ends in reading order, tinted as the
+pointer moves, and put on the clipboard the moment the button comes up. What is
+copied is what was on screen — the visible rows, joined with newlines, each
+trimmed of its trailing blanks, with neither the scrollbar's column nor the day
+band in it. The next click, `Esc`, or any scroll takes the selection away.
+Nothing else reads it: like `y`, the text goes to the pasteboard and nowhere
+else, and `y` still copies the whole selected message whichever way it was
+picked.
+
+msgs captures the mouse to do all of this, which is what stops the terminal
+from drawing its own selection over the app. `--no-mouse` (or `mouse = false`
+in the config) hands the mouse back: no clicking, no wheel, no drag-select in
+msgs, and the terminal's own selection and copy work everywhere again.
 
 ## When it cannot start
 
