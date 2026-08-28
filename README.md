@@ -9,8 +9,8 @@ Design mockups: [`docs/mockups.html`](docs/mockups.html).
 ```
  / search chats…             │ Alex Nakamura · iMessage · +1 (555) 000-0001    4 msgs · 1 photo
  ● Fixture Group 5/18/22  1  │──────────────────────────────────────────────────────────────────
-   Bailey: named the conver… │
-▌● Alex Nakamura 5/18/22  1  │                           May 18, 2022
+   Bailey: named the conver… │ May 18, 2022
+▌● Alex Nakamura 5/18/22  1  │
 ▌  still unread              │ ▌  first fixture message
    iMessage;-;+15550000009   │ ▌  00:29  😂  Alex   ❤️  You
                              │ ▌  recovered from the typedstream
@@ -32,7 +32,7 @@ Design mockups: [`docs/mockups.html`](docs/mockups.html).
                              │ o open · s save · y copy · Ctrl+R react
 ────────────────────────────────────────────────────────────────────────────────────────────────
  Messages.app unknown  │  2 unread in 2 chats  │  watching chat.db
- Tab focus list/convo · ↑↓ select · Enter open/send · Ctrl+K jump / search · o open attachment ·
+ Tab focus list/convo · ↑↓ select · Enter open/send · Ctrl+K jump / search · ? help
 ```
 
 That frame is drawn by the real widgets, at 96×26, against the synthetic
