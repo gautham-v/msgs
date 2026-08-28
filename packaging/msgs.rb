@@ -1,11 +1,10 @@
 # A Homebrew formula stub for msgs.
 #
-# The live copy lives in the tap, github.com/gautham-v/homebrew-tap, as
+# The template for the tap. On each `v*` tag `.github/workflows/release.yml`
+# builds the universal binary, fills `version`, `url`, and `sha256` in below,
+# and pushes the result to github.com/gautham-v/homebrew-tap as
 # `Formula/msgs.rb`; users install with `brew install gautham-v/tap/msgs`.
-# This one is kept in step with it. On each `v*` tag
-# `.github/workflows/release.yml` attaches `msgs-<version>-macos-universal.tar.gz`
-# and its .sha256 to the release; copy the version and checksum into both
-# files.
+# The values here are the last release's and need no hand edits.
 #
 # Installing from source works too:
 #   brew install --HEAD --build-from-source packaging/msgs.rb

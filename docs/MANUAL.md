@@ -638,6 +638,8 @@ the repository holds a real name, number, or message.
 
 `.github/workflows/ci.yml` runs all four on macOS for every push and pull
 request; `.github/workflows/release.yml` builds the universal binary on a `v*`
-tag. `packaging/msgs.rb` is the Homebrew formula that installs it.
+tag, then writes `packaging/msgs.rb` with that version and checksum into
+[gautham-v/homebrew-tap](https://github.com/gautham-v/homebrew-tap) (needs the
+`TAP_TOKEN` secret, a fine-grained PAT with contents: write on the tap).
 
 MIT licensed; see [LICENSE](../LICENSE).

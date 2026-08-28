@@ -16,6 +16,9 @@ jobs:
   universal:
     name: Universal macOS binary
     runs-on: macos-14
+    outputs:
+      name: ${{ steps.package.outputs.name }}
+      version: ${{ steps.package.outputs.version }}
     permissions:
       contents: write
     steps:
@@ -91,4 +94,52 @@ jobs:
             --generate-notes \
             "dist/${{ steps.package.outputs.name }}.tar.gz" \
             "dist/${{ steps.package.outputs.name }}.tar.gz.sha256"
-          echo "Paste the checksum above into packaging/msgs.rb before tapping it."
+
+  # The tap: packaging/msgs.rb with this release's version and checksum, pushed
+  # to gautham-v/homebrew-tap as Formula/msgs.rb. Needs TAP_TOKEN, a
+  # fine-grained PAT with contents: write on the tap repository only.
+  tap:
+    name: Update the Homebrew tap
+    needs: universal
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the checksum
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.universal.outputs.name }}
+          path: dist
+
+      - name: Write the formula
+        id: formula
+        run: |
+          set -euo pipefail
+          version="${{ needs.universal.outputs.version }}"
+          sha="$(cut -d' ' -f1 dist/*.sha256)"
+          sed -e "s/^  version \"[^\"]*\"/  version \"${version}\"/" \
+              -e "s#/releases/download/v[^/]*/msgs-[^/]*-macos-universal.tar.gz#/releases/download/v${version}/msgs-${version}-macos-universal.tar.gz#" \
+              -e "s/^  sha256 \"[0-9a-f]*\"/  sha256 \"${sha}\"/" \
+              packaging/msgs.rb > msgs.rb
+          grep -E '^  (version|url|sha256) ' msgs.rb
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Push it to the tap
+        env:
+          GH_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::TAP_TOKEN is not set; add a fine-grained PAT with contents: write on gautham-v/homebrew-tap"
+            exit 1
+          fi
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/gautham-v/homebrew-tap.git" tap
+          cp msgs.rb tap/Formula/msgs.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/msgs.rb
+          git diff --cached --quiet && { echo "tap already at ${{ steps.formula.outputs.version }}"; exit 0; }
+          git commit -m "msgs ${{ steps.formula.outputs.version }}"
+          git push
