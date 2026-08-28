@@ -2393,7 +2393,10 @@ impl App {
             return;
         };
         match crate::shell::open_path(&path) {
-            Ok(()) => self.status.toast("opening the attachment"),
+            Ok(()) => self.status.toast(match crate::shell::opener(&path) {
+                crate::shell::Opener::QuickLook => "playing the attachment in Quick Look",
+                crate::shell::Opener::Finder => "opening the attachment",
+            }),
             Err(err) => self
                 .status
                 .error(format!("could not open the attachment: {err}")),
@@ -2792,6 +2795,29 @@ impl App {
         }
         self.update(Action::Scroll(delta));
         self.focus = previous;
+    }
+
+    /// How long the event loop may wait before a picture on screen is due for
+    /// its next frame.
+    ///
+    /// `None` when nothing on screen is moving, which is the ordinary case and
+    /// leaves the loop waiting the way it always did.
+    #[must_use]
+    pub fn next_animation_due(&self) -> Option<Duration> {
+        self.images.next_due(Instant::now())
+    }
+
+    /// Take in finished animations and step the ones on screen to the frame
+    /// `now` calls for. Returns `true` if a redraw is needed.
+    ///
+    /// Called by the event loop beside [`App::tick`], and separate from it
+    /// because it is the one piece of housekeeping that wants the very instant
+    /// the loop woke up rather than an approximate one. The frames are already
+    /// encoded, so this is a comparison and an index.
+    pub fn tick_animations(&mut self, now: Instant) -> bool {
+        let mut dirty = self.images.absorb();
+        dirty |= self.images.advance(now);
+        dirty
     }
 
     /// Housekeeping between frames. Returns `true` if a redraw is needed.
@@ -3382,6 +3408,17 @@ mod tests {
         );
         assert_eq!(app.status.warnings.len(), 1);
         assert!(app.status.active_toast().is_some());
+    }
+
+    #[test]
+    fn nothing_moving_leaves_the_event_loop_waiting_the_way_it_always_did() {
+        let mut app = app();
+        // Pictures are off in the tests, so nothing can be playing: the loop
+        // is told to wait however long it was going to wait, and a tick moves
+        // no frame.
+        assert_eq!(app.next_animation_due(), None);
+        assert!(!app.tick_animations(Instant::now()));
+        assert!(!app.tick_animations(Instant::now() + Duration::from_secs(1)));
     }
 
     /// A one-to-one chat with an invented address, and an outbox that records

@@ -177,6 +177,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let panes = compute(area, app);
     app.panes = panes;
+    // What was on screen last time is not what is on screen now; the pictures
+    // fill the list back in as they are drawn, and only those are animated.
+    app.images.begin_frame();
 
     frame.render_widget(
         Block::new().style(
