@@ -3,36 +3,7 @@
 iMessage in your terminal. Reads `~/Library/Messages/chat.db`, sends through Messages.app.
 Rust + [ratatui](https://ratatui.rs), macOS 14+.
 
-<!-- demo video: drag the .mov onto this file in GitHub's editor and paste the link it makes here -->
-
-```
- / search chats…             │ Alex Nakamura · iMessage · +1 (555) 000-0001    4 msgs · 1 photo
- ● Fixture Group 5/18/22  1  │──────────────────────────────────────────────────────────────────
-   Bailey: named the conver… │ May 18, 2022
-▌● Alex Nakamura 5/18/22  1  │
-▌  still unread              │ ▌  first fixture message
-   iMessage;-;+15550000009   │ ▌  00:29  😂  Alex   ❤️  You
-                             │ ▌  recovered from the typedstream
-                             │ ▌  00:30
-                             │ ▌  ┄ 📷  photo.png · 2.0 KB · (not downloaded on this Mac) ┄
-                             │ ▌  00:31 · Read 00:33
-                             │ ▌  still unread
-                             │ ▌  00:34
-                             │
-                             │
-                             │
-                             │
-                             │
-                             │
-                             │
-                             │╭────────────────────────────────────────────────────────────────╮
-                             ││› message Alex Nakamura…                                        │
-                             │╰────────────────────────────────────────────────────────────────╯
-                             │ o open · s save · y copy · Ctrl+R react
-────────────────────────────────────────────────────────────────────────────────────────────────
- Messages.app unknown  │  2 unread in 2 chats  │  watching chat.db
- Tab focus list/convo · ↑↓ select · Enter open/send · Ctrl+K jump / search · ? help
-```
+https://github.com/user-attachments/assets/3ca1d87a-6de4-4186-a88a-520aac5984d7
 
 ## Install
 
