@@ -66,7 +66,7 @@ The mouse works too: click to select, click a link or picture to open it, wheel 
 
 ## Limits
 
-No typing indicators, no editing or unsending, no pinned chats, no clearing Messages.app's own badge — macOS keeps all of those out of reach. Reactions to arbitrary messages need `imsg` with SIP off. The full list, config keys, and how everything works are in [docs/MANUAL.md](docs/MANUAL.md).
+No typing indicators, no editing or unsending, no pinned chats, no clearing Messages.app's own badge — macOS keeps all of those out of reach. Reactions to arbitrary messages need `imsg` with SIP off; with SIP on, `imsg` reaches only a conversation's newest incoming message, and needs Messages.app open and Accessibility granted to your terminal. The full list, config keys, and how everything works are in [docs/MANUAL.md](docs/MANUAL.md).
 
 ## Development
 

@@ -18,14 +18,21 @@
 //! conversation. Neither is required: without `imsg` on `$PATH` the picker
 //! explains how to install it and nothing is sent.
 //!
+//! SIP is on by default, so on a stock Mac the first route always refuses and
+//! the second one is the only way a reaction leaves the machine. That is what
+//! [`bridge_available`] asks — once, from `csrutil` — so the picker can say
+//! which messages can actually be reached before anything is sent, and what
+//! [`classify`] turns `imsg`'s refusals into: one calm sentence naming the one
+//! thing the reader could do about it.
+//!
 //! Nothing here logs. Errors coming back from `osascript` or `imsg` are run
 //! through [`sanitize`], which drops the quoted spans — the ones that would
 //! otherwise carry a phone number or a body onto the status line.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::{Mutex, OnceLock};
 
 use crate::db::{Chat, Tapback, TapbackAction, TapbackKind};
 
@@ -43,6 +50,9 @@ const PGREP: &str = "/usr/bin/pgrep";
 
 /// What Messages.app calls itself in the process table.
 const MESSAGES_PROCESS: &str = "Messages";
+
+/// The tool that answers whether System Integrity Protection is on.
+const CSRUTIL: &str = "/usr/bin/csrutil";
 
 /// Which of Messages' services a chat is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -133,6 +143,20 @@ pub enum SendError {
     NoFile,
     /// `imsg`, which tapbacks go out through, is not on `$PATH`.
     NoHelper,
+    /// `imsg`'s IMCore bridge will not load, because System Integrity
+    /// Protection is on. Every message but one is out of reach without it.
+    NoBridge,
+    /// The bridge is out and this is not the message `imsg react` can reach.
+    OutOfReach,
+    /// Taking a reaction back is something only the bridge can do.
+    NoTakeBack,
+    /// `imsg react` drives Messages' own window through System Events, and was
+    /// not allowed to.
+    NoAccessibility,
+    /// `imsg react` types into Messages' window, so there has to be one.
+    NoMessagesApp,
+    /// `imsg` could not open `chat.db` at all.
+    NoDiskAccess,
     /// Messages refused it; the string is a sanitized first line.
     Script(String),
 }
@@ -144,10 +168,28 @@ impl std::fmt::Display for SendError {
             Self::NotAvailable => f.write_str("osascript is not available"),
             Self::NoFile => f.write_str("no such file"),
             Self::NoHelper => write!(f, "{IMSG} is not on PATH — {IMSG_INSTALL}"),
+            Self::NoBridge | Self::OutOfReach => f.write_str(SIP_REACH),
+            Self::NoTakeBack => {
+                f.write_str("taking a reaction back needs SIP off, which this Mac has on")
+            }
+            Self::NoAccessibility => f.write_str(
+                "give your terminal Accessibility in System Settings so imsg can drive Messages",
+            ),
+            Self::NoMessagesApp => {
+                f.write_str("open Messages.app: imsg react types into its window")
+            }
+            Self::NoDiskAccess => {
+                f.write_str("give your terminal Full Disk Access so imsg can read chat.db")
+            }
             Self::Script(detail) => f.write_str(detail),
         }
     }
 }
+
+/// The one sentence that explains a stock Mac to somebody whose reaction did
+/// not go anywhere. Said by the picker before `Enter` and by the toast after,
+/// so it has to fit inside the picker as well as read as a reason.
+pub const SIP_REACH: &str = "with SIP on, only the newest incoming message";
 
 impl std::error::Error for SendError {}
 
@@ -381,6 +423,30 @@ pub fn imsg_path() -> Option<PathBuf> {
     which(IMSG)
 }
 
+/// Whether `imsg`'s IMCore bridge can load on this Mac.
+///
+/// The bridge injects a library into Messages.app, which System Integrity
+/// Protection forbids, so `imsg tapback` refuses outright while SIP is on —
+/// and SIP is on unless somebody has been to Recovery mode to turn it off.
+/// Asked once, because that is a reboot away from changing, and answered
+/// optimistically when `csrutil` cannot be run at all: the route is tried
+/// anyway, and its own refusal is the better answer than a guess.
+#[must_use]
+pub fn bridge_available() -> bool {
+    static ANSWER: OnceLock<bool> = OnceLock::new();
+    *ANSWER.get_or_init(|| {
+        let Ok(output) = Command::new(CSRUTIL)
+            .arg("status")
+            .stdin(Stdio::null())
+            .output()
+        else {
+            return true;
+        };
+        let said = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+        !said.contains("status: enabled")
+    })
+}
+
 /// The `--chat` value `imsg` wants: the conversation's own GUID, or one built
 /// from the address of a one-to-one thread that has none.
 #[must_use]
@@ -397,17 +463,25 @@ pub fn chat_argument(target: &Target) -> Option<String> {
 ///
 /// Split out from [`send_tapback`] so the arguments can be checked without
 /// running anything.
+/// `db` is the database msgs is reading, which is only the default one until
+/// somebody passes `--db`; `imsg` resolves the chat in whichever database it
+/// is pointed at, so it has to be pointed at the same one.
 #[must_use]
 pub fn tapback_args(
     target: &Target,
+    db: Option<&Path>,
     message_guid: &str,
     part: usize,
     reaction: Reaction,
     remove: bool,
 ) -> Option<Vec<String>> {
     let chat = chat_argument(target)?;
-    let mut args = vec![
-        "tapback".to_string(),
+    let mut args = vec!["tapback".to_string()];
+    if let Some(db) = db {
+        args.push("--db".to_string());
+        args.push(db.to_string_lossy().into_owned());
+    }
+    args.extend([
         "--chat".to_string(),
         chat,
         "--message".to_string(),
@@ -416,7 +490,7 @@ pub fn tapback_args(
         reaction.label().to_string(),
         "--part".to_string(),
         part.to_string(),
-    ];
+    ]);
     if remove {
         args.push("--remove".to_string());
     }
@@ -459,13 +533,21 @@ pub fn react_args(fallback: &ReactFallback, reaction: Reaction) -> Vec<String> {
 /// Protection on — and the target is the one message `imsg react` can address,
 /// that route is tried too, so a reaction still goes out on a stock Mac.
 ///
+/// When the bridge is out and there is no second route, the failure is the
+/// stock Mac itself rather than anything `imsg` said, so it comes back as
+/// [`SendError::OutOfReach`] (or [`SendError::NoTakeBack`], for the one thing
+/// `imsg react` cannot do at all) instead of a sentence about SIP that reads
+/// as if something had broken.
+///
 /// # Errors
 ///
 /// Returns [`SendError::NoHelper`] when `imsg` is not installed,
-/// [`SendError::NoTarget`] when the conversation has no address, and
-/// [`SendError::Script`] with a sanitized reason when `imsg` refuses.
+/// [`SendError::NoTarget`] when the conversation has no address, and one of
+/// the reasons [`classify`] knows — or [`SendError::Script`] with a sanitized
+/// line — when `imsg` refuses.
 pub fn send_tapback(
     target: &Target,
+    db: Option<&Path>,
     message_guid: &str,
     part: usize,
     reaction: Reaction,
@@ -473,20 +555,29 @@ pub fn send_tapback(
     fallback: Option<&ReactFallback>,
 ) -> Result<(), SendError> {
     let imsg = imsg_path().ok_or(SendError::NoHelper)?;
-    let args =
-        tapback_args(target, message_guid, part, reaction, remove).ok_or(SendError::NoTarget)?;
+    let args = tapback_args(target, db, message_guid, part, reaction, remove)
+        .ok_or(SendError::NoTarget)?;
     let refused = match run_imsg(&imsg, &args) {
         Ok(()) => return Ok(()),
         Err(refused) => refused,
     };
-    match fallback.filter(|_| !remove) {
-        // Taking a reaction back is something only the bridge can do, so there
-        // is nothing to fall back to for it.
-        None => Err(refused),
-        // The second route is the one that actually reached Messages, so its
-        // complaint is the one worth showing.
-        Some(fallback) => run_imsg(&imsg, &react_args(fallback, reaction)),
+    // Taking a reaction back is something only the bridge can do, so there is
+    // nothing to fall back to for it.
+    let Some(fallback) = fallback.filter(|_| !remove) else {
+        return Err(match (refused, remove) {
+            (SendError::NoBridge, true) => SendError::NoTakeBack,
+            (SendError::NoBridge, false) => SendError::OutOfReach,
+            (other, _) => other,
+        });
+    };
+    // `imsg react` types into Messages' own window, so ask for one before
+    // driving a keyboard at a window that is not there.
+    if messages_app_running() == Some(false) {
+        return Err(SendError::NoMessagesApp);
     }
+    // The second route is the one that actually reached Messages, so its
+    // complaint is the one worth showing.
+    run_imsg(&imsg, &react_args(fallback, reaction))
 }
 
 /// Run one `imsg` subcommand and reduce a refusal to something safe to show.
@@ -500,17 +591,38 @@ fn run_imsg(imsg: &Path, args: &[String]) -> Result<(), SendError> {
         return Ok(());
     }
     // `imsg` writes its complaint to either stream depending on how far it
-    // got; both are stripped of quoted spans before they go anywhere.
+    // got, and 0.11 writes most of them to stdout; both are classified, and
+    // anything unrecognized is stripped of its quoted spans before it goes
+    // anywhere.
     let stderr = String::from_utf8_lossy(&output.stderr);
     let detail = if stderr.trim().is_empty() {
         String::from_utf8_lossy(&output.stdout).into_owned()
     } else {
         stderr.into_owned()
     };
-    Err(SendError::Script(sanitize_or(
-        &detail,
-        "imsg could not send that reaction",
-    )))
+    Err(classify(&detail))
+}
+
+/// Turn what `imsg` printed into the one thing the reader could do about it.
+///
+/// `imsg` explains itself at length — the Full Disk Access refusal is eight
+/// lines with a numbered list in it — and none of that belongs on a status
+/// line, so the shapes msgs knows become their own [`SendError`] and the rest
+/// falls back to a sanitized first line.
+#[must_use]
+pub fn classify(detail: &str) -> SendError {
+    let said = detail.to_ascii_lowercase();
+    let saw = |needle: &str| said.contains(needle);
+    if saw("system integrity protection") || saw("refusing to inject") {
+        return SendError::NoBridge;
+    }
+    if saw("assistive access") || saw("-1719") || saw("accessibility permission") {
+        return SendError::NoAccessibility;
+    }
+    if saw("full disk access") || saw("unable to open database file") {
+        return SendError::NoDiskAccess;
+    }
+    SendError::Script(sanitize_or(detail, "imsg could not send that reaction"))
 }
 
 /// Start Messages.app without bringing it to the front.
@@ -841,6 +953,9 @@ pub enum Outgoing {
     File(PathBuf),
     /// A reaction on the message with this GUID, through `imsg`.
     Tapback {
+        /// The database msgs is reading, so `imsg` resolves the chat in the
+        /// same one rather than in whichever it defaults to.
+        db: Option<PathBuf>,
         /// `message.guid` of the message being reacted to.
         message_guid: String,
         /// Which part of it the reaction lands on.
@@ -928,6 +1043,14 @@ impl Outbox {
         matches!(self.mode, Mode::Inert(_)) || imsg_path().is_some()
     }
 
+    /// Whether the GUID route is open, which is [`bridge_available`] for a
+    /// real outbox and always true for an inert one — nothing under `tests/`
+    /// asks this machine about its own SIP.
+    #[must_use]
+    pub fn has_bridge(&self) -> bool {
+        matches!(self.mode, Mode::Inert(_)) || bridge_available()
+    }
+
     /// Start one send in the background. The answer arrives from
     /// [`Outbox::drain`] carrying the same `id`.
     pub fn send(&self, id: u64, target: Target, what: Outgoing) {
@@ -941,6 +1064,7 @@ impl Outbox {
                 Outgoing::Text(text) => send_text(&target, &text),
                 Outgoing::File(path) => send_file(&target, &path),
                 Outgoing::Tapback {
+                    db,
                     message_guid,
                     part,
                     reaction,
@@ -948,6 +1072,7 @@ impl Outbox {
                     fallback,
                 } => send_tapback(
                     &target,
+                    db.as_deref(),
                     &message_guid,
                     part,
                     reaction,
@@ -1177,26 +1302,141 @@ mod tests {
         assert_eq!(Reaction::from_kind(&TapbackKind::Sticker), None);
     }
 
-    #[test]
-    fn a_tapback_is_addressed_by_chat_and_message_guid() {
-        let args = tapback_args(&direct(), "ABCD-1234", 0, Reaction::Love, false).expect("args");
-        assert_eq!(args[0], "tapback");
-        let pairs: Vec<(&str, &str)> = args[1..]
+    /// The `--flag value` pairs of an argument list, so a test can ask what
+    /// was passed without caring what order it was built in.
+    fn pairs(args: &[String]) -> Vec<(&str, &str)> {
+        args[1..]
             .chunks(2)
             .filter(|chunk| chunk.len() == 2)
             .map(|chunk| (chunk[0].as_str(), chunk[1].as_str()))
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn a_tapback_is_addressed_by_chat_and_message_guid() {
+        let args =
+            tapback_args(&direct(), None, "ABCD-1234", 0, Reaction::Love, false).expect("args");
+        assert_eq!(args[0], "tapback");
+        let pairs = pairs(&args);
         assert!(pairs.contains(&("--chat", "iMessage;-;+15550000000")));
         assert!(pairs.contains(&("--message", "ABCD-1234")));
         assert!(pairs.contains(&("--kind", "love")));
         assert!(pairs.contains(&("--part", "0")));
         assert!(!args.iter().any(|arg| arg == "--remove"));
+        assert!(
+            !args.iter().any(|arg| arg == "--db"),
+            "with no database named, imsg uses its own default"
+        );
 
         let taken =
-            tapback_args(&direct(), "ABCD-1234", 2, Reaction::Question, true).expect("args");
+            tapback_args(&direct(), None, "ABCD-1234", 2, Reaction::Question, true).expect("args");
         assert!(taken.iter().any(|arg| arg == "--remove"));
         assert!(taken.iter().any(|arg| arg == "question"));
         assert!(taken.iter().any(|arg| arg == "2"));
+    }
+
+    #[test]
+    fn the_guid_route_reads_the_database_msgs_was_pointed_at() {
+        // `--db` moves msgs off the default chat.db, and a chat guid only
+        // means something in the database it was read out of.
+        let db = PathBuf::from("/tmp/copy.db");
+        let args =
+            tapback_args(&direct(), Some(&db), "ABCD", 0, Reaction::Like, false).expect("args");
+        assert_eq!(args[0], "tapback", "the subcommand stays first");
+        assert!(pairs(&args).contains(&("--db", "/tmp/copy.db")));
+    }
+
+    #[test]
+    fn the_two_routes_spell_the_six_kinds_the_way_each_one_wants() {
+        // `imsg tapback --kind` takes emphasize; `imsg react --reaction`
+        // takes emphasis. Either one wrong is a refusal at the far end.
+        let fallback = ReactFallback {
+            chat_rowid: 1,
+            db: PathBuf::from("/tmp/copy.db"),
+        };
+        for reaction in REACTIONS {
+            let guid = tapback_args(&direct(), None, "ABCD", 0, reaction, false).expect("args");
+            assert!(pairs(&guid).contains(&("--kind", reaction.label())));
+            let ui = react_args(&fallback, reaction);
+            assert!(pairs(&ui).contains(&("--reaction", reaction.react_name())));
+        }
+        assert_eq!(Reaction::Emphasize.label(), "emphasize");
+        assert_eq!(Reaction::Emphasize.react_name(), "emphasis");
+    }
+
+    #[test]
+    fn imsg_refusals_become_the_one_thing_the_reader_could_do() {
+        // Every string here is one imsg 0.11.0 prints, copied down by hand;
+        // nothing in this test runs it.
+        assert_eq!(
+            classify(
+                "error: System Integrity Protection (SIP) is enabled. Refusing to inject into \
+                 Messages.app. Disable SIP in Recovery mode before using `imsg launch`."
+            ),
+            SendError::NoBridge
+        );
+        // The same refusal in the shape `--json` puts it in.
+        assert_eq!(
+            classify(
+                "{\"error\":\"System Integrity Protection (SIP) is enabled. Refusing to inject \
+                 into Messages.app.\",\"success\":false}"
+            ),
+            SendError::NoBridge
+        );
+        assert_eq!(
+            classify(
+                "unable to open database file (code: 14)\n\nPermission Error: Cannot access \
+                 the Messages database\n\nIt requires Full Disk Access permission."
+            ),
+            SendError::NoDiskAccess
+        );
+        assert_eq!(
+            classify(
+                "execution error: System Events got an error: osascript is not allowed \
+                 assistive access. (-1719)"
+            ),
+            SendError::NoAccessibility
+        );
+        // Anything unrecognized still has its quoted spans taken out of it.
+        let other =
+            classify("Chat not found\nCan\u{2019}t get chat id \"iMessage;-;+15550000000\".");
+        assert_eq!(other, SendError::Script("Chat not found".to_string()));
+        assert!(!other.to_string().contains("5550000000"));
+        assert_eq!(
+            classify("   \n "),
+            SendError::Script("imsg could not send that reaction".to_string())
+        );
+    }
+
+    #[test]
+    fn every_refusal_says_one_calm_sentence_and_names_nobody() {
+        for err in [
+            SendError::NoBridge,
+            SendError::OutOfReach,
+            SendError::NoTakeBack,
+            SendError::NoAccessibility,
+            SendError::NoMessagesApp,
+            SendError::NoDiskAccess,
+        ] {
+            let said = err.to_string();
+            assert!(said.chars().count() <= MAX_ERROR, "{said}");
+            assert_eq!(said.lines().count(), 1, "{said}");
+            assert!(!said.contains("error:"), "no relayed prefix in {said}");
+        }
+        // The two that mean "this Mac cannot reach this message" say the one
+        // sentence the picker draws before Enter is ever pressed.
+        assert_eq!(SendError::OutOfReach.to_string(), SIP_REACH);
+        assert_eq!(SendError::NoBridge.to_string(), SIP_REACH);
+        assert!(
+            SendError::NoAccessibility
+                .to_string()
+                .contains("Accessibility")
+        );
+        assert!(
+            SendError::NoDiskAccess
+                .to_string()
+                .contains("Full Disk Access")
+        );
     }
 
     #[test]
@@ -1217,9 +1457,9 @@ mod tests {
             service: Service::IMessage,
         };
         assert!(chat_argument(&nowhere).is_none());
-        assert!(tapback_args(&nowhere, "ABCD", 0, Reaction::Like, false).is_none());
+        assert!(tapback_args(&nowhere, None, "ABCD", 0, Reaction::Like, false).is_none());
         assert_eq!(
-            send_tapback(&nowhere, "ABCD", 0, Reaction::Like, false, None),
+            send_tapback(&nowhere, None, "ABCD", 0, Reaction::Like, false, None),
             Err(if imsg_path().is_some() {
                 SendError::NoTarget
             } else {
@@ -1250,14 +1490,7 @@ mod tests {
             .collect();
         assert!(pairs.contains(&("--chat-id", "7")));
         assert!(pairs.contains(&("--db", "/tmp/copy.db")));
-        // The two routes spell this one differently, and each gets its own.
         assert!(pairs.contains(&("--reaction", "emphasis")));
-        assert_eq!(Reaction::Emphasize.label(), "emphasize");
-        for reaction in REACTIONS {
-            if reaction != Reaction::Emphasize {
-                assert_eq!(reaction.label(), reaction.react_name());
-            }
-        }
     }
 
     #[test]

@@ -94,7 +94,7 @@ Flags:
 | `--no-mouse` | do not capture the mouse |
 | `--theme <NAME>` | `dark`, `light`, `system`, or `terminal`; overrides `base` in the config's `[theme]` |
 | `--redact` | mask phone numbers and addresses on screen (`+1 (•••) •••-••39`), for a demo or a screenshot; names and message bodies still show |
-| `--check` | print a readiness report (Full Disk Access, database, row counts, unread, read state, live updates, Messages.app and whether it is running, `osascript`, `imsg`, search index, contacts, terminal graphics) and exit |
+| `--check` | print a readiness report (Full Disk Access, database, row counts, unread, read state, live updates, Messages.app and whether it is running, `osascript`, `imsg` and which reaction route SIP leaves open, search index, contacts, terminal graphics) and exit |
 | `--no-index` | do not build or use the full-text message index |
 | `--no-images` | do not draw pictures inline; show every attachment as a chip |
 | `--no-contacts` | do not read Contacts; show numbers and addresses instead of names |
@@ -211,7 +211,8 @@ where to look after the toast has gone.
 
 `msgs --check` answers the same questions from the shell without starting the
 UI: Full Disk Access, whether `chat.db` opens and what is in it, the read state,
-live updates, Messages.app and whether it is running, `osascript`, `imsg`, the
+live updates, Messages.app and whether it is running, `osascript`, `imsg` and
+which of its two reaction routes this Mac's SIP setting leaves open, the
 search index, Contacts, the terminal's graphics support, `sips`, and
 `qlmanage`. It prints
 paths and counts — never a name, a number, or a message.
@@ -474,8 +475,49 @@ arrives on the next live update the chip retires into it without moving, and if
 that the database has still not confirmed twenty seconds later is dropped, so
 what is on screen is the database's own answer rather than a guess.
 
-Without `imsg` on `$PATH` the picker still opens and says
-`brew install steipete/tap/imsg`; nothing is sent and no chip goes up.
+### What each route needs
+
+System Integrity Protection is on unless somebody has been to Recovery mode to
+turn it off, so on a stock Mac the GUID route never runs and the UI route is
+the only one there is. msgs asks `csrutil` once, when the picker first opens,
+and the picker says up front what can actually be reached rather than letting
+you press a key that could not work.
+
+| Route | Reaches | Needs |
+| --- | --- | --- |
+| `imsg tapback` | any message, and can take a reaction back | System Integrity Protection **off** (`csrutil disable` from Recovery), so the IMCore bridge can load |
+| `imsg react` | the newest incoming message of the open conversation, adding only | Messages.app running, and Accessibility for your terminal in System Settings → Privacy & Security → Accessibility |
+
+The UI route is exactly that: `imsg` brings Messages to the front and types
+into its window — ⌘F, the conversation, ⌘T, the reaction. It takes the keyboard
+for about a second and leaves Messages in front of your terminal. Nothing msgs
+can do about that; it is how the route works.
+
+So on a stock Mac, with `imsg` installed, Messages open and Accessibility
+granted: the newest incoming message of a conversation takes a reaction, every
+other message says so instead, and no reaction can be taken back.
+
+### When nothing goes out
+
+The picker dims its row and says the one reason, and pressing `Enter` anyway
+repeats it on the status line rather than sending:
+
+| What it says | What to do |
+| --- | --- |
+| `imsg is not on PATH — brew install steipete/tap/imsg` | install it |
+| `with SIP on, only the newest incoming message` | react to the newest incoming message of the conversation, or turn SIP off |
+| `taking a reaction back needs SIP off, which this Mac has on` | leave it, or turn SIP off |
+| `give your terminal Accessibility in System Settings so imsg can drive Messages` | add your terminal under Privacy & Security → Accessibility, then restart it |
+| `open Messages.app: imsg react types into its window` | open Messages |
+| `give your terminal Full Disk Access so imsg can read chat.db` | add your terminal under Privacy & Security → Full Disk Access |
+
+Every one of those is a single sentence naming one thing to do. `imsg`'s own
+refusals are longer than that — the Full Disk Access one is eight lines with a
+numbered list in it — so msgs recognizes the shapes it knows and shows its own
+sentence; anything it does not recognize is trimmed to a first line with the
+quoted spans taken out, because `imsg` quotes the chat or the message it could
+not reach and none of that belongs on a status line.
+
 Reactions with an arbitrary emoji are read and drawn but cannot be sent —
 neither `imsg` route will put one on the wire.
 
@@ -602,7 +644,9 @@ Some of these are macOS's and some are msgs's, and it is worth knowing which.
   while System Integrity Protection is on. With SIP on, the `imsg react`
   fallback can only reach a conversation's newest incoming message, taking a
   reaction back is not possible at all, and a custom-emoji reaction cannot be
-  sent by either route. Every reaction is *read* and drawn regardless.
+  sent by either route. That fallback also needs Messages.app open and
+  Accessibility granted to your terminal, and it brings Messages to the front
+  and types into it. Every reaction is *read* and drawn regardless.
 - **Attachments that never reached this Mac stay chips.** msgs reads files; it
   cannot ask iCloud for one. HEIC needs `sips`, which macOS ships.
 - **A conversation with yourself shows every message twice.** Messages stores
