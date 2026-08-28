@@ -46,6 +46,11 @@ pub const BINDINGS: &[Binding] = &[
         scope: "global",
     },
     Binding {
+        keys: "Ctrl+T",
+        description: "cycle the theme: dark / light / system",
+        scope: "global",
+    },
+    Binding {
         keys: "Esc",
         description: "close the overlay / leave the composer",
         scope: "global",
@@ -199,12 +204,14 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
 
     // Bindings that win everywhere, including while typing. The first-run
     // surface is the exception: there is no conversation behind it to attach
-    // to, react to, or open a link from, so only the two keys that still mean
-    // something over it get through and the rest stay dead.
+    // to, react to, or open a link from, so only the keys that still mean
+    // something over it (quit, the palette, the theme) get through and the
+    // rest stay dead.
     if ctrl {
         match key.code {
             KeyCode::Char('c') => return Some(Action::Quit),
             KeyCode::Char('k') => return Some(Action::OpenPalette),
+            KeyCode::Char('t') => return Some(Action::CycleTheme),
             KeyCode::Char('b') if focus != Focus::DbError => {
                 return Some(Action::ToggleChatList);
             }

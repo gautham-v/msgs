@@ -34,6 +34,7 @@ Reactions need [`imsg`](https://github.com/steipete/imsg) (`brew install steipet
 | `Enter` | open chat / send message | everywhere |
 | `Ctrl+K` | jump palette: chats, people, message search | everywhere |
 | `Ctrl+B` | toggle the chat list | everywhere |
+| `Ctrl+T` | cycle the theme: dark / light / system | everywhere |
 | `Esc` | close the overlay / leave the composer | everywhere |
 | `?` | this help | everywhere |
 | `q` / `Ctrl+C` | quit | everywhere |

@@ -92,6 +92,7 @@ Flags:
 | `--db <PATH>` | read this database instead of `~/Library/Messages/chat.db` |
 | `--config <PATH>` | read this config file instead of the default |
 | `--no-mouse` | do not capture the mouse |
+| `--theme <NAME>` | `dark`, `light`, or `system`; overrides `base` in the config's `[theme]` |
 | `--redact` | mask phone numbers and addresses on screen (`+1 (•••) •••-••39`), for a demo or a screenshot; names and message bodies still show |
 | `--check` | print a readiness report (Full Disk Access, database, row counts, unread, read state, live updates, Messages.app and whether it is running, `osascript`, `imsg`, search index, contacts, terminal graphics) and exit |
 | `--no-index` | do not build or use the full-text message index |
@@ -112,6 +113,7 @@ binding applies.
 | `Enter` | open chat / send message |
 | `Ctrl+K` | jump palette: chats, people, message search |
 | `Ctrl+B` | toggle the chat list |
+| `Ctrl+T` | cycle the theme: dark / light / system |
 | `Esc` | close the overlay / leave the composer |
 | `?` | this help |
 | `q` / `Ctrl+C` | quit |
@@ -482,7 +484,8 @@ images = true            # draw pictures inline; --no-images overrides this
 contacts = true          # read Contacts for names; --no-contacts overrides this
 
 [theme]
-# Any color slot, as "#rrggbb", "#rgb", or an ANSI index 0–255.
+base = "dark"            # "light", or "system" to follow macOS; --theme overrides this
+# Any color slot, as "#rrggbb", "#rgb", or an ANSI index 0–255, on top of the base.
 accent_me = "#5ea8ff"
 accent_them = "#7ec699"
 participant0 = "#7ec699" # participant0–participant3: stable group-chat accents
@@ -499,11 +502,18 @@ Every key, what it does, and what overrides it:
 | `mouse` | `true` | bool | capture the mouse; `--no-mouse` overrides it to `false` |
 | `images` | `true` | bool | draw pictures inline; `--no-images` overrides it to `false` |
 | `contacts` | `true` | bool | read Contacts for names; `--no-contacts` overrides it to `false` |
-| `[theme]` | — | color per slot | any slot below, as `"#rrggbb"`, `"#rgb"`, or an ANSI index `0`–`255` |
+| `[theme] base` | `dark` | `dark`, `light`, `system` | the palette to start from; `--theme` overrides it and `Ctrl+T` cycles it at runtime |
+| `[theme]` | — | color per slot | any slot below, as `"#rrggbb"`, `"#rgb"`, or an ANSI index `0`–`255`, applied on top of `base` |
 
 Slots: `bg_base`, `bg_light`, `bg_dark`, `bg_highlight`, `bg_hover`, `accent_me`, `accent_them`,
 `participant0`–`participant3`, `text_primary`, `text_secondary`, `gray`, `gray_dim`, `system`,
 `fuzzy`, `border`, `border_active`, `error`.
+
+`system` asks macOS (`defaults read -g AppleInterfaceStyle`, on its own thread,
+every five seconds while it is the base) and follows the answer, so switching
+the Mac's appearance switches msgs within a few seconds. Until the first answer
+it draws dark. `Ctrl+T` changes the base for this run only; put it in the
+config to keep it.
 
 A value out of range is clamped and said on the status line; an unknown key,
 a bad color, or TOML that will not parse is a warning under `NOTES` in the help

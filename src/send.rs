@@ -591,7 +591,9 @@ pub fn messages_app_running() -> Option<bool> {
     }
 }
 
-/// A background answer to "is Messages.app running?", refreshed on a timer.
+/// A background yes/no answer, refreshed on a timer: "is Messages.app
+/// running?" by default, or any other `fn() -> Option<bool>` handed to
+/// [`Presence::watching_with`] (the system appearance, for one).
 ///
 /// The probe costs a process, so it is off by default — nothing under `tests/`
 /// ever spawns one — and one launch's worth of it runs at a time: [`poll`]
@@ -601,6 +603,8 @@ pub fn messages_app_running() -> Option<bool> {
 /// [`poll`]: Presence::poll
 #[derive(Debug)]
 pub struct Presence {
+    /// The question, asked on its own thread.
+    ask: fn() -> Option<bool>,
     /// The answer to the probe that is in flight, if one is.
     rx: Option<Receiver<Option<bool>>>,
     /// When the next probe may start. `None` while one is in flight.
@@ -618,6 +622,7 @@ impl Presence {
     #[must_use]
     pub const fn off() -> Self {
         Self {
+            ask: messages_app_running,
             rx: None,
             due: None,
             interval: PRESENCE_INTERVAL,
@@ -627,7 +632,14 @@ impl Presence {
     /// A probe that asks now and then every [`PRESENCE_INTERVAL`].
     #[must_use]
     pub fn watching() -> Self {
+        Self::watching_with(messages_app_running)
+    }
+
+    /// A probe that asks `ask` now and then every [`PRESENCE_INTERVAL`].
+    #[must_use]
+    pub fn watching_with(ask: fn() -> Option<bool>) -> Self {
         Self {
+            ask,
             rx: None,
             due: Some(std::time::Instant::now()),
             interval: PRESENCE_INTERVAL,
@@ -666,8 +678,9 @@ impl Presence {
             self.due = None;
             let (tx, rx) = channel();
             self.rx = Some(rx);
+            let ask = self.ask;
             std::thread::spawn(move || {
-                let _ = tx.send(messages_app_running());
+                let _ = tx.send(ask());
             });
         }
         None

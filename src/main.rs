@@ -16,8 +16,8 @@ use crossterm::event::{
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    supports_keyboard_enhancement,
+    BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement,
 };
 use crossterm::{cursor, event, execute};
 use ratatui::Terminal;
@@ -29,7 +29,7 @@ use msgs::contacts::Contacts;
 use msgs::db::{Db, Source};
 use msgs::seen::Seen;
 use msgs::send::which;
-use msgs::{config, contacts, default_db_path, keymap, media, search, send, ui};
+use msgs::{config, contacts, default_db_path, keymap, media, search, send, theme, ui};
 
 /// How long the loop waits for input before waking up to expire toasts.
 const TICK: Duration = Duration::from_millis(250);
@@ -49,6 +49,10 @@ struct Cli {
     /// Do not capture the mouse.
     #[arg(long)]
     no_mouse: bool,
+
+    /// Use this palette instead of the config's: dark, light, or system.
+    #[arg(long, value_name = "NAME", value_parser = theme::BASES)]
+    theme: Option<String>,
 
     /// Print a readiness report and exit without starting the UI.
     #[arg(long)]
@@ -74,7 +78,10 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let (config, warnings) = Config::load(cli.config.as_deref());
+    let (mut config, warnings) = Config::load(cli.config.as_deref());
+    if let Some(name) = &cli.theme {
+        config.theme.insert("base".to_string(), name.clone());
+    }
 
     if cli.check {
         return check(&cli, &warnings);
@@ -102,6 +109,10 @@ fn main() -> Result<()> {
     // Whether Messages.app is up, asked on a timer on its own thread. The
     // status line says `unknown` until the first answer lands.
     app.enable_presence();
+
+    // Whether macOS is in dark mode, asked the same way while the theme
+    // follows the system.
+    app.enable_appearance();
 
     // Which chats msgs itself has already put in front of you. Its own small
     // file beside the index; `chat.db` and Messages.app's badge are untouched.
@@ -138,9 +149,21 @@ fn main() -> Result<()> {
 /// The event loop: draw, wait for input, apply, repeat.
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     loop {
-        terminal.draw(|frame| ui::draw(frame, app))?;
+        // A synchronized update asks the terminal to hold the frame until it
+        // is complete, so a resize's clear-and-redraw lands as one paint
+        // instead of a blank screen followed by the new layout. Terminals
+        // that do not understand the sequence ignore it.
+        let _ = execute!(io::stdout(), BeginSynchronizedUpdate);
+        let drawn = terminal.draw(|frame| ui::draw(frame, app));
+        let _ = execute!(io::stdout(), EndSynchronizedUpdate);
+        drawn?;
 
-        if event::poll(TICK)? {
+        // Drain everything queued before drawing again: a drag of the window
+        // edge arrives as a burst of resize events, and one frame at the end
+        // of the burst is the whole point of it.
+        let mut waited = false;
+        while event::poll(if waited { Duration::ZERO } else { TICK })? {
+            waited = true;
             match event::read()? {
                 // Terminals with the kitty keyboard protocol also report key
                 // releases and repeats; only presses act.
@@ -151,6 +174,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Resu
                 }
                 Event::Mouse(mouse) => app.on_mouse(mouse),
                 _ => {}
+            }
+            if app.should_quit {
+                break;
             }
         }
         app.tick();

@@ -23,7 +23,7 @@ use crate::send::{
     self, Delivery, Outbox, Outgoing, Pending, PendingTapback, Presence, REACTIONS, ReactFallback,
     Reaction, SendError, Service, Target,
 };
-use crate::theme::Theme;
+use crate::theme::{self, Base, Theme};
 use crate::ui::Panes;
 use crate::ui::conversation::{Hits, Measured, Scroll};
 use crate::ui::message::{self, Ctx};
@@ -106,6 +106,8 @@ pub enum Action {
     FocusComposer,
     /// Show or hide the chat list.
     ToggleChatList,
+    /// `Ctrl+T`: the next theme base — dark, light, then the system's.
+    CycleTheme,
     /// Move the selection up one row.
     SelectPrev,
     /// Move the selection down one row.
@@ -527,6 +529,14 @@ pub struct App {
     pub config: Config,
     /// Colors, after config overrides.
     pub theme: Theme,
+    /// Which palette [`App::theme`] starts from; `Ctrl+T` cycles it.
+    pub theme_base: Base,
+    /// The system's answer to "dark mode?", for [`Base::System`]. `None`
+    /// until the probe answers, which reads as dark.
+    pub system_dark: Option<bool>,
+    /// The probe behind [`App::system_dark`]. [`Presence::off`] until
+    /// something asks for it, so no test spawns one.
+    pub appearance: Presence,
     /// Which pane has keyboard focus.
     pub focus: Focus,
     /// Where focus returns to when an overlay closes.
@@ -661,7 +671,9 @@ impl App {
     /// Build the app from a loaded config and any startup warnings.
     #[must_use]
     pub fn new(config: Config, mut warnings: Vec<String>) -> Self {
-        let mut theme = Theme::default();
+        let (theme_base, base_warning) = Theme::base_from(&config.theme);
+        warnings.extend(base_warning);
+        let mut theme = Theme::for_base(theme_base, None);
         warnings.extend(theme.apply_overrides(&config.theme));
         let show_chat_list = config.show_chat_list;
         let mouse_enabled = config.mouse;
@@ -674,6 +686,9 @@ impl App {
         Self {
             config,
             theme,
+            theme_base,
+            system_dark: None,
+            appearance: Presence::off(),
             focus: Focus::ChatList,
             overlay_return: Focus::ChatList,
             show_chat_list,
@@ -829,6 +844,39 @@ impl App {
     /// test should spawn one.
     pub fn enable_presence(&mut self) {
         self.presence = Presence::watching();
+    }
+
+    /// Start asking, on a timer, whether macOS is in dark mode. Only asked
+    /// while the base is [`Base::System`]; off in the tests like the rest.
+    pub fn enable_appearance(&mut self) {
+        self.appearance = Presence::watching_with(theme::system_is_dark);
+    }
+
+    /// `Ctrl+T`: move to the next base and say which one.
+    fn cycle_theme(&mut self) {
+        self.theme_base = self.theme_base.next();
+        self.rebuild_theme();
+        let name = self.theme_base.name();
+        let toast = if self.theme_base == Base::System {
+            let showing = if self.theme_base.is_dark(self.system_dark) {
+                "dark"
+            } else {
+                "light"
+            };
+            format!("theme: {name} ({showing})")
+        } else {
+            format!("theme: {name}")
+        };
+        self.status.toast(toast);
+    }
+
+    /// Recompute [`App::theme`] from the base, the system's answer, and the
+    /// config's slot overrides. The overrides were already reported at
+    /// startup, so their warnings are not repeated here.
+    fn rebuild_theme(&mut self) {
+        let mut theme = Theme::for_base(self.theme_base, self.system_dark);
+        let _ = theme.apply_overrides(&self.config.theme);
+        self.theme = theme;
     }
 
     /// Take the names read out of the macOS Contacts stores.
@@ -1826,6 +1874,7 @@ impl App {
             Action::FocusPane(pane) => self.focus = pane,
             Action::FocusComposer => self.focus = Focus::Composer,
             Action::ToggleChatList => self.toggle_chat_list(),
+            Action::CycleTheme => self.cycle_theme(),
             Action::SelectPrev => self.move_selection(-1),
             Action::SelectNext => self.move_selection(1),
             Action::PageUp => self.page(-1),
@@ -2737,6 +2786,16 @@ impl App {
             self.status.messages_app_running = answer;
             dirty = true;
         }
+        // The system appearance is only worth asking about while it is what
+        // the theme follows, and only a changed answer repaints.
+        if self.theme_base == Base::System
+            && let Some(answer) = self.appearance.poll()
+            && self.system_dark != answer
+        {
+            self.system_dark = answer;
+            self.rebuild_theme();
+            dirty = true;
+        }
         if self.watcher.ready() {
             dirty |= self.on_db_change();
         }
@@ -3206,6 +3265,44 @@ mod tests {
         });
 
         assert_eq!(app.focus, Focus::Help);
+    }
+
+    #[test]
+    fn ctrl_t_cycles_the_base_and_keeps_the_slot_overrides() {
+        let (config, warnings) = Config::parse("[theme]\naccent_me = \"#123456\"");
+        let mut app = App::new(config, warnings);
+        let accent = ratatui::style::Color::Rgb(0x12, 0x34, 0x56);
+        assert_eq!(app.theme_base, Base::Dark);
+
+        app.update(Action::CycleTheme);
+        assert_eq!(app.theme_base, Base::Light);
+        assert_eq!(app.theme.bg_base, Theme::light().bg_base);
+        assert_eq!(app.theme.accent_me, accent, "the override survives");
+        assert!(app.status.active_toast().is_some());
+
+        // System with no answer yet reads as dark; an answer of light repaints.
+        app.update(Action::CycleTheme);
+        assert_eq!(app.theme_base, Base::System);
+        assert_eq!(app.theme.bg_base, Theme::default().bg_base);
+        app.system_dark = Some(false);
+        app.rebuild_theme();
+        assert_eq!(app.theme.bg_base, Theme::light().bg_base);
+
+        app.update(Action::CycleTheme);
+        assert_eq!(app.theme_base, Base::Dark);
+        assert_eq!(app.theme.bg_base, Theme::default().bg_base);
+    }
+
+    #[test]
+    fn config_base_system_starts_dark_without_spawning_anything() {
+        let (config, warnings) = Config::parse("[theme]\nbase = \"system\"");
+        let mut app = App::new(config, warnings);
+        assert_eq!(app.theme_base, Base::System);
+        assert!(app.status.warnings.is_empty());
+        assert_eq!(app.theme, Theme::default());
+        // The probe is off, so a tick asks nothing and changes nothing.
+        app.tick();
+        assert_eq!(app.system_dark, None);
     }
 
     #[test]

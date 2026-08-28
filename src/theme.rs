@@ -3,7 +3,8 @@
 //! Every color the app draws with comes from a slot on [`Theme`] so the palette
 //! can be swapped wholesale (and overridden per-slot from `config.toml`) without
 //! touching render code. Defaults are the GrokNight-ish values from
-//! `docs/mockups.html`.
+//! `docs/mockups.html`; [`Theme::light`] is the same layout on a light ground,
+//! chosen with `base = "light"` in `[theme]` or `--theme light`.
 
 use std::collections::BTreeMap;
 
@@ -88,7 +89,157 @@ impl Default for Theme {
     }
 }
 
+/// The bases a config can name, in the order `--help` lists them and
+/// `Ctrl+T` cycles through them.
+pub const BASES: [&str; 3] = ["dark", "light", "system"];
+
+/// Which palette to start from before per-slot overrides.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Base {
+    /// The mockup palette.
+    #[default]
+    Dark,
+    /// [`Theme::light`].
+    Light,
+    /// Whichever of the two macOS is showing, asked on a timer.
+    System,
+}
+
+impl Base {
+    /// The base a config value names, case-insensitively.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            "system" => Some(Self::System),
+            _ => None,
+        }
+    }
+
+    /// The name the config and the toast use.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::System => "system",
+        }
+    }
+
+    /// The base after this one in [`BASES`], wrapping around.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::System,
+            Self::System => Self::Dark,
+        }
+    }
+
+    /// Whether this base draws dark, given the system's answer (`None` while
+    /// it has not answered yet, which reads as dark).
+    #[must_use]
+    pub fn is_dark(self, system_dark: Option<bool>) -> bool {
+        match self {
+            Self::Dark => true,
+            Self::Light => false,
+            Self::System => system_dark.unwrap_or(true),
+        }
+    }
+}
+
+/// Ask macOS whether it is in dark mode: `defaults read -g
+/// AppleInterfaceStyle` says `Dark` when it is and fails when it is not.
+/// `None` when the question could not be asked.
+#[must_use]
+pub fn system_is_dark() -> Option<bool> {
+    let output = std::process::Command::new("/usr/bin/defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim() == "Dark")
+    } else {
+        Some(false)
+    }
+}
+
 impl Theme {
+    /// The palette a name picks out: `dark` (the default) or `light`.
+    /// `system` needs an answer, so it is not a name here.
+    #[must_use]
+    pub fn named(name: &str) -> Option<Self> {
+        match Base::parse(name)? {
+            Base::Dark => Some(Self::default()),
+            Base::Light => Some(Self::light()),
+            Base::System => None,
+        }
+    }
+
+    /// The palette for a base, given what the system said.
+    #[must_use]
+    pub fn for_base(base: Base, system_dark: Option<bool>) -> Self {
+        if base.is_dark(system_dark) {
+            Self::default()
+        } else {
+            Self::light()
+        }
+    }
+
+    /// The base the `[theme]` table asks for, and a warning if it names one
+    /// that does not exist.
+    #[must_use]
+    pub fn base_from(overrides: &BTreeMap<String, String>) -> (Base, Option<String>) {
+        let Some(name) = overrides.get("base") else {
+            return (Base::default(), None);
+        };
+        match Base::parse(name) {
+            Some(base) => (base, None),
+            None => (
+                Base::default(),
+                Some(format!(
+                    "config: unknown theme base `{name}` (one of {})",
+                    BASES.join(", ")
+                )),
+            ),
+        }
+    }
+
+    /// The dark palette on a light ground: the same accents, darkened enough
+    /// to read on white, with the bands and borders inverted.
+    #[must_use]
+    pub fn light() -> Self {
+        Self {
+            bg_base: rgb(0xff, 0xff, 0xff),
+            bg_light: rgb(0xf4, 0xf4, 0xf6),
+            bg_dark: rgb(0xf7, 0xf7, 0xf9),
+            bg_highlight: rgb(0xe6, 0xe6, 0xeb),
+            bg_hover: rgb(0xec, 0xec, 0xf0),
+
+            accent_me: rgb(0x1f, 0x6f, 0xe5),
+            accent_them: rgb(0x2e, 0x8b, 0x57),
+            participants: [
+                rgb(0x2e, 0x8b, 0x57),
+                rgb(0xb0, 0x7a, 0x1a),
+                rgb(0x9b, 0x3f, 0xb0),
+                rgb(0x1f, 0x8a, 0x80),
+            ],
+
+            text_primary: rgb(0x1c, 0x1c, 0x1f),
+            text_secondary: rgb(0x52, 0x52, 0x5b),
+            gray: rgb(0x8a, 0x8a, 0x94),
+            gray_dim: rgb(0xc4, 0xc4, 0xcb),
+            system: rgb(0x6e, 0x6e, 0x78),
+            fuzzy: rgb(0x1f, 0x6f, 0xe5),
+
+            border: rgb(0xd6, 0xd6, 0xdc),
+            border_active: rgb(0x1f, 0x6f, 0xe5),
+            error: rgb(0xc0, 0x39, 0x2b),
+        }
+    }
+
     /// The accent for the `n`th participant of a group chat, wrapping around
     /// the palette. Callers pass a stable index (handle rowid order) so a
     /// person keeps the same color for the whole thread.
@@ -144,13 +295,18 @@ impl Theme {
         true
     }
 
-    /// Apply `slot = "#rrggbb"` overrides from the config file.
+    /// Apply the `slot = "#rrggbb"` entries of the `[theme]` table on top of
+    /// this palette. `base` is not a slot — [`Theme::base_from`] reads it —
+    /// so it is stepped over here.
     ///
     /// Bad entries are skipped and described in the returned warnings so the
     /// status line can surface them instead of the app refusing to start.
     pub fn apply_overrides(&mut self, overrides: &BTreeMap<String, String>) -> Vec<String> {
         let mut warnings = Vec::new();
         for (name, value) in overrides {
+            if name == "base" {
+                continue;
+            }
             match parse_color(value) {
                 Some(color) => {
                     if !self.set_slot(name, color) {
@@ -256,6 +412,60 @@ mod tests {
         assert_eq!(theme.participants[2], Color::Rgb(0, 255, 0));
         assert_eq!(theme.border, Theme::default().border);
         assert_eq!(warnings.len(), 3);
+    }
+
+    #[test]
+    fn base_is_read_apart_from_the_slots() {
+        let overrides = BTreeMap::from([
+            ("base".to_string(), "Light".to_string()),
+            ("accent_me".to_string(), "#ff0000".to_string()),
+        ]);
+
+        let (base, warning) = Theme::base_from(&overrides);
+        let mut theme = Theme::for_base(base, None);
+        let warnings = theme.apply_overrides(&overrides);
+
+        assert_eq!(base, Base::Light);
+        assert!(warning.is_none());
+        assert!(warnings.is_empty(), "`base` is not an unknown slot");
+        assert_eq!(theme.bg_base, Theme::light().bg_base);
+        assert_eq!(theme.accent_me, Color::Rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn unknown_base_warns_and_keeps_the_default() {
+        let overrides = BTreeMap::from([("base".to_string(), "sepia".to_string())]);
+        let (base, warning) = Theme::base_from(&overrides);
+        assert_eq!(base, Base::Dark);
+        assert!(warning.is_some_and(|w| w.contains("system")));
+    }
+
+    #[test]
+    fn every_base_parses_and_cycles() {
+        for name in BASES {
+            let base = Base::parse(name).expect(name);
+            assert_eq!(base.name(), name);
+        }
+        assert_eq!(Base::parse("nope"), None);
+        assert_eq!(Base::Dark.next().next().next(), Base::Dark);
+        assert_eq!(Theme::named("dark"), Some(Theme::default()));
+        assert_eq!(Theme::named("system"), None);
+    }
+
+    #[test]
+    fn system_follows_the_answer_and_reads_dark_until_there_is_one() {
+        assert!(Base::System.is_dark(None));
+        assert!(Base::System.is_dark(Some(true)));
+        assert!(!Base::System.is_dark(Some(false)));
+        assert!(Base::Dark.is_dark(Some(false)));
+        assert!(!Base::Light.is_dark(Some(true)));
+        assert_eq!(Theme::for_base(Base::System, Some(false)), Theme::light());
+    }
+
+    #[test]
+    fn light_and_dark_disagree_on_the_ground() {
+        assert_ne!(Theme::light().bg_base, Theme::default().bg_base);
+        assert_eq!(Theme::light().participant(0), Theme::light().accent_them);
     }
 
     #[test]

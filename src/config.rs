@@ -36,7 +36,8 @@ pub struct Config {
     /// Read the macOS Contacts stores so handles become names.
     /// `--no-contacts` overrides this to `false`.
     pub contacts: bool,
-    /// Per-slot color overrides, e.g. `accent_me = "#ff8800"`.
+    /// The `[theme]` table: `base = "light"` picks a palette, and any other
+    /// key is a per-slot color override, e.g. `accent_me = "#ff8800"`.
     #[serde(default)]
     pub theme: BTreeMap<String, String>,
 }
@@ -150,6 +151,7 @@ mod tests {
             contacts = false
 
             [theme]
+            base = "light"
             accent_me = "#ff8800"
             participant1 = "#00ffcc"
             "##,
@@ -164,7 +166,8 @@ mod tests {
             config.theme.get("accent_me").map(String::as_str),
             Some("#ff8800")
         );
-        assert_eq!(config.theme.len(), 2);
+        assert_eq!(config.theme.get("base").map(String::as_str), Some("light"));
+        assert_eq!(config.theme.len(), 3);
     }
 
     #[test]
