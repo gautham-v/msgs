@@ -22,6 +22,7 @@ Reactions need [`imsg`](https://github.com/steipete/imsg) (`brew install steipet
 
 - Chats, messages, group chats, names from Contacts, pictures inline, video posters
 - Send text, files, replies, and reactions; live updates as messages land
+- Drag a file from Finder onto the window to attach it; `Enter` sends
 - `Ctrl+K` fuzzy jump to any chat or person, full-text search over every message
 - Local unread state, so opening a chat here does not touch Messages.app's badge
 - Never writes to `chat.db`; nothing leaves your Mac

@@ -595,6 +595,9 @@ pub struct App {
     /// The `Ctrl+A` path prompt, which takes the composer's place while it is
     /// open.
     pub attach_prompt: Option<TextField>,
+    /// Files dropped onto the composer and waiting for `Enter`, in the order
+    /// they were dropped. Each is a chip at the top of the send box.
+    pub attached: Vec<PathBuf>,
     /// Messages sent but not yet read back out of `chat.db`, oldest first.
     /// They are drawn as ordinary blocks at the end of the open conversation.
     pub pending: Vec<Pending>,
@@ -715,6 +718,7 @@ impl App {
             messages: ListPane::default(),
             composer: TextField::default(),
             attach_prompt: None,
+            attached: Vec::new(),
             pending: Vec::new(),
             pending_tapbacks: Vec::new(),
             reaction_picker: None,
@@ -1418,16 +1422,26 @@ impl App {
     /// The echo goes up first and the send runs on its own thread, because
     /// `osascript` takes long enough to answer that doing it here would freeze
     /// the UI mid-keystroke.
+    ///
+    /// Anything dropped on the composer goes first, one message per file, and
+    /// the typed draft follows as a message of its own — the order they are
+    /// read in on the other end.
     fn send_composed(&mut self) {
-        if self.composer.text().trim().is_empty() {
+        let typed = !self.composer.text().trim().is_empty();
+        if !typed && self.attached.is_empty() {
             return;
         }
         let Some(target) = self.outgoing_target() else {
             self.status.error("no conversation selected");
             return;
         };
-        let text = self.composer.take();
-        self.start_send(&target, text.clone(), Outgoing::Text(text), false);
+        for path in std::mem::take(&mut self.attached) {
+            self.start_file_send(&target, path);
+        }
+        if typed {
+            let text = self.composer.take();
+            self.start_send(&target, text.clone(), Outgoing::Text(text), false);
+        }
     }
 
     /// `Ctrl+A`, once a path has been typed: send that file.
@@ -1454,12 +1468,14 @@ impl App {
             self.status.error("no conversation selected");
             return;
         };
-        let label = path.file_name().map_or_else(
-            || "attachment".to_string(),
-            |name| name.to_string_lossy().to_string(),
-        );
         self.attach_prompt = None;
-        self.start_send(&target, format!("📎 {label}"), Outgoing::File(path), true);
+        self.start_file_send(&target, path);
+    }
+
+    /// Put one file on its way, with the chip the transcript echoes it as.
+    fn start_file_send(&mut self, target: &Target, path: PathBuf) {
+        let echo = format!("📎 {}", attachment_label(&path));
+        self.start_send(target, echo, Outgoing::File(path), true);
     }
 
     /// Put an echo on screen and start the send behind it.
@@ -2310,9 +2326,16 @@ impl App {
             }
             Focus::Composer => {
                 // The attachment prompt is a layer in front of the composer, so
-                // `Esc` closes it and leaves the draft where it was.
+                // `Esc` closes it and leaves the draft where it was; the next
+                // `Esc` drops whatever was dropped on the composer, and only
+                // then does the composer give focus back.
                 if self.attach_prompt.take().is_none() {
-                    self.focus = Focus::Conversation;
+                    if self.attached.is_empty() {
+                        self.focus = Focus::Conversation;
+                    } else {
+                        self.attached.clear();
+                        self.status.toast("attachments dropped");
+                    }
                 }
             }
             Focus::Conversation => {
@@ -2333,6 +2356,9 @@ impl App {
     }
 
     /// `Ctrl+A`: ask for a path, in the composer's place.
+    ///
+    /// Dropping a file from Finder does the same thing without the typing —
+    /// see [`App::on_paste`].
     fn start_attach(&mut self) {
         if self.focus.is_overlay() {
             return;
@@ -2692,6 +2718,77 @@ impl App {
         }
     }
 
+    /// A bracketed paste, which is also how a file dropped from Finder
+    /// arrives: the terminal types the path, escaped or quoted or as a
+    /// `file://` URL, usually with a space on the end.
+    ///
+    /// A paste that names nothing but files becomes attachments waiting on the
+    /// composer; anything else is typed into whatever field has focus.
+    pub fn on_paste(&mut self, text: &str) {
+        let files = if self.takes_drops() {
+            let home = dirs::home_dir();
+            crate::paste::dropped_files(text, home.as_deref(), &|path| path.is_file())
+        } else {
+            Vec::new()
+        };
+        if files.is_empty() {
+            self.paste_text(text);
+            return;
+        }
+        self.attach_dropped(files);
+    }
+
+    /// Whether a dropped file would be taken as an attachment right now.
+    ///
+    /// Not while an overlay or the first-run surface is up, and not while the
+    /// chat filter is open — those are somebody typing, and a path pasted into
+    /// them is text.
+    fn takes_drops(&self) -> bool {
+        !self.focus.is_overlay() && self.db_error.is_none() && self.chat_filter.is_none()
+    }
+
+    /// Hang dropped files on the composer as chips. `Enter` sends them.
+    fn attach_dropped(&mut self, files: Vec<PathBuf>) {
+        // The drop is the path the prompt was waiting for, so the prompt goes.
+        self.attach_prompt = None;
+        self.focus = Focus::Composer;
+        let note = match files.as_slice() {
+            [one] => format!("📎 {} — Enter sends", attachment_label(one)),
+            many => format!("📎 {} files — Enter sends", many.len()),
+        };
+        self.attached.extend(files);
+        self.status.toast(note);
+    }
+
+    /// Type a paste into the focused field.
+    ///
+    /// The composer takes newlines, because a draft is allowed to have them;
+    /// every other field is one line, so they arrive as spaces. Control
+    /// characters are dropped rather than typed.
+    fn paste_text(&mut self, text: &str) {
+        let newlines = self.focus == Focus::Composer && self.attach_prompt.is_none();
+        let mut cleaned = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\r' | '\n' => {
+                    if c == '\r' && chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    cleaned.push(if newlines { '\n' } else { ' ' });
+                }
+                '\t' => cleaned.push(' '),
+                c if c.is_control() => {}
+                c => cleaned.push(c),
+            }
+        }
+        self.edit(|field| {
+            for c in cleaned.chars() {
+                field.insert(c);
+            }
+        });
+    }
+
     /// Height the composer wants, borders included.
     #[must_use]
     pub fn composer_height(&self) -> u16 {
@@ -2844,9 +2941,12 @@ impl App {
     /// Height the composer's contents want, borders excluded.
     #[must_use]
     fn composer_lines(&self) -> u16 {
-        self.attach_prompt
+        let field = self
+            .attach_prompt
             .as_ref()
-            .map_or_else(|| self.composer.line_count(), TextField::line_count)
+            .map_or_else(|| self.composer.line_count(), TextField::line_count);
+        let chips = u16::try_from(self.attached.len()).unwrap_or(u16::MAX);
+        field.saturating_add(chips)
     }
 }
 
@@ -2947,6 +3047,16 @@ fn expand_path(raw: &str) -> PathBuf {
         return expanded;
     }
     std::env::current_dir().map_or(expanded.clone(), |cwd| cwd.join(expanded))
+}
+
+/// The name a file is shown under: the last component, or a word when it has
+/// none. Never the whole path — a chip is a name, not a location.
+#[must_use]
+fn attachment_label(path: &std::path::Path) -> String {
+    path.file_name().map_or_else(
+        || "attachment".to_string(),
+        |name| name.to_string_lossy().to_string(),
+    )
 }
 
 /// What `y` puts on the clipboard: the body, or the names of what was sent when
@@ -3845,6 +3955,124 @@ mod tests {
             "the file goes out as a file"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A scratch directory of this test's own, deleted on the way out. Nothing
+    /// under it is anybody's real file.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("msgs-drop-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        dir
+    }
+
+    #[test]
+    fn a_dropped_file_waits_on_the_composer_and_enter_sends_it_before_the_draft() {
+        let dir = scratch("one");
+        let file = dir.join("two words.png");
+        std::fs::write(&file, b"fixture").expect("scratch file");
+
+        let mut app = app_with_chat();
+        compose(&mut app, "look at this");
+        // What a terminal types when a file is dropped on it: the path with
+        // its space escaped, and a space on the end.
+        app.on_paste(&format!("{}\\ words.png ", dir.join("two").display()));
+
+        assert_eq!(app.attached, vec![file.clone()]);
+        assert_eq!(
+            app.composer.text(),
+            "look at this",
+            "the draft is untouched"
+        );
+        assert!(app.composer_height() > 3, "the chip takes a row");
+        let (toast, is_error) = app.status.active_toast().expect("a toast");
+        assert!(toast.contains("Enter sends"), "{toast}");
+        assert!(!is_error);
+
+        app.update(Action::Activate);
+        assert!(app.attached.is_empty());
+        let sent: Vec<Outgoing> = app
+            .outbox
+            .recorded()
+            .into_iter()
+            .map(|(_, _, what)| what)
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                Outgoing::File(file),
+                Outgoing::Text("look at this".to_string())
+            ],
+            "the file goes first, the draft after it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn several_dropped_files_keep_their_order_and_escape_drops_them() {
+        let dir = scratch("many");
+        let first = dir.join("a.png");
+        let second = dir.join("b.png");
+        std::fs::write(&first, b"a").expect("scratch file");
+        std::fs::write(&second, b"b").expect("scratch file");
+
+        let mut app = app_with_chat();
+        app.focus = Focus::Conversation;
+        app.on_paste(&format!("{} '{}' ", first.display(), second.display()));
+        assert_eq!(app.attached, vec![first, second]);
+        assert_eq!(app.focus, Focus::Composer, "a drop lands in the composer");
+
+        app.update(Action::Cancel);
+        assert!(app.attached.is_empty(), "Esc drops them");
+        assert_eq!(app.focus, Focus::Composer, "and stays in the composer");
+        assert!(app.outbox.recorded().is_empty(), "nothing was sent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_drop_answers_the_path_prompt_and_a_path_that_is_not_there_is_typed() {
+        let dir = scratch("prompt");
+        let file = dir.join("a.png");
+        std::fs::write(&file, b"a").expect("scratch file");
+
+        let mut app = app_with_chat();
+        app.update(Action::Attach);
+        app.on_paste(&format!("{} ", file.display()));
+        assert!(app.attach_prompt.is_none(), "the prompt got its answer");
+        assert_eq!(app.attached, vec![file]);
+
+        // A path to nothing is not a drop, so it is typed like any paste.
+        let mut app = app_with_chat();
+        app.on_paste("/nonexistent/msgs-test/nothing.png");
+        assert!(app.attached.is_empty());
+        assert_eq!(app.composer.text(), "/nonexistent/msgs-test/nothing.png");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_text_paste_is_typed_into_the_field_that_has_focus() {
+        let mut app = app_with_chat();
+        app.on_paste("two\r\nlines\tand a tab\u{7}");
+        assert_eq!(
+            app.composer.text(),
+            "two\nlines and a tab",
+            "the composer keeps newlines and drops control characters"
+        );
+
+        // The palette is one line, so a pasted newline arrives as a space.
+        let mut app = app_with_chat();
+        app.update(Action::OpenPalette);
+        app.on_paste("one\ntwo");
+        assert_eq!(app.palette.text(), "one two");
+
+        // And the path prompt is one line too.
+        let mut app = app_with_chat();
+        app.update(Action::Attach);
+        app.on_paste("one\ntwo");
+        assert_eq!(
+            app.attach_prompt.as_ref().expect("prompt").text(),
+            "one two"
+        );
     }
 
     #[test]

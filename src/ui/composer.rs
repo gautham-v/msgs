@@ -1,5 +1,6 @@
 //! The send box: a rounded hairline box with the `❯` prompt and the draft, a
-//! column in from either edge of the pane.
+//! column in from either edge of the pane. A file dropped from Finder waits
+//! above the draft as a `📎 name` chip until `Enter` sends it.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -44,7 +45,10 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, boxed);
 
     let text = field.text();
-    let (cursor_row, cursor_column) = cursor_cell(text, field.cursor());
+    let (text_row, cursor_column) = cursor_cell(text, field.cursor());
+    // The dropped files sit above the draft, so the cursor is that many rows
+    // further down than the text alone would put it.
+    let cursor_row = text_row + app.attached.len();
     // Keep the cursor line visible once the draft is taller than the box.
     let scroll = cursor_row.saturating_sub(usize::from(inner.height).saturating_sub(1));
 
@@ -53,7 +57,25 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         theme.gray
     });
-    let mut lines: Vec<Line> = Vec::new();
+    // One chip per dropped file, in the order they were dropped: a name, not
+    // a path, in the same gray a label is drawn in.
+    let mut lines: Vec<Line> = app
+        .attached
+        .iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .map_or_else(|| path.to_string_lossy(), |name| name.to_string_lossy());
+            let room = usize::from(inner.width).saturating_sub(usize::from(PROMPT_WIDTH) + 2);
+            Line::from(vec![
+                Span::styled(" 📎 ", Style::new().fg(theme.gray)),
+                Span::styled(
+                    super::format::truncate(&name, room.max(4)),
+                    Style::new().fg(theme.text_secondary),
+                ),
+            ])
+        })
+        .collect();
     if text.is_empty() {
         lines.push(Line::from(vec![
             Span::styled(PROMPT, prompt),

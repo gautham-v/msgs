@@ -12,8 +12,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
@@ -175,6 +176,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Resu
                     }
                 }
                 Event::Mouse(mouse) => app.on_mouse(mouse),
+                // A paste arrives whole rather than as a burst of keys, which
+                // is also how a file dragged from Finder lands: the terminal
+                // pastes its path.
+                Event::Paste(text) => app.on_paste(&text),
                 _ => {}
             }
             if app.should_quit {
@@ -192,6 +197,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Resu
 // The terminal modes we turned on, so the restore path can undo exactly those.
 static MOUSE_CAPTURED: AtomicBool = AtomicBool::new(false);
 static KEYBOARD_FLAGS_PUSHED: AtomicBool = AtomicBool::new(false);
+static BRACKETED_PASTE: AtomicBool = AtomicBool::new(false);
 
 fn setup_terminal(mouse: bool) -> Result<Terminal<CrosstermBackend<Stdout>>> {
     // Ask before raw mode so the query and its reply do not race the UI. A
@@ -205,6 +211,12 @@ fn setup_terminal(mouse: bool) -> Result<Terminal<CrosstermBackend<Stdout>>> {
 
     if mouse && execute!(out, EnableMouseCapture).is_ok() {
         MOUSE_CAPTURED.store(true, Ordering::SeqCst);
+    }
+    // Bracketed paste, so a pasted block arrives as one event instead of a
+    // burst of keystrokes — and so a file dragged in from Finder arrives as
+    // its path rather than as a line of typing.
+    if execute!(out, EnableBracketedPaste).is_ok() {
+        BRACKETED_PASTE.store(true, Ordering::SeqCst);
     }
     if enhanced
         && execute!(
@@ -225,6 +237,9 @@ fn restore_terminal() {
     let mut out = io::stdout();
     if KEYBOARD_FLAGS_PUSHED.swap(false, Ordering::SeqCst) {
         let _ = execute!(out, PopKeyboardEnhancementFlags);
+    }
+    if BRACKETED_PASTE.swap(false, Ordering::SeqCst) {
+        let _ = execute!(out, DisableBracketedPaste);
     }
     if MOUSE_CAPTURED.swap(false, Ordering::SeqCst) {
         let _ = execute!(out, DisableMouseCapture);

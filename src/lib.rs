@@ -12,6 +12,7 @@
 //! - [`jump`] — what the `Ctrl+K` palette matches and shows
 //! - [`keymap`] — keys to actions, and the table the help modal renders
 //! - [`media`] — inline pictures, and the files behind the attachment chips
+//! - [`paste`] — what a bracketed paste is: dropped files, or text
 //! - [`search`] — the FTS5 message index msgs keeps of its own
 //! - [`seen`] — the local read state, kept beside `chat.db` rather than in it
 //! - [`send`] — outbound messages, through Messages.app
@@ -31,6 +32,7 @@ pub mod db;
 pub mod jump;
 pub mod keymap;
 pub mod media;
+pub mod paste;
 pub mod search;
 pub mod seen;
 pub mod send;
