@@ -163,8 +163,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Resu
         // Drain everything queued before drawing again: a drag of the window
         // edge arrives as a burst of resize events, and one frame at the end
         // of the burst is the whole point of it.
+        // A live copy notice wants its row back on time, so the first wait is
+        // the sooner of the tick and its expiry.
         let mut waited = false;
-        while event::poll(if waited { Duration::ZERO } else { TICK })? {
+        while event::poll(if waited {
+            Duration::ZERO
+        } else {
+            app.next_wake(TICK)
+        })? {
             waited = true;
             match event::read()? {
                 // Terminals with the kitty keyboard protocol also report key

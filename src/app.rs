@@ -31,6 +31,10 @@ use crate::watch::Watcher;
 
 /// How long a toast stays on the status line.
 const TOAST_TTL: Duration = Duration::from_secs(2);
+
+/// How long the copy notice sits above the composer before it gives its row
+/// back.
+pub const NOTICE_TTL: Duration = Duration::from_secs(3);
 /// Rows moved per wheel notch.
 const WHEEL_ROWS: i16 = 3;
 /// Tallest the composer grows before it scrolls internally.
@@ -631,6 +635,13 @@ pub struct App {
     pub help_scroll: u16,
     /// Status line state.
     pub status: Status,
+    /// The `copied N chars to clipboard` line above the composer, and when it
+    /// was put there. Cleared by the next keystroke, the next copy, or
+    /// [`NOTICE_TTL`], whichever comes first.
+    notice: Option<(String, Instant)>,
+    /// How text reaches the clipboard. A field so a test can drive `y`
+    /// without touching the real pasteboard.
+    clipboard: fn(&str) -> Result<(), crate::shell::Error>,
     /// Rects from the last frame, for mouse hit-testing.
     pub panes: Panes,
     /// Last known mouse position, for the hover tint.
@@ -728,6 +739,8 @@ impl App {
             draft_target: None,
             help_scroll: 0,
             status,
+            notice: None,
+            clipboard: crate::shell::copy,
             panes: Panes::default(),
             hover: None,
             watcher: Watcher::off(),
@@ -1881,6 +1894,9 @@ impl App {
 
     /// Apply one action. This is the only place app state changes.
     pub fn update(&mut self, action: Action) {
+        // The copy notice answers one keystroke; the next one takes it away
+        // again, so its row goes back to the conversation.
+        self.notice = None;
         match action {
             Action::Quit => self.should_quit = true,
             Action::FocusNext => self.cycle_focus(true),
@@ -2664,10 +2680,47 @@ impl App {
             self.status.toast("nothing to copy in that message");
             return;
         }
-        match crate::shell::copy(&text) {
-            Ok(()) => self.status.toast("copied to the clipboard"),
+        self.copy_text(&text);
+    }
+
+    /// Put `text` on the clipboard and say how much of it went, above the
+    /// composer. Only the count is ever shown — never the text.
+    pub fn copy_text(&mut self, text: &str) {
+        match (self.clipboard)(text) {
+            Ok(()) => self.notify_copied(text.chars().count()),
+            // A failure is chrome's business, not the composer's: it stays a
+            // status-line error.
             Err(err) => self.status.error(format!("could not copy: {err}")),
         }
+    }
+
+    /// Say that `len` characters went to the clipboard, on the one line above
+    /// the composer.
+    pub fn notify_copied(&mut self, len: usize) {
+        let unit = if len == 1 { "char" } else { "chars" };
+        self.notice = Some((format!("copied {len} {unit} to clipboard"), Instant::now()));
+    }
+
+    /// The copy notice, while one is alive. `None` gives its row back to the
+    /// conversation.
+    #[must_use]
+    pub fn notice(&self) -> Option<&str> {
+        self.notice
+            .as_ref()
+            .filter(|(_, born)| born.elapsed() < NOTICE_TTL)
+            .map(|(text, _)| text.as_str())
+    }
+
+    /// How long the event loop may wait for input before drawing again: the
+    /// sooner of its own `tick` and the moment the copy notice expires, so the
+    /// row comes back without a keystroke.
+    #[must_use]
+    pub fn next_wake(&self, tick: Duration) -> Duration {
+        let Some((_, born)) = self.notice.as_ref() else {
+            return tick;
+        };
+        let left = NOTICE_TTL.saturating_sub(born.elapsed());
+        tick.min(left.max(Duration::from_millis(10)))
     }
 
     /// `Ctrl+L`: open the first link in the selected message.
@@ -2797,6 +2850,15 @@ impl App {
     /// Housekeeping between frames. Returns `true` if a redraw is needed.
     pub fn tick(&mut self) -> bool {
         let mut dirty = self.status.tick();
+        // An expired copy notice hands its row back to the conversation.
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|(_, born)| born.elapsed() >= NOTICE_TTL)
+        {
+            self.notice = None;
+            dirty = true;
+        }
         if let Some(search) = self.search.as_mut()
             && search.poll()
         {
@@ -3482,6 +3544,72 @@ mod tests {
         app.messages.set_len(1);
         app.focus = Focus::Conversation;
         app
+    }
+
+    #[test]
+    fn copying_a_message_says_how_much_went_above_the_composer() {
+        let mut app = app_with_message();
+        // Nothing in a test reaches the real pasteboard.
+        app.clipboard = |_| Ok(());
+
+        app.update(Action::CopySelection);
+        // Eight characters of invented text, and the count is the only thing
+        // that surfaces anywhere.
+        assert_eq!(app.notice(), Some("copied 8 chars to clipboard"));
+        assert!(
+            app.status.active_toast().is_none(),
+            "the header's row is left alone"
+        );
+
+        // The next keystroke gives the row back.
+        app.update(Action::SelectNext);
+        assert_eq!(app.notice(), None);
+    }
+
+    #[test]
+    fn the_copy_notice_counts_one_character_in_the_singular() {
+        let mut app = app();
+        app.notify_copied(1);
+        assert_eq!(app.notice(), Some("copied 1 char to clipboard"));
+        app.notify_copied(27);
+        assert_eq!(app.notice(), Some("copied 27 chars to clipboard"));
+    }
+
+    #[test]
+    fn the_copy_notice_expires_on_its_own() {
+        let tick = Duration::from_millis(250);
+        let mut app = app();
+        assert_eq!(app.next_wake(tick), tick, "nothing to wake up for");
+
+        app.notify_copied(27);
+        assert_eq!(app.next_wake(tick), tick, "a fresh notice outlasts a tick");
+
+        // Wind it back to just before the deadline: the loop must wake sooner
+        // than its own tick to take the row down.
+        let nearly = Instant::now()
+            .checked_sub(NOTICE_TTL - Duration::from_millis(20))
+            .expect("an instant inside the notice's life");
+        app.notice = Some(("copied 27 chars to clipboard".to_string(), nearly));
+        assert!(app.next_wake(tick) < tick);
+        assert!(app.notice().is_some(), "still alive");
+
+        let past = Instant::now()
+            .checked_sub(NOTICE_TTL)
+            .expect("an instant past the deadline");
+        app.notice = Some(("copied 27 chars to clipboard".to_string(), past));
+        assert_eq!(app.notice(), None, "expired");
+        assert!(app.tick(), "and the expiry is worth a frame");
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
+    fn a_copy_that_fails_stays_on_the_status_line() {
+        let mut app = app_with_message();
+        app.clipboard = |_| Err(crate::shell::Error::NotAvailable);
+        app.update(Action::CopySelection);
+        assert!(app.notice().is_none(), "no notice for a copy that did not");
+        let (_, is_error) = app.status.active_toast().expect("a toast");
+        assert!(is_error);
     }
 
     /// Your own reaction, as the database would hand it back.

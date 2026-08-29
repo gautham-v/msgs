@@ -1223,13 +1223,34 @@ fn copying_the_selected_message_reports_what_it_did() {
     let _ = frame(&mut app, 120, 34);
     press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
 
-    let (toast, _) = app.status.active_toast().expect("a toast");
-    assert!(
-        toast.contains("clipboard") || toast.contains("could not copy"),
-        "unexpected toast: {toast}"
-    );
-    // Nothing about the message body leaks onto the status line.
-    assert!(!toast.contains("sounds good"));
+    // The count goes on its own row above the composer; a machine with no
+    // clipboard helper gets an error on the status line instead.
+    match app.notice().map(str::to_string) {
+        Some(notice) => {
+            assert_eq!(notice, "copied 11 chars to clipboard");
+            assert!(
+                app.status.active_toast().is_none(),
+                "the header's row is left alone"
+            );
+            // Nothing about the message body reaches the notice.
+            assert!(!notice.contains("sounds good"));
+
+            let buffer = frame(&mut app, 120, 34);
+            let row = usize::from(app.panes.notice.expect("a row for the notice").y);
+            assert!(rows(&buffer)[row].contains(&notice));
+            // A row of its own, directly above the composer's box, never over
+            // a message.
+            assert_eq!(row + 1, usize::from(app.panes.composer.y));
+        }
+        None => {
+            let (toast, is_error) = app.status.active_toast().expect("a toast");
+            assert!(
+                is_error && toast.contains("could not copy"),
+                "unexpected toast: {toast}"
+            );
+            assert!(!toast.contains("sounds good"));
+        }
+    }
 }
 
 #[test]

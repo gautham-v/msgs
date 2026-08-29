@@ -221,12 +221,27 @@ paths and counts — never a name, a number, or a message.
 The app's chrome is the right end of the header row (the filter line, on a
 narrow terminal's list screen): `? help`, and before it the unread total while
 there is one — `3 unread in 2 chats · ? help` — and nothing when there is not.
-No bar along the bottom, no rule, no row of its own. Anything transient — a copy, a save, a send that was refused, the theme
+No bar along the bottom, no rule, no row of its own. Anything transient — a save, a send that was refused, the theme
 changing — takes the unread's place for two seconds and then gives it back;
 failures are drawn in the error color. Whether Messages.app is running, what
 the index is doing, and whether live updates are watching or polling are not
 on screen: `--check` reports them, and a problem with any of them lands under
 `NOTES` in the help modal.
+
+## Copying
+
+`y` puts the selected message on the pasteboard — `pbcopy`, or the OSC 52
+escape over SSH. The receipt is the one piece of chrome that is not in the
+corner: a single right-aligned line in the secondary gray, directly above the
+composer's box, reading `copied 27 chars to clipboard` (`1 char`, in the
+singular). It is a row of its own, taken off the bottom of the conversation
+only while it is showing, so it never covers a message; it gives the row back
+three seconds later, on the next keystroke, or on the next copy, whichever
+comes first.
+
+The count is all that is ever said. The text itself goes to the pasteboard and
+nowhere else — not to the status line, not to a log. A copy that could not
+happen at all is a status-line error like any other failure.
 
 ## Attachments
 
