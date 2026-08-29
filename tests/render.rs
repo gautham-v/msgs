@@ -684,8 +684,24 @@ fn five_hundred_chats_draw_only_what_fits_and_do_it_quickly() {
 use msgs::db::{AttachmentRef, Handle, Message, Tapback, TapbackAction, TapbackKind};
 
 /// Raw Messages timestamp `minutes` before now.
+/// The furthest back any test here reaches, in minutes.
+const SPAN: i64 = 60;
+
+/// `minutes` before an anchor that keeps the whole invented span inside today.
+///
+/// The day tests assert that the band says `Today`, so a suite that happens to
+/// run in the first [`SPAN`] minutes after midnight would otherwise date its
+/// oldest messages to yesterday and fail on the clock rather than on the code.
+/// Every message shifts by the same amount, so the gaps a run depends on are
+/// exactly the gaps the caller asked for.
 fn ago(minutes: i64) -> i64 {
-    let when = Local::now() - Duration::minutes(minutes);
+    let now = Local::now();
+    let earliest = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(|midnight| midnight.and_local_timezone(Local).single())
+        .map_or(now, |midnight| midnight + Duration::minutes(SPAN));
+    let when = now.max(earliest) - Duration::minutes(minutes);
     (when.timestamp() - 978_307_200) * 1_000_000_000
 }
 
