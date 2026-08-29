@@ -141,9 +141,34 @@ pub const BINDINGS: &[Binding] = &[
         scope: "composer",
     },
     Binding {
+        keys: "@",
+        description: "pick a file to attach, at the start of a word",
+        scope: "composer",
+    },
+    Binding {
         keys: "Alt+Enter",
         description: "newline without sending (Shift+Enter where supported)",
         scope: "composer",
+    },
+    Binding {
+        keys: "↑ ↓ / Tab",
+        description: "move through the files",
+        scope: "file picker",
+    },
+    Binding {
+        keys: "/",
+        description: "go into the highlighted directory",
+        scope: "file picker",
+    },
+    Binding {
+        keys: "Enter",
+        description: "attach the highlighted file",
+        scope: "file picker",
+    },
+    Binding {
+        keys: "Esc",
+        description: "close the picker, keeping the typed @",
+        scope: "file picker",
     },
     Binding {
         keys: "Ctrl+W",
@@ -227,6 +252,7 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         Focus::DbError => db_error_keys(key),
         Focus::Help => help_keys(key),
         Focus::Palette => palette_keys(key, ctrl, alt, shift),
+        Focus::FilePicker => file_picker_keys(key, ctrl, alt, shift),
         Focus::Reactions => reaction_keys(key),
         Focus::Composer => text_entry_keys(key, ctrl, alt, shift),
         Focus::ChatList | Focus::Conversation => navigation_keys(key, focus, ctrl, shift),
@@ -256,6 +282,19 @@ fn reaction_keys(key: KeyEvent) -> Option<Action> {
 fn palette_keys(key: KeyEvent, ctrl: bool, alt: bool, shift: bool) -> Option<Action> {
     match key.code {
         KeyCode::Tab | KeyCode::BackTab => Some(Action::PaletteFilter),
+        KeyCode::PageUp => Some(Action::PageUp),
+        KeyCode::PageDown => Some(Action::PageDown),
+        _ => text_entry_keys(key, ctrl, alt, shift),
+    }
+}
+
+/// The `@` picker is a list steered from a text field: `Tab` and the arrows
+/// move through the files instead of moving focus, and everything else is
+/// still typed into the draft, where it narrows the list.
+fn file_picker_keys(key: KeyEvent, ctrl: bool, alt: bool, shift: bool) -> Option<Action> {
+    match key.code {
+        KeyCode::Tab => Some(Action::SelectNext),
+        KeyCode::BackTab => Some(Action::SelectPrev),
         KeyCode::PageUp => Some(Action::PageUp),
         KeyCode::PageDown => Some(Action::PageDown),
         _ => text_entry_keys(key, ctrl, alt, shift),
@@ -541,6 +580,45 @@ mod tests {
                 Focus::DbError
             ),
             Some(Action::OpenPalette)
+        );
+    }
+
+    #[test]
+    fn the_file_picker_steers_a_list_and_still_types_into_the_draft() {
+        // `Tab` moves through the files rather than moving focus, and the
+        // arrows do what they do in any list.
+        assert_eq!(
+            resolve(key(KeyCode::Tab), Focus::FilePicker),
+            Some(Action::SelectNext)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::BackTab), Focus::FilePicker),
+            Some(Action::SelectPrev)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Down), Focus::FilePicker),
+            Some(Action::SelectNext)
+        );
+        // Everything else is still typing.
+        assert_eq!(
+            resolve(key(KeyCode::Char('r')), Focus::FilePicker),
+            Some(Action::Insert('r'))
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Char('/')), Focus::FilePicker),
+            Some(Action::Insert('/'))
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Enter), Focus::FilePicker),
+            Some(Action::Activate)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Esc), Focus::FilePicker),
+            Some(Action::Cancel)
+        );
+        assert_eq!(
+            resolve(key(KeyCode::Backspace), Focus::FilePicker),
+            Some(Action::Backspace)
         );
     }
 

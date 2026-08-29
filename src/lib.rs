@@ -9,6 +9,7 @@
 //! - [`config`] — the optional `~/.config/msgs/config.toml`
 //! - [`contacts`] — names for handles, out of the macOS Contacts stores
 //! - [`db`] — read-only queries against `chat.db`
+//! - [`filepick`] — what the composer's `@` file picker lists and matches
 //! - [`jump`] — what the `Ctrl+K` palette matches and shows
 //! - [`keymap`] — keys to actions, and the table the help modal renders
 //! - [`media`] — inline pictures, and the files behind the attachment chips
@@ -28,6 +29,7 @@ pub mod app;
 pub mod config;
 pub mod contacts;
 pub mod db;
+pub mod filepick;
 pub mod jump;
 pub mod keymap;
 pub mod media;

@@ -1,5 +1,6 @@
 //! The send box: a rounded hairline box with the `❯` prompt and the draft, a
-//! column in from either edge of the pane.
+//! column in from either edge of the pane, and a chip for every file the `@`
+//! picker has queued above it.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -15,7 +16,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let theme = &app.theme;
-    let focused = app.focus == Focus::Composer;
+    // The `@` picker takes the keys but not the draft: the cursor stays here
+    // while it is open, because that is where what is typed is going.
+    let focused = matches!(app.focus, Focus::Composer | Focus::FilePicker);
     let attaching = app.attach_prompt.as_ref();
     let field = attaching.unwrap_or(&app.composer);
 
@@ -44,7 +47,15 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, boxed);
 
     let text = field.text();
-    let (cursor_row, cursor_column) = cursor_cell(text, field.cursor());
+    // A queued file is a chip on a row of its own above the draft, which is
+    // what pushes the cursor's row down.
+    let chips = if attaching.is_some() {
+        Vec::new()
+    } else {
+        app.attachment_chips()
+    };
+    let (draft_row, cursor_column) = cursor_cell(text, field.cursor());
+    let cursor_row = draft_row + chips.len();
     // Keep the cursor line visible once the draft is taller than the box.
     let scroll = cursor_row.saturating_sub(usize::from(inner.height).saturating_sub(1));
 
@@ -54,6 +65,12 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         theme.gray
     });
     let mut lines: Vec<Line> = Vec::new();
+    for chip in &chips {
+        lines.push(Line::from(Span::styled(
+            format!(" {chip}"),
+            Style::new().fg(theme.text_secondary),
+        )));
+    }
     if text.is_empty() {
         lines.push(Line::from(vec![
             Span::styled(PROMPT, prompt),

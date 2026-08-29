@@ -152,7 +152,17 @@ binding applies.
 | Key | Action |
 |---|---|
 | `Ctrl+A` | attach a file |
+| `@` | pick a file to attach, at the start of a word |
 | `Alt+Enter` | newline without sending (Shift+Enter where supported) |
+
+**File picker** — the list an `@` opens above the composer
+
+| Key | Action |
+|---|---|
+| `↑` `↓` / `Tab` | move through the files |
+| `/` | go into the highlighted directory |
+| `Enter` | attach the highlighted file |
+| `Esc` | close the picker, keeping the typed @ |
 
 **Any text field** — the composer, the palette input, the chat-list filter
 
@@ -262,6 +272,22 @@ opens that one the same way — and `s` copies it into
 ` (2)` before the extension. Both read the file and nothing else; `chat.db` is
 untouched. `Ctrl+A` goes the other way and sends a file to the open
 conversation.
+
+An `@` at the start of a word in the composer goes the same way with a list
+instead of a typed path. It opens a picker just above the send box, listing
+what is in `~/Downloads`, `~/Desktop`, `~/Pictures`, `~/Documents`, and the
+directory msgs was started in — most recently modified first, two hundred
+entries at most, no hidden files, and nothing under `~/Library`. What is typed
+after the `@` stays in the draft and narrows the list, matched fuzzily against
+the path each entry is shown under; `↑` `↓` and `Tab` move, `/` goes into the
+highlighted directory, and a `Backspace` on a `/` comes back out of it. `Enter`
+takes the file, which lifts the `@` and everything typed after it back out of
+the draft and hangs the file above the box as a chip: `📎 report.pdf`. Those
+chips are sent, one message each, ahead of whatever was typed, so the words
+about a photo arrive under it; a `Backspace` on an empty draft takes the last
+one back off. An `@` after a letter — the one in an email address — is just a
+character, and `Esc` closes the picker leaving the `@` where it was typed,
+which is how a literal one is had at the start of a word.
 
 ## Reading
 

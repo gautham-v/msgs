@@ -9,6 +9,7 @@ pub mod chat_list;
 pub mod composer;
 pub mod conversation;
 pub mod db_error;
+pub mod filepick;
 pub mod format;
 pub mod help;
 pub mod message;
@@ -224,6 +225,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let hits = conversation::render(frame, app, panes.conversation);
     app.hits = hits;
     composer::render(frame, app, panes.composer);
+    // The `@` picker stands on top of the composer, so it goes on after it
+    // and before the chrome that shares the header's row.
+    if app.focus == Focus::FilePicker {
+        filepick::render(frame, app, area);
+    }
     // Last on its row, so it sits over the tail of a long title or filter.
     status::render(frame, app, panes.status);
 

@@ -53,7 +53,12 @@ Reactions need [`imsg`](https://github.com/steipete/imsg) (`brew install steipet
 | `y` | copy the selected message | conversation |
 | `Ctrl+L` | open the first link in the selected message | conversation |
 | `Ctrl+A` | attach a file | composer |
+| `@` | pick a file to attach, at the start of a word | composer |
 | `Alt+Enter` | newline without sending (Shift+Enter where supported) | composer |
+| `↑` `↓` / `Tab` | move through the files | file picker |
+| `/` | go into the highlighted directory | file picker |
+| `Enter` | attach the highlighted file | file picker |
+| `Esc` | close the picker, keeping the typed @ | file picker |
 | `Ctrl+W` | delete the word before the cursor | any text field |
 | `Ctrl+U` | clear the whole field | any text field |
 | `Tab` | cycle the filter: all / chats / messages / photos | jump palette |
