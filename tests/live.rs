@@ -365,13 +365,20 @@ fn clicking_the_pill_jumps_to_what_it_is_counting() {
     app.on_db_change();
     frame(&mut app, 100, 30);
 
+    // Press and release on the one cell: the press anchors a drag that could
+    // have been over the words, and the release is what makes it a click.
     let pill = app.hits.pill.expect("the pill was drawn");
-    app.on_mouse(crossterm::event::MouseEvent {
-        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        column: pill.x,
-        row: pill.y,
-        modifiers: crossterm::event::KeyModifiers::NONE,
-    });
+    for kind in [
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+    ] {
+        app.on_mouse(crossterm::event::MouseEvent {
+            kind,
+            column: pill.x,
+            row: pill.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+    }
     frame(&mut app, 100, 30);
 
     assert_eq!(app.new_below, 0);

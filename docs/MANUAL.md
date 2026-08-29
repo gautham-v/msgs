@@ -195,10 +195,16 @@ selection does: everything between the two ends in reading order, tinted as the
 pointer moves, and put on the clipboard the moment the button comes up. What is
 copied is what was on screen — the visible rows, joined with newlines, each
 trimmed of its trailing blanks, with neither the scrollbar's column nor the day
-band in it. The next click, `Esc`, or any scroll takes the selection away.
-Nothing else reads it: like `y`, the text goes to the pasteboard and nowhere
-else, and `y` still copies the whole selected message whichever way it was
-picked.
+band in it. A picture comes across as the blank cells it covers rather than as
+the sequence that drew it, and the tint stays off it. The next click, `Esc`, or
+any scroll takes the selection away. Nothing else reads it: like `y`, the text
+goes to the pasteboard and nowhere else, and `y` still copies the whole
+selected message whichever way it was picked.
+
+Because a press is also how a drag begins, a link, a picture, and the pill open
+on the release rather than on the press — so a selection that starts on a link
+selects the words instead of opening it. The block under the pointer is picked
+as soon as the button goes down either way.
 
 msgs captures the mouse to do all of this, which is what stops the terminal
 from drawing its own selection over the app. `--no-mouse` (or `mouse = false`

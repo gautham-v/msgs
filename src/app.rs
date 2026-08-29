@@ -1332,6 +1332,10 @@ impl App {
         self.messages.to_bottom();
         self.measured = Measured::default();
         self.convo = Scroll::default();
+        // Different words are about to be under it. Two short threads both sit
+        // at the top of the pane, so the scroll alone would not tell the frame
+        // that the drag was made over something else.
+        self.clear_selection();
         // A fresh conversation opens at its newest message, so nothing is
         // below the viewport for the pill to count.
         self.new_below = 0;
@@ -2227,6 +2231,7 @@ impl App {
         self.messages.set_len(0);
         self.convo = Scroll::default();
         self.measured = Measured::default();
+        self.clear_selection();
         self.focus = Focus::Composer;
         // The address is on screen in the header; it is not repeated here.
         self.status.toast("new message — type it and press Enter");
@@ -2960,16 +2965,23 @@ impl App {
                 self.clear_selection();
                 if let Some(pane) = target {
                     self.focus = pane;
-                    self.click(pane, position);
-                    // The press is also the anchor of a drag that may not
-                    // happen. A release on the same cell is a plain click and
-                    // takes it away again.
                     if pane == Focus::Conversation {
+                        // Picking the block under the pointer is instant, but
+                        // opening what is drawn on it waits for the button to
+                        // come up: the press is also the anchor of a drag, and
+                        // a drag that began on a link must not open it.
+                        if let Some(index) =
+                            self.hits.message_at(self.panes.conversation, position.y)
+                        {
+                            self.messages.selected = index;
+                        }
                         self.selection = Some(Selection::new(
                             position,
                             self.convo,
                             self.panes.conversation,
                         ));
+                    } else {
+                        self.click(pane, position);
                     }
                 }
             }
@@ -2982,6 +2994,18 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.focus.is_overlay() {
                     return;
+                }
+                // A press and a release on the one cell is a click, and only
+                // then does the link, the picture, or the pill under it do
+                // anything. It is answered from the anchor rather than from
+                // here, so a release the terminal reports a cell late still
+                // acts on what was pressed.
+                if let Some(anchor) = self
+                    .selection
+                    .filter(Selection::is_click)
+                    .map(|drag| drag.anchor)
+                {
+                    self.click(Focus::Conversation, anchor);
                 }
                 self.end_selection();
             }
@@ -3681,6 +3705,32 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_that_starts_on_a_link_selects_words_instead_of_opening_it() {
+        // Nothing here may reach the browser, so the assertion is that no
+        // route to it was ever taken: `open_link` toasts either way.
+        let mut app = with_measured_conversation(100);
+        app.hits = Hits {
+            rows: (0..20).map(|row| Some(row / 2)).collect(),
+            links: vec![crate::ui::conversation::LinkHit {
+                y: 5,
+                start: 38,
+                end: 60,
+                url: "https://example.invalid/page".to_string(),
+            }],
+            ..Hits::default()
+        };
+
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 5));
+        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 55, 8));
+        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 55, 8));
+        assert!(
+            app.status.active_toast().is_none(),
+            "a drag across a link is a drag, not a click on it"
+        );
+        assert!(app.copy_selection_pending, "and the words are what it took");
+    }
+
+    #[test]
     fn clicking_a_picture_selects_its_message_and_opens_it() {
         let mut app = with_measured_conversation(2);
         let mut row = message_row("IMG-0001");
@@ -3711,14 +3761,14 @@ mod tests {
             pill: None,
         };
 
-        app.on_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 36,
-            row: 7,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        });
-
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 36, 7));
         assert_eq!(app.focus, Focus::Conversation);
+        assert!(
+            app.status.active_toast().is_none(),
+            "the press anchors a drag and opens nothing"
+        );
+
+        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 36, 7));
         assert_eq!(app.messages.selected, 1, "the picture's own message");
         let (text, _) = app.status.active_toast().expect("a toast explains it");
         assert!(text.contains(media::NOT_DOWNLOADED), "{text}");

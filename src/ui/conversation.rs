@@ -367,7 +367,9 @@ pub fn selected_columns(selection: &Selection, area: Rect, row: u16) -> Option<(
 /// cells of each row, trailing blanks trimmed, rows joined with newlines.
 ///
 /// The cells are the words as the reader saw them — wrapping, the name column,
-/// and the clock included — because that is what was pointed at.
+/// and the clock included — because that is what was pointed at. A cell that
+/// holds a picture rather than a word comes across as a blank; see
+/// [`printable`].
 #[must_use]
 pub fn selection_text(buffer: &Buffer, area: Rect, selection: &Selection) -> String {
     let (start, end) = selection.span();
@@ -380,7 +382,7 @@ pub fn selection_text(buffer: &Buffer, area: Rect, selection: &Selection) -> Str
         let mut line = String::new();
         for column in first..last {
             if let Some(cell) = buffer.cell((column, row)) {
-                line.push_str(cell.symbol());
+                line.push_str(printable(cell.symbol()));
             }
         }
         if !first_row {
@@ -392,12 +394,36 @@ pub fn selection_text(buffer: &Buffer, area: Rect, selection: &Selection) -> Str
     out
 }
 
-/// Tint the selected cells with `bg_highlight`.
+/// A cell's symbol when it is text, and a blank when it is not.
+///
+/// A picture drawn through the kitty, iTerm2, or sixel protocol lives in the
+/// buffer as the escape sequence that draws it — one cell holding the whole
+/// base64 image — so copying a symbol verbatim would put raw control codes on
+/// the clipboard for anybody who dragged across a photo. Nothing but printable
+/// text is ever copied out of a frame.
+#[must_use]
+fn printable(symbol: &str) -> &str {
+    // The kitty protocol also spells its rows in unicode placeholders out of
+    // the private-use planes, which are no more text than an escape is.
+    let text = |c: char| {
+        !c.is_control() && !matches!(c, '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{10ffff}')
+    };
+    if symbol.chars().all(text) {
+        symbol
+    } else {
+        " "
+    }
+}
+
+/// Tint the selected cells with `bg_highlight`, leaving the pictures alone.
 ///
 /// The rows are already drawn; only the background under them changes, which
 /// is why this is done to the buffer rather than by a widget over the top —
-/// nothing a message says is covered by it.
-fn render_selection(frame: &mut Frame, app: &App, area: Rect) {
+/// nothing a message says is covered by it. `covered` is where the pictures
+/// actually landed, and the tint stays off those cells: a half-blocks picture
+/// keeps half of every pixel pair in the cell's own background, so a tint over
+/// one would repaint the photo rather than highlight it.
+fn render_selection(frame: &mut Frame, app: &App, area: Rect, covered: &[Rect]) {
     let Some(selection) = app.selection else {
         return;
     };
@@ -408,7 +434,11 @@ fn render_selection(frame: &mut Frame, app: &App, area: Rect) {
             continue;
         };
         for column in first..last {
-            if let Some(cell) = buffer.cell_mut((column, row)) {
+            let position = Position::new(column, row);
+            if covered.iter().any(|picture| picture.contains(position)) {
+                continue;
+            }
+            if let Some(cell) = buffer.cell_mut(position) {
                 cell.set_bg(highlight);
             }
         }
@@ -549,6 +579,8 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
     let text_x = area.x + MARGIN_LEFT;
     let text_width = message::row_width(area.width);
     let visible = app.convo.visible(heights, area.height);
+    // Where the pictures land, so the drag's tint can keep off them.
+    let mut covered: Vec<Rect> = Vec::new();
     for entry in &visible {
         let block = message::block(&ctx, entry.index, area.width);
         let selected = app.messages.selected == entry.index;
@@ -641,29 +673,31 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
             app.images
                 .render(frame.buffer_mut(), strip, offset, attachment, spot.room);
 
-            // Where it actually landed, so a click can open it. The rect comes
-            // from the very numbers the block reserved and `render` drew into,
-            // clipped to the pane rather than measured again.
-            // A link preview's picture is not a file the reader can open, so
-            // it registers no hit and a click on it does nothing.
-            let Some(index) = spot.picture.attachment() else {
-                continue;
-            };
+            // Where it actually landed, so a click can open it and the drag's
+            // tint can stay off it. The rect comes from the very numbers the
+            // block reserved and `render` drew into, clipped to the pane
+            // rather than measured again.
             let bottom = (top + i32::from(spot.rows)).min(i32::from(area.y + area.height));
             let visible_top = top.max(i32::from(area.y));
             if bottom > visible_top {
                 let y = u16::try_from(visible_top).unwrap_or(area.y);
                 let height = u16::try_from(bottom - visible_top).unwrap_or_default();
-                hits.images.push(ImageHit {
-                    rect: Rect {
-                        x: strip.x,
-                        y,
-                        width: strip.width,
-                        height,
-                    },
-                    message: entry.index,
-                    attachment: index,
-                });
+                let rect = Rect {
+                    x: strip.x,
+                    y,
+                    width: strip.width,
+                    height,
+                };
+                covered.push(rect);
+                // A link preview's picture is not a file the reader can open,
+                // so it registers no hit and a click on it does nothing.
+                if let Some(index) = spot.picture.attachment() {
+                    hits.images.push(ImageHit {
+                        rect,
+                        message: entry.index,
+                        attachment: index,
+                    });
+                }
             }
         }
 
@@ -687,7 +721,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
     render_scrollbar(frame, app, area, heights);
     // The drag's tint goes on last of the words, and before the pill so the
     // pill stays legible over it.
-    render_selection(frame, app, area);
+    render_selection(frame, app, area, &covered);
     hits.pill = render_new_pill(frame, app, area);
     hits
 }
@@ -1053,5 +1087,26 @@ mod tests {
         let selection = drag((1, 0), (1, 0), area);
         assert!(selection.is_click());
         assert_eq!(selection_text(&buffer, area, &selection), "b");
+    }
+
+    #[test]
+    fn a_picture_is_never_copied_out_of_the_frame_as_the_escape_that_drew_it() {
+        // What ratatui-image leaves in the buffer for a kitty, iTerm2, or
+        // sixel picture: one cell holding the whole sequence, the rest of the
+        // row skipped. None of it is text, and none of it may reach the
+        // pasteboard — a terminal that read it back would act on it.
+        let (mut buffer, area) = pane();
+        let escape = "\u{1b}_Gf=32,s=8,v=8,m=0;AAAA\u{1b}\\\u{10eeee}\u{305}\u{305}";
+        buffer[(2, 1)].set_symbol(escape);
+        buffer[(3, 1)].set_symbol("\u{10eeee}");
+
+        let selection = drag((0, 1), (5, 1), area);
+        let copied = selection_text(&buffer, area, &selection);
+        assert_eq!(copied, "ij");
+        assert!(!copied.contains('\u{1b}'), "no escape leaves the frame");
+
+        assert_eq!(printable("a"), "a");
+        assert_eq!(printable("▀"), "▀", "a half-blocks picture is drawable");
+        assert_eq!(printable(escape), " ");
     }
 }
