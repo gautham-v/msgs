@@ -26,6 +26,11 @@ pub const HANDLE_CASEY: i64 = 3;
 pub const CHAT_DIRECT: i64 = 1;
 pub const CHAT_GROUP: i64 = 2;
 pub const CHAT_EMPTY: i64 = 3;
+/// The second `chat` row for [`DIRECT_ADDRESS`], on the other service.
+///
+/// The database keeps one row per service for the same person, which is what
+/// `Chat::rowids` folds back into a single conversation.
+pub const CHAT_DIRECT_SMS: i64 = 4;
 
 /// `chat.original_group_id` of [`CHAT_GROUP`], which is what Messages.app's
 /// pin state refers to a group by. Invented, like every other id here.
@@ -42,6 +47,9 @@ pub const MSG_UNREAD: i64 = 4;
 pub const MSG_GROUP_FIRST: i64 = 10;
 pub const MSG_GROUP_REPLY: i64 = 11;
 pub const MSG_GROUP_RENAME: i64 = 12;
+/// The two messages that arrived on [`CHAT_DIRECT_SMS`], the second unread.
+pub const MSG_SMS_READ: i64 = 20;
+pub const MSG_SMS_UNREAD: i64 = 21;
 
 /// Body text that only exists inside `attributedBody`, never in `text`.
 pub const ATTRIBUTED_BODY: &str = "recovered from the typedstream";
@@ -572,6 +580,15 @@ fn build(path: &Path) -> rusqlite::Result<()> {
         Some("Fixture Group"),
     )?;
     chat(&conn, CHAT_EMPTY, "iMessage;-;+15550000009", 45, None)?;
+    // The same person again, on the other service: Messages.app shows one
+    // conversation, the database keeps two rows. The identifier is written the
+    // way the other service writes it, so only normalizing the two addresses
+    // brings them together.
+    chat(&conn, CHAT_DIRECT_SMS, "SMS;-;+15550000001", 45, None)?;
+    conn.execute(
+        "UPDATE chat SET chat_identifier = ?1, service_name = 'SMS' WHERE ROWID = ?2",
+        rusqlite::params!["5550000001", CHAT_DIRECT_SMS],
+    )?;
     // Messages.app's pin state names a group by this, not by its rowid or its
     // guid; the value is invented like everything else here.
     conn.execute(
@@ -581,6 +598,7 @@ fn build(path: &Path) -> rusqlite::Result<()> {
 
     for (chat_id, handle_id) in [
         (CHAT_DIRECT, HANDLE_ALEX),
+        (CHAT_DIRECT_SMS, HANDLE_ALEX),
         (CHAT_GROUP, HANDLE_ALEX),
         (CHAT_GROUP, HANDLE_BAILEY),
         (CHAT_GROUP, HANDLE_CASEY),
@@ -645,6 +663,35 @@ fn build(path: &Path) -> rusqlite::Result<()> {
             from_me: false,
             date: BASE + 300 * SECOND,
             text: Some("still unread"),
+            ..Row::default()
+        },
+    )?;
+
+    // Two messages on the other service's row for the same person, both
+    // older than the newest message on the iMessage row, so the conversation
+    // still answers to `CHAT_DIRECT`.
+    message(
+        &conn,
+        Row {
+            rowid: MSG_SMS_READ,
+            chat: CHAT_DIRECT_SMS,
+            handle: HANDLE_ALEX,
+            from_me: false,
+            date: BASE + 150 * SECOND,
+            text: Some("sent the other way"),
+            read: true,
+            ..Row::default()
+        },
+    )?;
+    message(
+        &conn,
+        Row {
+            rowid: MSG_SMS_UNREAD,
+            chat: CHAT_DIRECT_SMS,
+            handle: HANDLE_ALEX,
+            from_me: false,
+            date: BASE + 200 * SECOND,
+            text: Some("and this one is new"),
             ..Row::default()
         },
     )?;

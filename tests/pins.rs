@@ -257,3 +257,27 @@ fn the_preference_file_is_only_ever_read() {
         stamp
     );
 }
+
+#[test]
+fn a_pinned_person_with_two_service_rows_is_pinned_once() {
+    let scratch = Scratch::new("merged");
+    let plist = fixtures::pinning_plist(&scratch.dir, &[fixtures::DIRECT_ADDRESS], &[]);
+
+    let mut app = app();
+    app.enable_pins(Pins::load(&plist));
+
+    assert_eq!(app.pinned_visible, 1, "one entry, not one per service");
+    let pinned: Vec<i64> = app
+        .chat_rows
+        .iter()
+        .filter(|chat| chat.is_pinned())
+        .map(|chat| chat.rowid)
+        .collect();
+    assert_eq!(pinned, vec![fixtures::CHAT_DIRECT]);
+    // The row that was merged away is not a second entry anywhere in the list.
+    assert!(
+        app.chat_rows
+            .iter()
+            .all(|chat| chat.rowid != fixtures::CHAT_DIRECT_SMS)
+    );
+}

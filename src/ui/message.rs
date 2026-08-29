@@ -930,6 +930,7 @@ mod tests {
     fn chat(is_group: bool) -> Chat {
         Chat {
             rowid: 1,
+            rowids: vec![1],
             guid: "iMessage;-;chat1".to_string(),
             identifier: Some("chat1".to_string()),
             group_id: None,

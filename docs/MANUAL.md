@@ -9,7 +9,7 @@ Built with Rust + [ratatui](https://ratatui.rs). Visual grammar borrowed from Gr
 Design mockups: [`mockups.html`](mockups.html).
 
 ```
-  / filter                   │ Alex Nakamura · iMessage · +1 (55…  2 unread in 2 chats · ? help
+  / filter                   │ Alex Nakamura · iMessage · +1 (55…  3 unread in 2 chats · ? help
                              │──────────────────────────────────────────────────────────────────
   Fixture Group     5/18/22  │ May 18, 2022
   Bailey: named the conver…  │
@@ -22,9 +22,9 @@ Design mockups: [`mockups.html`](mockups.html).
                              │      ┄ 📷  photo.png · 2.0 KB · (not downloaded on t… ┄
                              │      Read 12:33 AM
                              │
-                             │ Alex  still unread                                      12:34 AM
-                             │
-                             │
+                             │ Alex  sent the other way                                12:32 AM
+                             │       and this one is new                               12:33 AM
+                             │       still unread                                      12:34 AM
                              │
                              │
                              │
@@ -410,6 +410,16 @@ URI, and `PRAGMA query_only`. Nothing in msgs can write to it. macOS keeps the
 database in WAL mode, so if a read is refused because Messages.app holds the
 file, msgs copies `chat.db` and its `-wal` / `-shm` sidecars to a scratch
 directory, reads the copy, and deletes the copy on exit.
+
+One person is one conversation. The database keeps a separate `chat` row per
+service for the same address — an iMessage row beside an SMS one, sometimes an
+RCS one — and msgs folds them back into a single entry in the list, the way
+Messages.app shows them: one row, the unread counts added up, and one thread
+holding every message from all of them interleaved by date. Addresses are
+matched the way contact lookup matches them, so a number written two ways is
+still one person. Group conversations are never merged this way — a group is a
+thread id, not an address. A reply goes out on whichever service the newest
+message came in on, and Messages.app picks the service per recipient from there.
 
 Conversations load a page at a time from the newest end, so opening a thread
 with 25,000 messages in it costs the same as opening a short one. Scrolling past

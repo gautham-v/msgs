@@ -381,7 +381,13 @@ fn message_rows(
     now: DateTime<Local>,
     columns: usize,
 ) -> Vec<Row> {
-    let by_rowid: HashMap<i64, &Chat> = chats.iter().map(|chat| (chat.rowid, chat)).collect();
+    // A hit carries the `chat` row the message was joined to, which may be one
+    // of several rows merged into a single conversation, so every member rowid
+    // points at the conversation the jump should open.
+    let by_rowid: HashMap<i64, &Chat> = chats
+        .iter()
+        .flat_map(|chat| chat.rowid_set().iter().map(move |rowid| (*rowid, chat)))
+        .collect();
     hits.iter()
         .filter_map(|hit| {
             // A hit in a conversation that is no longer in the list has
@@ -435,7 +441,7 @@ fn message_row(
         } else {
             Kind::Message
         },
-        chat_rowid: hit.chat_rowid,
+        chat_rowid: chat.rowid,
         message_rowid: Some(hit.message_rowid),
         label: chat.title(),
         label_hits: Vec::new(),

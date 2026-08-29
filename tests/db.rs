@@ -22,11 +22,13 @@ fn the_fixture_opens_read_only_and_in_place() {
     assert!(db.scratch_path().is_none());
 
     let counts = db.counts().expect("counts");
-    assert_eq!(counts.chats, 3);
+    // Four `chat` rows, but three conversations: two of the rows are the same
+    // person on two services.
+    assert_eq!(counts.chats, 4);
     assert_eq!(counts.handles, 3);
     assert_eq!(counts.attachments, 1);
-    // Seven real messages plus four tapback rows.
-    assert_eq!(counts.messages, 11);
+    // Nine real messages plus four tapback rows.
+    assert_eq!(counts.messages, 13);
 }
 
 #[test]
@@ -79,7 +81,12 @@ fn chats_come_back_newest_first_with_participants_and_counts() {
     assert_eq!(direct.participants.len(), 1);
     assert!(direct.display_name.is_none());
     // Tapback rows must not be counted as messages.
-    assert_eq!(direct.message_count, 4);
+    // Both of the address's `chat` rows, counted once as one conversation.
+    assert_eq!(direct.message_count, 6);
+    assert_eq!(
+        direct.rowid_set(),
+        [fixtures::CHAT_DIRECT, fixtures::CHAT_DIRECT_SMS]
+    );
 
     let empty = &chats[2];
     assert_eq!(empty.message_count, 0);
@@ -95,9 +102,10 @@ fn unread_counts_only_incoming_unread_messages() {
         .find(|chat| chat.rowid == fixtures::CHAT_DIRECT)
         .expect("the direct chat");
 
-    // One incoming message is unread. The outgoing one, the read ones, and the
-    // tapback rows do not count.
-    assert_eq!(direct.unread_count, 1);
+    // One incoming message is unread on each of the two rows behind the
+    // conversation. The outgoing one, the read ones, and the tapback rows do
+    // not count.
+    assert_eq!(direct.unread_count, 2);
     assert!(direct.is_unread());
 
     // The group holds one unread reply; its rename event is not a message and
@@ -109,7 +117,7 @@ fn unread_counts_only_incoming_unread_messages() {
     assert_eq!(group.unread_count, 1);
 
     let (total, chats_with_unread) = db.unread_totals().expect("totals");
-    assert_eq!(total, 2);
+    assert_eq!(total, 3);
     assert_eq!(chats_with_unread, 2);
 }
 
@@ -142,7 +150,7 @@ fn handles_come_back_in_rowid_order() {
 #[test]
 fn a_conversation_page_is_oldest_first_and_excludes_tapback_rows() {
     let page = db()
-        .messages_before(fixtures::CHAT_DIRECT, None, 50)
+        .messages_before(&[fixtures::CHAT_DIRECT], None, 50)
         .expect("page");
 
     let rowids: Vec<i64> = page.iter().map(|message| message.rowid).collect();
@@ -169,7 +177,7 @@ fn a_conversation_page_is_oldest_first_and_excludes_tapback_rows() {
 fn paging_walks_backwards_through_a_conversation() {
     let db = db();
     let newest = db
-        .messages_before(fixtures::CHAT_DIRECT, None, 2)
+        .messages_before(&[fixtures::CHAT_DIRECT], None, 2)
         .expect("newest page");
     assert_eq!(
         newest.iter().map(|m| m.rowid).collect::<Vec<_>>(),
@@ -177,7 +185,11 @@ fn paging_walks_backwards_through_a_conversation() {
     );
 
     let older = db
-        .messages_before(fixtures::CHAT_DIRECT, Some(newest[0].rowid), 2)
+        .messages_before(
+            &[fixtures::CHAT_DIRECT],
+            Some((newest[0].date, newest[0].rowid)),
+            2,
+        )
         .expect("older page");
     assert_eq!(
         older.iter().map(|m| m.rowid).collect::<Vec<_>>(),
@@ -185,7 +197,11 @@ fn paging_walks_backwards_through_a_conversation() {
     );
 
     let top = db
-        .messages_before(fixtures::CHAT_DIRECT, Some(older[0].rowid), 2)
+        .messages_before(
+            &[fixtures::CHAT_DIRECT],
+            Some((older[0].date, older[0].rowid)),
+            2,
+        )
         .expect("above the top");
     assert!(top.is_empty());
 }
@@ -193,10 +209,10 @@ fn paging_walks_backwards_through_a_conversation() {
 #[test]
 fn new_messages_can_be_fetched_by_watermark() {
     let db = db();
-    assert_eq!(db.max_message_rowid().expect("watermark"), 12);
+    assert_eq!(db.max_message_rowid().expect("watermark"), 21);
 
     let since = db
-        .messages_after(fixtures::CHAT_DIRECT, fixtures::MSG_ATTRIBUTED, 50)
+        .messages_after(&[fixtures::CHAT_DIRECT], fixtures::MSG_ATTRIBUTED, 50)
         .expect("messages after");
     assert_eq!(
         since.iter().map(|m| m.rowid).collect::<Vec<_>>(),
@@ -207,7 +223,7 @@ fn new_messages_can_be_fetched_by_watermark() {
 #[test]
 fn a_body_that_only_lives_in_attributed_body_is_recovered() {
     let page = db()
-        .messages_before(fixtures::CHAT_DIRECT, None, 50)
+        .messages_before(&[fixtures::CHAT_DIRECT], None, 50)
         .expect("page");
     let recovered = page
         .iter()
@@ -219,7 +235,7 @@ fn a_body_that_only_lives_in_attributed_body_is_recovered() {
 #[test]
 fn an_attachment_only_message_has_a_file_and_no_body() {
     let page = db()
-        .messages_before(fixtures::CHAT_DIRECT, None, 50)
+        .messages_before(&[fixtures::CHAT_DIRECT], None, 50)
         .expect("page");
     let photo = page
         .iter()
@@ -243,7 +259,7 @@ fn an_attachment_only_message_has_a_file_and_no_body() {
 
 /// The link fixture's page, oldest first.
 fn link_page(db: &Db) -> Vec<msgs::db::Message> {
-    db.messages_before(fixtures::LINK_CHAT, None, 50)
+    db.messages_before(&[fixtures::LINK_CHAT], None, 50)
         .expect("page")
 }
 
@@ -325,7 +341,7 @@ fn a_database_without_the_payload_columns_simply_has_no_previews() {
     let db = db();
     assert!(db.schema().link_preview);
     assert!(
-        db.messages_before(fixtures::CHAT_DIRECT, None, 50)
+        db.messages_before(&[fixtures::CHAT_DIRECT], None, 50)
             .expect("page")
             .iter()
             .all(|message| message.link_preview.is_none()),
@@ -355,7 +371,7 @@ fn o_on_a_link_opens_it_when_there_is_no_file_to_open() {
 #[test]
 fn tapbacks_land_on_their_target_with_removals_already_applied() {
     let page = db()
-        .messages_before(fixtures::CHAT_DIRECT, None, 50)
+        .messages_before(&[fixtures::CHAT_DIRECT], None, 50)
         .expect("page");
     let target = page
         .iter()
@@ -380,7 +396,7 @@ fn tapbacks_land_on_their_target_with_removals_already_applied() {
 #[test]
 fn a_group_rename_reads_as_an_announcement_not_a_message() {
     let page = db()
-        .messages_before(fixtures::CHAT_GROUP, None, 50)
+        .messages_before(&[fixtures::CHAT_GROUP], None, 50)
         .expect("page");
     let rename = page
         .iter()
@@ -407,7 +423,7 @@ fn a_group_rename_reads_as_an_announcement_not_a_message() {
 #[test]
 fn an_empty_chat_pages_to_nothing_rather_than_failing() {
     let page = db()
-        .messages_before(fixtures::CHAT_EMPTY, None, 50)
+        .messages_before(&[fixtures::CHAT_EMPTY], None, 50)
         .expect("page");
     assert!(page.is_empty());
 }
@@ -419,12 +435,13 @@ fn the_app_loads_the_fixture_and_reports_it_on_the_status_line() {
 
     assert_eq!(app.status.db, DbStatus::Ready);
     assert!(app.db_error.is_none());
+    // Four `chat` rows, three conversations.
     assert_eq!(app.chat_rows.len(), 3);
-    assert_eq!(app.status.unread_total, 2);
+    assert_eq!(app.status.unread_total, 3);
     assert_eq!(app.status.unread_chats, 2);
 
     app.load_conversation(fixtures::CHAT_DIRECT);
-    assert_eq!(app.message_rows.len(), 4);
+    assert_eq!(app.message_rows.len(), 6);
 }
 
 #[test]
@@ -434,7 +451,7 @@ fn the_app_pages_older_messages_in_above_the_ones_it_has() {
 
     let db = app.db.as_ref().expect("an open database");
     app.message_rows = db
-        .messages_before(fixtures::CHAT_DIRECT, None, 2)
+        .messages_before(&[fixtures::CHAT_DIRECT], None, 2)
         .expect("newest page");
 
     assert_eq!(app.load_older_messages(), 2);
@@ -528,7 +545,7 @@ fn opening_the_database_selects_the_newest_chat_and_loads_it() {
         Some(fixtures::CHAT_DIRECT)
     );
     assert_eq!(app.open_chat, Some(fixtures::CHAT_DIRECT));
-    assert_eq!(app.message_rows.len(), 4);
+    assert_eq!(app.message_rows.len(), 6);
 
     // The empty chat opens to nothing rather than keeping the last one.
     app.update(Action::SelectNext);
@@ -567,15 +584,17 @@ fn filtering_the_list_narrows_it_and_opens_what_is_left() {
 fn a_chat_can_say_how_many_files_and_how_many_pictures_it_holds() {
     let db = db();
     assert_eq!(
-        db.attachment_counts(fixtures::CHAT_DIRECT).expect("counts"),
+        db.attachment_counts(&[fixtures::CHAT_DIRECT])
+            .expect("counts"),
         (1, 1),
         "one attachment, and it is a picture"
     );
     assert_eq!(
-        db.attachment_counts(fixtures::CHAT_GROUP).expect("counts"),
+        db.attachment_counts(&[fixtures::CHAT_GROUP])
+            .expect("counts"),
         (0, 0)
     );
-    assert_eq!(db.attachment_counts(999_999).expect("counts"), (0, 0));
+    assert_eq!(db.attachment_counts(&[999_999]).expect("counts"), (0, 0));
 }
 
 #[test]
@@ -617,7 +636,7 @@ fn an_echo_is_retired_when_its_own_row_shows_up_in_the_database() {
     app.open_db(fixtures::database());
     app.update(Action::SelectNext);
     assert_eq!(app.open_chat, Some(fixtures::CHAT_DIRECT));
-    assert_eq!(app.message_rows.len(), 4);
+    assert_eq!(app.message_rows.len(), 6);
 
     // The fixture's own outgoing row carries a file. Rewind the page to just
     // before it and stand an echo of it in its place, which is exactly the
@@ -652,7 +671,7 @@ fn an_echo_is_retired_when_its_own_row_shows_up_in_the_database() {
     assert_eq!(app.pending.len(), 1);
     assert_eq!(app.pending[0].chat_rowid, fixtures::CHAT_GROUP);
     // The real rows are back, and the retired echo is not among them.
-    assert_eq!(app.message_rows.len(), 4);
+    assert_eq!(app.message_rows.len(), 6);
     assert!(app.message_rows.iter().any(|message| message.guid == guid));
     assert!(
         !app.message_rows
@@ -690,5 +709,108 @@ fn an_echo_whose_row_never_arrives_stops_being_a_send_in_progress() {
         app.message_rows
             .last()
             .is_some_and(|message| message.guid.starts_with(msgs::send::PENDING_PREFIX))
+    );
+}
+
+#[test]
+fn the_two_service_rows_for_one_address_are_one_conversation() {
+    let db = db();
+    let chats = db.chats().expect("chats");
+
+    // Four `chat` rows, three entries in the list, and the address appears in
+    // exactly one of them.
+    assert_eq!(chats.len(), 3);
+    let holding: Vec<i64> = chats
+        .iter()
+        .filter(|chat| chat.owns(fixtures::CHAT_DIRECT_SMS))
+        .map(|chat| chat.rowid)
+        .collect();
+    assert_eq!(holding, vec![fixtures::CHAT_DIRECT]);
+
+    let direct = chats
+        .iter()
+        .find(|chat| chat.rowid == fixtures::CHAT_DIRECT)
+        .expect("the direct conversation");
+    // The newest row is the identity, and the other one comes with it.
+    assert_eq!(
+        direct.rowid_set(),
+        [fixtures::CHAT_DIRECT, fixtures::CHAT_DIRECT_SMS]
+    );
+    assert_eq!(direct.service.as_deref(), Some("iMessage"));
+    // One person, not two, however many rows they are spread over.
+    assert_eq!(direct.participants.len(), 1);
+    // Both rows' unread, counted once.
+    assert_eq!(direct.unread_count, 2);
+    assert_eq!(direct.message_count, 6);
+}
+
+#[test]
+fn a_merged_thread_is_both_rows_in_date_order() {
+    let page = db()
+        .messages_before(
+            &[fixtures::CHAT_DIRECT, fixtures::CHAT_DIRECT_SMS],
+            None,
+            50,
+        )
+        .expect("the merged page");
+
+    let dates: Vec<i64> = page.iter().map(|message| message.date).collect();
+    let mut sorted = dates.clone();
+    sorted.sort_unstable();
+    assert_eq!(dates, sorted, "a page is drawn oldest first");
+
+    let rowids: Vec<i64> = page.iter().map(|message| message.rowid).collect();
+    assert_eq!(
+        rowids,
+        vec![
+            fixtures::MSG_PLAIN,
+            fixtures::MSG_ATTRIBUTED,
+            fixtures::MSG_PHOTO,
+            fixtures::MSG_SMS_READ,
+            fixtures::MSG_SMS_UNREAD,
+            fixtures::MSG_UNREAD,
+        ],
+        "the other service's rows are interleaved, not appended"
+    );
+    // Every row is stamped with the conversation, not with the row it came off.
+    assert!(
+        page.iter()
+            .all(|message| message.chat_rowid == fixtures::CHAT_DIRECT)
+    );
+}
+
+#[test]
+fn opening_the_merged_conversation_loads_both_rows() {
+    let mut app = App::new(Config::default(), Vec::new());
+    app.open_db(fixtures::database());
+    app.load_conversation(fixtures::CHAT_DIRECT);
+    assert_eq!(app.message_rows.len(), 6);
+    assert!(
+        app.message_rows
+            .iter()
+            .any(|message| message.rowid == fixtures::MSG_SMS_UNREAD)
+    );
+    // Paging upward through a merged thread walks it in date order too.
+    let oldest = app.message_rows[3].clone();
+    let above = app
+        .db
+        .as_ref()
+        .expect("the database")
+        .messages_before(
+            &[fixtures::CHAT_DIRECT, fixtures::CHAT_DIRECT_SMS],
+            Some((oldest.date, oldest.rowid)),
+            50,
+        )
+        .expect("the page above");
+    assert_eq!(
+        above
+            .iter()
+            .map(|message| message.rowid)
+            .collect::<Vec<_>>(),
+        vec![
+            fixtures::MSG_PLAIN,
+            fixtures::MSG_ATTRIBUTED,
+            fixtures::MSG_PHOTO
+        ]
     );
 }

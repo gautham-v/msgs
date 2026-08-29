@@ -63,14 +63,15 @@ fn opening_a_chat_clears_its_badge_here() {
     let scratch = Scratch::new("opening");
     let mut app = app();
 
-    // Two chats hold one unread message each before msgs has shown either.
-    assert_eq!(app.status.unread_total, 2);
+    // Two chats hold unread messages before msgs has shown either; one of
+    // them is two `chat` rows for the same person, counted once as three.
+    assert_eq!(app.status.unread_total, 3);
     assert_eq!(app.status.unread_chats, 2);
 
     // Enabling the state marks whatever is already on screen, which is the
     // conversation the list opens on.
     app.enable_seen(&scratch.path());
-    assert_eq!(app.status.unread_total, 1);
+    assert_eq!(app.status.unread_total, 2);
 
     app.open_chat_row(fixtures::CHAT_DIRECT);
     app.open_chat_row(fixtures::CHAT_GROUP);
@@ -84,7 +85,7 @@ fn opening_a_chat_clears_its_badge_here() {
             .iter()
             .map(|chat| chat.unread_count)
             .sum::<i64>(),
-        2
+        3
     );
 }
 
@@ -115,7 +116,7 @@ fn ctrl_u_marks_everything_seen_and_gives_it_back() {
     assert_eq!(app.status.unread_total, 0, "everything marked seen");
 
     press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
-    assert_eq!(app.status.unread_total, 2, "the database's counts are back");
+    assert_eq!(app.status.unread_total, 3, "the database's counts are back");
 
     press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
     assert_eq!(app.status.unread_total, 0);
@@ -138,7 +139,7 @@ fn without_a_state_file_nothing_is_tracked() {
     app.open_chat_row(fixtures::CHAT_DIRECT);
     app.open_chat_row(fixtures::CHAT_GROUP);
     assert_eq!(
-        app.status.unread_total, 2,
+        app.status.unread_total, 3,
         "read state is off until something asks for it"
     );
 }
@@ -213,6 +214,11 @@ fn a_message_arriving_after_you_looked_counts_and_the_open_thread_does_not() {
     } else {
         fixtures::CHAT_DIRECT
     };
+    let counted = app
+        .chat_rows
+        .iter()
+        .find(|chat| chat.rowid == other)
+        .map_or(0, |chat| chat.unread_count);
 
     // One arrives in the thread on screen: it is being read, so no badge.
     arrives(&db, 901, open, fixtures::BASE + 900 * fixtures::SECOND);
@@ -231,5 +237,9 @@ fn a_message_arriving_after_you_looked_counts_and_the_open_thread_does_not() {
         .find(|chat| chat.rowid == other)
         .expect("the other chat");
     assert_eq!(badge.unread, 1, "only what arrived since you looked");
-    assert_eq!(badge.unread_count, 2, "the database still counts both");
+    assert_eq!(
+        badge.unread_count,
+        counted + 1,
+        "the database still counts what was already there"
+    );
 }
