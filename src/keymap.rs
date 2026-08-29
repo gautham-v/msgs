@@ -136,11 +136,6 @@ pub const BINDINGS: &[Binding] = &[
         scope: "conversation",
     },
     Binding {
-        keys: "Ctrl+R",
-        description: "react to the selected message",
-        scope: "conversation",
-    },
-    Binding {
         keys: "y",
         description: "copy the selected message",
         scope: "conversation",
@@ -201,21 +196,6 @@ pub const BINDINGS: &[Binding] = &[
         scope: "palette",
     },
     Binding {
-        keys: "← →",
-        description: "choose a reaction",
-        scope: "react picker",
-    },
-    Binding {
-        keys: "1–6",
-        description: "send that reaction straight away",
-        scope: "react picker",
-    },
-    Binding {
-        keys: "Enter",
-        description: "send it, or take back one of yours",
-        scope: "react picker",
-    },
-    Binding {
         keys: "r / Enter",
         description: "try to open chat.db again",
         scope: "first run",
@@ -247,7 +227,7 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
 
     // Bindings that win everywhere, including while typing. The first-run
     // surface is the exception: there is no conversation behind it to attach
-    // to, react to, or open a link from, so only the keys that still mean
+    // to or open a link from, so only the keys that still mean
     // something over it (quit, the palette, the theme) get through and the
     // rest stay dead.
     if ctrl {
@@ -260,7 +240,6 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
             }
             KeyCode::Char('a') if focus != Focus::DbError => return Some(Action::Attach),
             KeyCode::Char('n') if focus != Focus::DbError => return Some(Action::NewChat),
-            KeyCode::Char('r') if focus != Focus::DbError => return Some(Action::React),
             KeyCode::Char('l') if focus != Focus::DbError => return Some(Action::OpenLink),
             _ => {}
         }
@@ -271,26 +250,8 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         Focus::Help => help_keys(key),
         Focus::Palette => palette_keys(key, ctrl, alt, shift),
         Focus::FilePicker => file_picker_keys(key, ctrl, alt, shift),
-        Focus::Reactions => reaction_keys(key),
         Focus::Composer => text_entry_keys(key, ctrl, alt, shift),
         Focus::ChatList | Focus::Conversation => navigation_keys(key, focus, ctrl, alt, shift),
-    }
-}
-
-/// The reaction picker is a one-row menu: the cursor moves along it, `Enter`
-/// sends what is under the cursor, and `1`–`6` do both at once.
-fn reaction_keys(key: KeyEvent) -> Option<Action> {
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => Some(Action::Cancel),
-        KeyCode::Enter | KeyCode::Char(' ') => Some(Action::Activate),
-        KeyCode::Left | KeyCode::Up | KeyCode::Char('h' | 'k') | KeyCode::BackTab => {
-            Some(Action::SelectPrev)
-        }
-        KeyCode::Right | KeyCode::Down | KeyCode::Char('l' | 'j') | KeyCode::Tab => {
-            Some(Action::SelectNext)
-        }
-        KeyCode::Char(c @ '1'..='6') => Some(Action::Insert(c)),
-        _ => None,
     }
 }
 
@@ -548,36 +509,6 @@ mod tests {
     }
 
     #[test]
-    fn the_reaction_picker_is_a_menu_not_a_text_field() {
-        assert_eq!(
-            resolve(key(KeyCode::Right), Focus::Reactions),
-            Some(Action::SelectNext)
-        );
-        assert_eq!(
-            resolve(key(KeyCode::Char('h')), Focus::Reactions),
-            Some(Action::SelectPrev)
-        );
-        assert_eq!(
-            resolve(key(KeyCode::Enter), Focus::Reactions),
-            Some(Action::Activate)
-        );
-        assert_eq!(
-            resolve(key(KeyCode::Char('3')), Focus::Reactions),
-            Some(Action::Insert('3'))
-        );
-        // A letter that means nothing here types nothing.
-        assert_eq!(resolve(key(KeyCode::Char('z')), Focus::Reactions), None);
-        // Ctrl+R closes it again, the same key that opened it.
-        assert_eq!(
-            resolve(
-                with(KeyCode::Char('r'), KeyModifiers::CONTROL),
-                Focus::Reactions
-            ),
-            Some(Action::React)
-        );
-    }
-
-    #[test]
     fn the_first_run_surface_retries_and_quits_and_nothing_else() {
         assert_eq!(
             resolve(key(KeyCode::Char('r')), Focus::DbError),
@@ -722,9 +653,8 @@ mod tests {
             resolve(key(KeyCode::Char('y')), Focus::ChatList),
             Some(Action::ComposeChar('y'))
         );
-        // Nothing types into the first-run surface or an overlay menu.
+        // Nothing types into the first-run surface.
         assert_eq!(resolve(key(KeyCode::Char('z')), Focus::DbError), None);
-        assert_eq!(resolve(key(KeyCode::Char('z')), Focus::Reactions), None);
     }
 
     #[test]
@@ -742,7 +672,7 @@ mod tests {
             resolve(key(KeyCode::Right), Focus::Conversation),
             Some(Action::FocusComposer)
         );
-        // The composer moves its cursor, and the picker moves its cursor.
+        // The composer moves its cursor.
         assert_eq!(
             resolve(key(KeyCode::Left), Focus::Composer),
             Some(Action::CursorLeft)
@@ -754,14 +684,6 @@ mod tests {
         assert_eq!(
             resolve(key(KeyCode::Left), Focus::Palette),
             Some(Action::CursorLeft)
-        );
-        assert_eq!(
-            resolve(key(KeyCode::Left), Focus::Reactions),
-            Some(Action::SelectPrev)
-        );
-        assert_eq!(
-            resolve(key(KeyCode::Right), Focus::Reactions),
-            Some(Action::SelectNext)
         );
     }
 

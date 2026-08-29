@@ -23,8 +23,7 @@ use crate::pins::Pins;
 use crate::search::{self, Search};
 use crate::seen::Seen;
 use crate::send::{
-    self, Delivery, Outbox, Outgoing, Pending, PendingTapback, Presence, REACTIONS, ReactFallback,
-    Reaction, SendError, Service, Target,
+    self, Delivery, Outbox, Outgoing, Pending, Presence, SendError, Service, Target,
 };
 use crate::theme::{self, Base, TerminalColors, Theme};
 use crate::ui::Panes;
@@ -84,8 +83,6 @@ pub enum Focus {
     Palette,
     /// The `?` help modal.
     Help,
-    /// The `Ctrl+R` reaction picker, floating over the selected message.
-    Reactions,
     /// The first-run surface, shown while `chat.db` cannot be read.
     ///
     /// Never assigned to [`App::focus`]: [`App::key_focus`] reports it while
@@ -99,7 +96,7 @@ impl Focus {
     /// Overlays float above the panes and take all keys while open.
     #[must_use]
     pub const fn is_overlay(self) -> bool {
-        matches!(self, Self::Palette | Self::Help | Self::Reactions)
+        matches!(self, Self::Palette | Self::Help)
     }
 }
 
@@ -160,8 +157,6 @@ pub enum Action {
     SaveAttachment,
     /// Quote the selected message in the composer.
     QuoteReply,
-    /// Open the reaction picker on the selected message, or close it again.
-    React,
     /// Copy the selected message to the clipboard.
     CopySelection,
     /// Open the first link in the selected message in the browser.
@@ -609,83 +604,6 @@ impl FilePicker {
     }
 }
 
-/// The `Ctrl+R` reaction picker: what it is aimed at, and what is under the
-/// cursor.
-///
-/// It is aimed at a message GUID rather than a row number, so a live update
-/// arriving underneath it cannot move it onto a different message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReactionPicker {
-    /// `message.guid` the reaction would land on.
-    pub target_guid: String,
-    /// Which part of that message it would land on.
-    pub part: usize,
-    /// `chat.ROWID` the target lives in.
-    pub chat_rowid: i64,
-    /// Index into [`REACTIONS`] under the cursor.
-    pub selected: usize,
-    /// The reactions of yours already standing on the target, so choosing one
-    /// of them again takes it back rather than sending it twice.
-    pub standing: Vec<Reaction>,
-    /// Whether `imsg` is on `$PATH`. Without it the picker only says how to
-    /// get it, and answering it sends nothing.
-    pub available: bool,
-    /// Whether `imsg tapback`'s IMCore bridge can load here, which it cannot
-    /// while System Integrity Protection is on — and SIP is on by default.
-    pub bridge: bool,
-    /// The `imsg react` route, filled in only when the target is the newest
-    /// incoming message of its chat — the one message that route can reach.
-    pub fallback: Option<ReactFallback>,
-}
-
-impl ReactionPicker {
-    /// The reaction under the cursor.
-    #[must_use]
-    pub fn reaction(&self) -> Reaction {
-        REACTIONS[self.selected.min(REACTIONS.len() - 1)]
-    }
-
-    /// Whether `reaction` is one you have already put on this message.
-    #[must_use]
-    pub fn holds(&self, reaction: Reaction) -> bool {
-        self.standing.contains(&reaction)
-    }
-
-    /// Whether a reaction chosen here could reach this message at all, which
-    /// on a stock Mac means the `imsg react` route and this message being the
-    /// newest incoming one.
-    #[must_use]
-    pub fn reaches(&self) -> bool {
-        self.available && (self.bridge || self.fallback.is_some())
-    }
-
-    /// Why nothing would happen on `Enter`, or `None` when something would.
-    ///
-    /// The picker says this before the key is pressed and the toast says it
-    /// after, so the two never disagree.
-    #[must_use]
-    pub fn refusal(&self) -> Option<SendError> {
-        if !self.available {
-            return Some(SendError::NoHelper);
-        }
-        if self.bridge {
-            return None;
-        }
-        if self.fallback.is_none() {
-            return Some(SendError::OutOfReach);
-        }
-        // `imsg react` adds a reaction; only the bridge can take one away.
-        self.holds(self.reaction()).then_some(SendError::NoTakeBack)
-    }
-
-    /// Move the cursor, wrapping around the row the way a six-item menu should.
-    pub fn move_by(&mut self, delta: i64) {
-        let len = REACTIONS.len() as i64;
-        let next = (self.selected as i64 + delta).rem_euclid(len);
-        self.selected = usize::try_from(next).unwrap_or(0);
-    }
-}
-
 /// The whole application.
 pub struct App {
     /// User config, as loaded at startup.
@@ -777,12 +695,6 @@ pub struct App {
     /// Messages sent but not yet read back out of `chat.db`, oldest first.
     /// They are drawn as ordinary blocks at the end of the open conversation.
     pub pending: Vec<Pending>,
-    /// Reactions sent but not yet read back out of `chat.db`. They are drawn
-    /// as chips on the message they were aimed at, exactly where the real ones
-    /// will land.
-    pub pending_tapbacks: Vec<PendingTapback>,
-    /// The `Ctrl+R` picker, open while `Some`.
-    pub reaction_picker: Option<ReactionPicker>,
     /// Sends currently out with `osascript`.
     ///
     /// Public so a test can put an [`Outbox::inert`] one in its place and drive
@@ -911,8 +823,6 @@ impl App {
             file_picker: None,
             picker_roots: None,
             pending: Vec::new(),
-            pending_tapbacks: Vec::new(),
-            reaction_picker: None,
             outbox: Outbox::new(),
             next_send: 0,
             last_reconcile: None,
@@ -1607,7 +1517,6 @@ impl App {
                 messages: &self.message_rows,
                 by_guid: &by_guid,
                 pending: &self.pending,
-                reactions: &self.pending_tapbacks,
                 now,
                 images: &self.images,
                 contacts: &self.contacts,
@@ -1800,21 +1709,6 @@ impl App {
             return false;
         }
         for reply in replies {
-            // A refused reaction takes its optimistic chip back down with it;
-            // one that landed keeps the chip until the database's own row for
-            // it arrives.
-            if let Some(index) = self
-                .pending_tapbacks
-                .iter()
-                .position(|pending| pending.id == reply.id)
-            {
-                if let Err(err) = reply.result {
-                    self.pending_tapbacks.remove(index);
-                    self.measured.stale = true;
-                    self.status.error(format!("could not react — {err}"));
-                }
-                continue;
-            }
             let Some(pending) = self
                 .pending
                 .iter_mut()
@@ -1853,17 +1747,16 @@ impl App {
     ///
     /// Returns `true` if anything changed on screen.
     fn reconcile_pending(&mut self) -> bool {
-        if self.pending.is_empty() && self.pending_tapbacks.is_empty() {
+        if self.pending.is_empty() {
             self.reconcile_since = None;
             return false;
         }
         // A failed send stands until the user does something about it; nothing
         // is coming for it.
-        if self.pending_tapbacks.is_empty()
-            && self
-                .pending
-                .iter()
-                .all(|pending| matches!(pending.state, Delivery::Failed(_)))
+        if self
+            .pending
+            .iter()
+            .all(|pending| matches!(pending.state, Delivery::Failed(_)))
         {
             self.reconcile_since = None;
             return false;
@@ -1876,12 +1769,6 @@ impl App {
                 if pending.state == Delivery::Sending {
                     pending.state = Delivery::Sent;
                 }
-            }
-            // A chip the database has not confirmed by now is standing on a
-            // guess. The database's own answer is the honest one to show.
-            if !self.pending_tapbacks.is_empty() {
-                self.pending_tapbacks.clear();
-                self.measured.stale = true;
             }
             self.reconcile_since = None;
             self.sync_pending_rows();
@@ -2005,10 +1892,7 @@ impl App {
         refreshed.appended = appended.len();
         refreshed.claimed = claimed.len();
         self.message_rows.extend(appended);
-        // The page is the database's own answer right now, which is the one
-        // moment an optimistic chip can be held up against it.
-        self.reconcile_tapbacks();
-        if self.pending.is_empty() && self.pending_tapbacks.is_empty() {
+        if self.pending.is_empty() {
             self.reconcile_since = None;
         }
         if refreshed.merged {
@@ -2135,7 +2019,6 @@ impl App {
         self.help_scroll = 0;
         self.palette.clear();
         self.jump.clear();
-        self.reaction_picker = None;
         self.focus = self.overlay_return;
     }
 
@@ -2162,7 +2045,7 @@ impl App {
             Focus::Conversation => Some(&mut self.messages),
             Focus::Palette => Some(&mut self.jump.list),
             Focus::FilePicker => self.file_picker.as_mut().map(|picker| &mut picker.list),
-            Focus::Help | Focus::Composer | Focus::Reactions | Focus::DbError => None,
+            Focus::Help | Focus::Composer | Focus::DbError => None,
         }
     }
 
@@ -2201,11 +2084,7 @@ impl App {
             Action::Cancel => self.cancel(),
             Action::StartFilter => self.start_filter(),
             Action::Insert(c) => {
-                // The reaction picker is a menu, not a text field: a digit
-                // picks the reaction at that position and sends it.
-                if self.focus == Focus::Reactions {
-                    self.pick_reaction(c);
-                } else if self.focus == Focus::FilePicker && c == '/' && self.enter_directory() {
+                if self.focus == Focus::FilePicker && c == '/' && self.enter_directory() {
                     // A `/` on a highlighted directory is the way into it,
                     // and `enter_directory` writes the query that lists it.
                 } else {
@@ -2230,7 +2109,6 @@ impl App {
             Action::OpenAttachment => self.open_attachment(),
             Action::SaveAttachment => self.save_attachment(),
             Action::QuoteReply => self.quote_reply(),
-            Action::React => self.toggle_reactions(),
             Action::CopySelection => self.copy_selection(),
             Action::OpenLink => self.open_selected_link(),
             Action::ToggleAllSeen => self.toggle_all_seen(),
@@ -2480,11 +2358,6 @@ impl App {
                 self.help_scroll = u16::try_from(next.max(0)).unwrap_or(u16::MAX);
             }
             Focus::Conversation => self.move_message(delta),
-            Focus::Reactions => {
-                if let Some(picker) = self.reaction_picker.as_mut() {
-                    picker.move_by(delta);
-                }
-            }
             _ => {
                 if let Some(list) = self.active_list() {
                     list.move_by(delta);
@@ -2599,7 +2472,6 @@ impl App {
             Focus::Palette => self.jump_to_selected(),
             Focus::FilePicker => self.pick_file(),
             Focus::Conversation => self.focus = Focus::Composer,
-            Focus::Reactions => self.send_reaction(),
             Focus::Help => self.close_overlay(),
             // Unreachable: `focus` is never set to it. Retrying is `r`.
             Focus::DbError => {}
@@ -2614,7 +2486,7 @@ impl App {
             return;
         }
         match self.focus {
-            Focus::Help | Focus::Palette | Focus::Reactions => self.close_overlay(),
+            Focus::Help | Focus::Palette => self.close_overlay(),
             Focus::ChatList => {
                 // On the list screen a second `Esc` goes back to the thread.
                 if self.chat_filter.take().is_none() && self.too_narrow_for_the_chat_list() {
@@ -2941,198 +2813,6 @@ impl App {
         self.composer = TextField::from_text(format!("> {quoted}\n{draft}"));
         self.attach_prompt = None;
         self.focus = Focus::Composer;
-    }
-
-    /// `Ctrl+R`: open the reaction picker, or close one that is already open.
-    ///
-    /// The key is global, so pressing it a second time is the same as `Esc`.
-    fn toggle_reactions(&mut self) {
-        if self.focus == Focus::Reactions {
-            self.close_overlay();
-            return;
-        }
-        if self.focus.is_overlay() {
-            return;
-        }
-        self.open_reactions();
-    }
-
-    /// Aim the picker at the selected message.
-    ///
-    /// A reaction is addressed by the target's GUID, so anything without a real
-    /// one — an echo still on its way to `chat.db` — and anything Messages does
-    /// not let you react to is refused here rather than at `imsg`.
-    fn open_reactions(&mut self) {
-        let Some(message) = self.selected_message() else {
-            self.status.error("no message selected");
-            return;
-        };
-        if message.guid.starts_with(send::PENDING_PREFIX) {
-            self.status
-                .toast("that message has not reached Messages yet");
-            return;
-        }
-        if message.is_announcement() {
-            self.status.toast("there is nothing to react to there");
-            return;
-        }
-        let target_guid = message.guid.clone();
-        let part = message
-            .tapbacks
-            .first()
-            .map_or(0, |tapback| tapback.target_part);
-        let standing: Vec<Reaction> = message
-            .tapbacks
-            .iter()
-            .filter(|tapback| tapback.is_from_me)
-            .filter_map(|tapback| Reaction::from_kind(&tapback.kind))
-            .collect();
-        let Some(chat_rowid) = self.current_chat_rowid() else {
-            self.status.error("no conversation selected");
-            return;
-        };
-        // Start on a reaction you have already given, so the first `Enter`
-        // takes it back rather than adding a second one.
-        let selected = standing
-            .first()
-            .and_then(|first| REACTIONS.iter().position(|reaction| reaction == first))
-            .unwrap_or(0);
-        let fallback = self.react_fallback(&target_guid, chat_rowid);
-        self.reaction_picker = Some(ReactionPicker {
-            target_guid,
-            part,
-            chat_rowid,
-            selected,
-            standing,
-            available: self.outbox.has_helper(),
-            bridge: self.outbox.has_bridge(),
-            fallback,
-        });
-        self.open_overlay(Focus::Reactions);
-    }
-
-    /// The `imsg react` route for `target_guid`, when there is one.
-    ///
-    /// That route always lands on the newest incoming message of a
-    /// conversation, so it is only offered when the target happens to be
-    /// exactly that — and never for a conversation that has no row in
-    /// `chat.db` for `imsg` to look up.
-    fn react_fallback(&self, target_guid: &str, chat_rowid: i64) -> Option<ReactFallback> {
-        if chat_rowid <= 0 {
-            return None;
-        }
-        let newest = self
-            .message_rows
-            .iter()
-            .rev()
-            .find(|message| !message.is_from_me && !message.is_announcement())?;
-        if newest.guid != target_guid {
-            return None;
-        }
-        Some(ReactFallback {
-            chat_rowid,
-            db: self.db_path.clone()?,
-        })
-    }
-
-    /// A digit in the picker: choose that reaction and send it.
-    fn pick_reaction(&mut self, c: char) {
-        let Some(index) = c.to_digit(10).and_then(|digit| usize::try_from(digit).ok()) else {
-            return;
-        };
-        if index == 0 || index > REACTIONS.len() {
-            return;
-        }
-        if let Some(picker) = self.reaction_picker.as_mut() {
-            picker.selected = index - 1;
-        }
-        self.send_reaction();
-    }
-
-    /// `Enter` in the picker: hand the reaction to `imsg` and chip it on at
-    /// once.
-    ///
-    /// Choosing a reaction you have already given takes it back, which is what
-    /// tapping it again does in Messages.
-    fn send_reaction(&mut self) {
-        let Some(picker) = self.reaction_picker.clone() else {
-            return;
-        };
-        if let Some(refusal) = picker.refusal() {
-            // Nothing is sent and nothing is chipped on: there is no route
-            // this reaction could take, and the picker already said so.
-            self.status.error(refusal.to_string());
-            return;
-        }
-        let Some(target) = self.outgoing_target() else {
-            self.status.error("no conversation selected");
-            return;
-        };
-        if !target.is_addressable() {
-            self.status.error(SendError::NoTarget.to_string());
-            return;
-        }
-        let reaction = picker.reaction();
-        let remove = picker.holds(reaction);
-        let id = self.next_send;
-        self.next_send += 1;
-        self.pending_tapbacks.push(PendingTapback {
-            id,
-            chat_rowid: picker.chat_rowid,
-            target_guid: picker.target_guid.clone(),
-            part: picker.part,
-            kind: reaction.kind(),
-            remove,
-            date: crate::db::raw_time(Local::now()),
-        });
-        self.outbox.send(
-            id,
-            target,
-            Outgoing::Tapback {
-                db: self.db_path.clone(),
-                message_guid: picker.target_guid,
-                part: picker.part,
-                reaction,
-                remove,
-                fallback: picker.fallback,
-            },
-        );
-        self.reconcile_since.get_or_insert_with(Instant::now);
-        self.last_reconcile = None;
-        // A chip changes how tall the block it rides on is.
-        self.measured.stale = true;
-        self.close_overlay();
-        self.status.toast(if remove {
-            format!("{} taken back", reaction.glyph())
-        } else {
-            format!("{} sent", reaction.glyph())
-        });
-    }
-
-    /// Drop the optimistic chips that `chat.db` has caught up with.
-    ///
-    /// Called with the loaded page freshly read, which is the one moment
-    /// [`App::message_rows`] is the database's own answer and nothing else.
-    fn reconcile_tapbacks(&mut self) {
-        if self.pending_tapbacks.is_empty() {
-            return;
-        }
-        let waiting = std::mem::take(&mut self.pending_tapbacks);
-        let before = waiting.len();
-        let rows = &self.message_rows;
-        self.pending_tapbacks = waiting
-            .into_iter()
-            .filter(|pending| {
-                // A target that is not on the loaded page cannot be checked;
-                // the reconcile window closing is what retires that one.
-                rows.iter()
-                    .find(|message| message.guid == pending.target_guid)
-                    .is_none_or(|message| !pending.is_settled(message))
-            })
-            .collect();
-        if self.pending_tapbacks.len() != before {
-            self.measured.stale = true;
-        }
     }
 
     fn edit(&mut self, apply: impl FnOnce(&mut TextField)) {
@@ -4769,308 +4449,6 @@ mod tests {
         assert!(app.notice().is_none(), "no notice for a copy that did not");
         let (_, is_error) = app.status.active_toast().expect("a toast");
         assert!(is_error);
-    }
-
-    /// Your own reaction, as the database would hand it back.
-    fn mine(kind: crate::db::TapbackKind) -> crate::db::Tapback {
-        crate::db::Tapback {
-            rowid: 9,
-            target_guid: "ABCD-1234".to_string(),
-            target_part: 0,
-            action: crate::db::TapbackAction::Added,
-            kind,
-            is_from_me: true,
-            handle_rowid: None,
-            handle: None,
-            date: 0,
-        }
-    }
-
-    #[test]
-    fn ctrl_r_aims_the_picker_at_the_selected_message_and_ctrl_r_closes_it() {
-        let mut app = app_with_message();
-        app.update(Action::React);
-        assert_eq!(app.focus, Focus::Reactions);
-        let picker = app.reaction_picker.as_ref().expect("a picker");
-        assert_eq!(picker.target_guid, "ABCD-1234");
-        assert_eq!(picker.chat_rowid, 1);
-        assert_eq!(picker.reaction(), REACTIONS[0]);
-
-        app.update(Action::React);
-        assert_eq!(
-            app.focus,
-            Focus::Conversation,
-            "focus goes back where it was"
-        );
-        assert!(app.reaction_picker.is_none());
-    }
-
-    #[test]
-    fn the_react_fallback_is_offered_only_for_the_one_message_it_can_reach() {
-        let mut app = app_with_message();
-        app.db_path = Some(PathBuf::from("/tmp/msgs-test.db"));
-        app.update(Action::React);
-        let fallback = app
-            .reaction_picker
-            .as_ref()
-            .expect("picker")
-            .fallback
-            .clone()
-            .expect("the newest incoming message can be reached both ways");
-        assert_eq!(fallback.chat_rowid, 1);
-        assert_eq!(fallback.db, PathBuf::from("/tmp/msgs-test.db"));
-        app.update(Action::Cancel);
-
-        // Somebody else writes after it: only the GUID route can reach the
-        // older message now.
-        let mut newer = message_row("EFGH-5678");
-        newer.rowid = 6;
-        app.message_rows.push(newer);
-        app.messages.set_len(2);
-        app.messages.selected = 0;
-        app.update(Action::React);
-        assert!(
-            app.reaction_picker
-                .as_ref()
-                .expect("picker")
-                .fallback
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn the_cursor_wraps_around_the_row_of_reactions() {
-        let mut app = app_with_message();
-        app.update(Action::React);
-        app.update(Action::SelectPrev);
-        assert_eq!(
-            app.reaction_picker.as_ref().expect("picker").reaction(),
-            REACTIONS[REACTIONS.len() - 1]
-        );
-        app.update(Action::SelectNext);
-        assert_eq!(
-            app.reaction_picker.as_ref().expect("picker").reaction(),
-            REACTIONS[0]
-        );
-    }
-
-    #[test]
-    fn enter_hands_the_reaction_to_imsg_and_chips_it_on_at_once() {
-        let mut app = app_with_message();
-        app.update(Action::React);
-        app.update(Action::SelectNext);
-        app.update(Action::Activate);
-
-        assert!(app.reaction_picker.is_none(), "the picker closes behind it");
-        assert_eq!(app.pending_tapbacks.len(), 1);
-        assert_eq!(app.pending_tapbacks[0].target_guid, "ABCD-1234");
-        assert!(!app.pending_tapbacks[0].remove);
-
-        let recorded = app.outbox.recorded();
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(
-            recorded[0].1.guid.as_deref(),
-            Some("iMessage;-;+15550000000")
-        );
-        assert_eq!(
-            recorded[0].2,
-            Outgoing::Tapback {
-                db: None,
-                message_guid: "ABCD-1234".to_string(),
-                part: 0,
-                reaction: REACTIONS[1],
-                remove: false,
-                fallback: None,
-            }
-        );
-        // The loaded page is still exactly what the database said.
-        assert!(app.message_rows[0].tapbacks.is_empty());
-    }
-
-    #[test]
-    fn the_reaction_names_the_database_msgs_was_pointed_at() {
-        // `--db` moves msgs off the default chat.db, and imsg resolves the
-        // chat guid in whichever database it is handed.
-        let mut app = app_with_message();
-        app.db_path = Some(PathBuf::from("/tmp/msgs-test.db"));
-        app.update(Action::React);
-        app.update(Action::Activate);
-        let Outgoing::Tapback { db, .. } = &app.outbox.recorded()[0].2 else {
-            panic!("a tapback");
-        };
-        assert_eq!(
-            db.as_deref(),
-            Some(std::path::Path::new("/tmp/msgs-test.db"))
-        );
-    }
-
-    #[test]
-    fn a_message_a_stock_mac_cannot_reach_is_refused_before_anything_is_sent() {
-        // SIP on means no bridge, and without the bridge only the newest
-        // incoming message can be reached — this one is not it.
-        let mut app = app_with_message();
-        let mut newer = message_row("EFGH-5678");
-        newer.rowid = 6;
-        app.message_rows.push(newer);
-        app.messages.set_len(2);
-        app.messages.selected = 0;
-        app.update(Action::React);
-        let picker = app.reaction_picker.as_mut().expect("picker");
-        picker.bridge = false;
-        assert!(picker.fallback.is_none());
-        assert!(!picker.reaches());
-        assert_eq!(picker.refusal(), Some(SendError::OutOfReach));
-
-        app.update(Action::Activate);
-        assert!(
-            app.outbox.recorded().is_empty(),
-            "nothing is handed to imsg that imsg could not deliver"
-        );
-        assert!(app.pending_tapbacks.is_empty(), "and no chip goes up");
-        let (text, is_error) = app.status.active_toast().expect("a toast");
-        assert!(is_error);
-        assert_eq!(text, send::SIP_REACH);
-    }
-
-    #[test]
-    fn taking_a_reaction_back_is_refused_without_the_bridge() {
-        // The newest incoming message is reachable, but only to add one:
-        // `imsg react` has no way to undo.
-        let mut app = app_with_message();
-        app.db_path = Some(PathBuf::from("/tmp/msgs-test.db"));
-        app.message_rows[0].tapbacks = vec![mine(REACTIONS[2].kind())];
-        app.update(Action::React);
-        let picker = app.reaction_picker.as_mut().expect("picker");
-        picker.bridge = false;
-        assert!(picker.fallback.is_some());
-        assert!(picker.reaches(), "the row is still live for the other five");
-        assert_eq!(picker.refusal(), Some(SendError::NoTakeBack));
-
-        app.update(Action::Activate);
-        assert!(app.outbox.recorded().is_empty());
-        let (text, _) = app.status.active_toast().expect("a toast");
-        assert!(text.contains("SIP"), "{text}");
-
-        // The picker stays open on a refusal, so another glyph is one key
-        // away — and any of the other five does go out the fallback route.
-        assert_eq!(app.focus, Focus::Reactions);
-        let picker = app.reaction_picker.as_mut().expect("picker");
-        picker.selected = 0;
-        assert_eq!(picker.refusal(), None);
-        app.update(Action::Activate);
-        assert_eq!(app.outbox.recorded().len(), 1);
-    }
-
-    #[test]
-    fn a_digit_picks_a_reaction_and_sends_it_in_one_keystroke() {
-        let mut app = app_with_message();
-        app.update(Action::React);
-        app.update(Action::Insert('4'));
-        assert!(app.reaction_picker.is_none());
-        let recorded = app.outbox.recorded();
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(
-            recorded[0].2,
-            Outgoing::Tapback {
-                db: None,
-                message_guid: "ABCD-1234".to_string(),
-                part: 0,
-                reaction: REACTIONS[3],
-                remove: false,
-                fallback: None,
-            }
-        );
-
-        // A digit outside the row does nothing at all.
-        let mut app = app_with_message();
-        app.update(Action::React);
-        app.update(Action::Insert('9'));
-        assert_eq!(app.focus, Focus::Reactions);
-        assert!(app.outbox.recorded().is_empty());
-    }
-
-    #[test]
-    fn choosing_a_reaction_you_already_gave_takes_it_back() {
-        let mut app = app_with_message();
-        app.message_rows[0].tapbacks = vec![mine(REACTIONS[2].kind())];
-        app.update(Action::React);
-        let picker = app.reaction_picker.as_ref().expect("picker");
-        assert_eq!(
-            picker.reaction(),
-            REACTIONS[2],
-            "the cursor starts on the reaction already standing"
-        );
-        app.update(Action::Activate);
-        assert!(app.pending_tapbacks[0].remove);
-        assert_eq!(
-            app.outbox.recorded()[0].2,
-            Outgoing::Tapback {
-                db: None,
-                message_guid: "ABCD-1234".to_string(),
-                part: 0,
-                reaction: REACTIONS[2],
-                remove: true,
-                fallback: None,
-            }
-        );
-    }
-
-    #[test]
-    fn a_refused_reaction_takes_its_chip_back_down() {
-        let mut app = app_with_message();
-        app.update(Action::React);
-        app.update(Action::Activate);
-        let id = app.pending_tapbacks[0].id;
-
-        app.outbox
-            .answer(id, Err(SendError::Script("nope".to_string())));
-        assert!(app.absorb_replies());
-        assert!(app.pending_tapbacks.is_empty());
-        let (text, is_error) = app.status.active_toast().expect("a toast");
-        assert!(is_error);
-        assert!(text.contains("could not react"));
-    }
-
-    #[test]
-    fn a_reaction_that_landed_keeps_its_chip_until_the_database_agrees() {
-        let mut app = app_with_message();
-        app.update(Action::React);
-        app.update(Action::Activate);
-        let id = app.pending_tapbacks[0].id;
-        app.outbox.answer(id, Ok(()));
-        assert!(app.absorb_replies());
-        assert_eq!(app.pending_tapbacks.len(), 1, "the chip stands");
-
-        // The database catches up: the optimistic chip has nothing left to do.
-        app.message_rows[0].tapbacks = vec![mine(REACTIONS[0].kind())];
-        app.reconcile_tapbacks();
-        assert!(app.pending_tapbacks.is_empty());
-    }
-
-    #[test]
-    fn without_imsg_the_picker_explains_and_sends_nothing() {
-        let mut app = app_with_message();
-        app.update(Action::React);
-        app.reaction_picker.as_mut().expect("picker").available = false;
-        app.update(Action::Activate);
-        assert!(app.outbox.recorded().is_empty());
-        assert!(app.pending_tapbacks.is_empty());
-        assert_eq!(app.focus, Focus::Reactions, "the picker stays up");
-        let (text, is_error) = app.status.active_toast().expect("a toast");
-        assert!(is_error);
-        assert!(text.contains(send::IMSG_INSTALL));
-    }
-
-    #[test]
-    fn an_echo_that_has_not_reached_messages_cannot_be_reacted_to() {
-        let mut app = app_with_chat();
-        compose(&mut app, "on my way");
-        app.update(Action::Activate);
-        app.focus = Focus::Conversation;
-        app.update(Action::React);
-        assert_eq!(app.focus, Focus::Conversation);
-        assert!(app.reaction_picker.is_none());
-        assert!(app.status.active_toast().is_some());
     }
 
     #[test]

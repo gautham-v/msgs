@@ -16,14 +16,13 @@ Or from source: `cargo install --path .`
 Then give your terminal **Full Disk Access** (System Settings → Privacy & Security),
 relaunch it, and run `msgs`. `msgs --check` tells you what is missing.
 `msgs --redact` masks phone numbers and addresses, for screenshots and demos.
-Reactions need [`imsg`](https://github.com/steipete/imsg) (`brew install steipete/tap/imsg`).
 
 ## What it does
 
 - Chats, messages, group chats, names from Contacts, pictures inline, video posters
 - Conversations you pinned in Messages.app sit at the top of the list
 - Link previews from what Messages already stored — msgs never touches the network
-- Send text, files, replies, and reactions; live updates as messages land
+- Send text, files, and replies; live updates as messages land
 - Drag a file from Finder onto the window to attach it; `Enter` sends
 - `Ctrl+K` fuzzy jump to any chat or person, full-text search over every message
 - Local unread state, so opening a chat here does not touch Messages.app's badge
@@ -55,7 +54,6 @@ Reactions need [`imsg`](https://github.com/steipete/imsg) (`brew install steipet
 | `o` | open the selected attachment | conversation |
 | `s` | save the selected attachment | conversation |
 | `r` | quote the selected message in a reply | conversation |
-| `Ctrl+R` | react to the selected message | conversation |
 | `y` | copy the selected message | conversation |
 | `Ctrl+L` | open the first link in the selected message | conversation |
 | `Ctrl+A` | attach a file | composer |
@@ -68,16 +66,13 @@ Reactions need [`imsg`](https://github.com/steipete/imsg) (`brew install steipet
 | `Ctrl+W` | delete the word before the cursor | any text field |
 | `Ctrl+U` | clear the whole field | any text field |
 | `Tab` | cycle the filter: all / chats / messages / photos | jump palette |
-| `←` `→` | choose a reaction | react picker |
-| `1`–`6` | send that reaction straight away | react picker |
-| `Enter` | send it, or take back one of yours | react picker |
 | `r` / `Enter` | try to open chat.db again | first run |
 
 The mouse works too: click to select, drag across the conversation to copy what you drag over, click a link or picture to open it, wheel to scroll. `--no-mouse` hands the mouse back to the terminal.
 
 ## Limits
 
-No typing indicators, no editing or unsending, no pinning from here, no clearing Messages.app's own badge — macOS keeps all of those out of reach. Reactions to arbitrary messages need `imsg` with SIP off; with SIP on, `imsg` reaches only a conversation's newest incoming message, and needs Messages.app open and Accessibility granted to your terminal. The full list, config keys, and how everything works are in [docs/MANUAL.md](docs/MANUAL.md).
+No typing indicators, no sending reactions, no editing or unsending, no pinning from here, no clearing Messages.app's own badge — macOS keeps all of those out of reach. Reactions other people send are read and drawn. The full list, config keys, and how everything works are in [docs/MANUAL.md](docs/MANUAL.md).
 
 ## Development
 

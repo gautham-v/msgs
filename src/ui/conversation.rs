@@ -569,7 +569,6 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
         messages: &app.message_rows,
         by_guid: &app.measured.by_guid,
         pending: &app.pending,
-        reactions: &app.pending_tapbacks,
         now,
         images: &app.images,
         contacts: &app.contacts,
