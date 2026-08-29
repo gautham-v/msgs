@@ -147,16 +147,26 @@ pub fn text_area(area: Rect) -> Option<Rect> {
 /// `cursor` is where the cursor is now, because that is what decides how far
 /// the box has scrolled. Past the end of what is written — a click in the
 /// blank right of the last character, or on a row below the draft — the
-/// answer is the end of the draft, where `End` goes.
+/// answer is the end of the draft, where `End` goes. `chips` is how many
+/// attachment rows stand above the draft; a click on one of them is the
+/// start of the draft.
 #[must_use]
-pub fn offset_at(text: &str, cursor: usize, area: Rect, position: Position) -> Option<usize> {
+pub fn offset_at(
+    text: &str,
+    cursor: usize,
+    chips: usize,
+    area: Rect,
+    position: Position,
+) -> Option<usize> {
     let inner = text_area(area)?;
     if !inner.contains(position) {
         return None;
     }
     let (cursor_row, _) = cursor_cell(text, cursor);
-    let scroll = cursor_row.saturating_sub(usize::from(inner.height).saturating_sub(1));
-    let row = usize::from(position.y - inner.y) + scroll;
+    let scroll = (cursor_row + chips).saturating_sub(usize::from(inner.height).saturating_sub(1));
+    let Some(row) = (usize::from(position.y - inner.y) + scroll).checked_sub(chips) else {
+        return Some(0);
+    };
 
     let lines: Vec<&str> = text.split('\n').collect();
     let Some(line) = lines.get(row) else {
@@ -256,7 +266,7 @@ mod tests {
         let text_x = inner.x + PROMPT_WIDTH;
 
         let text = "one two";
-        let at = |x| offset_at(text, 0, pane, Position::new(x, inner.y));
+        let at = |x| offset_at(text, 0, 0, pane, Position::new(x, inner.y));
         assert_eq!(at(text_x), Some(0));
         assert_eq!(at(text_x + 4), Some(4));
         // Left of the prompt is the start of the line; past the last
@@ -265,8 +275,11 @@ mod tests {
         assert_eq!(at(text_x + 7), Some(text.len()));
         assert_eq!(at(text_x + 30), Some(text.len()));
         // Outside the box entirely.
-        assert_eq!(offset_at(text, 0, pane, Position::new(31, inner.y)), None);
-        assert_eq!(offset_at(text, 0, pane, Position::new(text_x, 20)), None);
+        assert_eq!(
+            offset_at(text, 0, 0, pane, Position::new(31, inner.y)),
+            None
+        );
+        assert_eq!(offset_at(text, 0, 0, pane, Position::new(text_x, 20)), None);
     }
 
     #[test]
@@ -276,14 +289,14 @@ mod tests {
         assert_eq!(inner.height, 2);
         let text = "one\ntwo";
         let cursor = text.len();
-        let at = |x, y| offset_at(text, cursor, pane, Position::new(x, y));
+        let at = |x, y| offset_at(text, cursor, 0, pane, Position::new(x, y));
         let text_x = inner.x + PROMPT_WIDTH;
         assert_eq!(at(text_x + 1, inner.y), Some(1));
         assert_eq!(at(text_x + 1, inner.y + 1), Some(5));
         // A row with nothing written on it is the end of the draft.
         let short = "one";
         assert_eq!(
-            offset_at(short, 0, pane, Position::new(text_x, inner.y + 1)),
+            offset_at(short, 0, 0, pane, Position::new(text_x, inner.y + 1)),
             Some(short.len())
         );
     }
@@ -302,7 +315,7 @@ mod tests {
         let inner = text_area(pane).expect("room for the box");
         let text_x = inner.x + PROMPT_WIDTH;
         assert_eq!(
-            offset_at(text, text.len(), pane, Position::new(text_x, inner.y)),
+            offset_at(text, text.len(), 0, pane, Position::new(text_x, inner.y)),
             Some(8),
             "the top row of the box is the third line"
         );

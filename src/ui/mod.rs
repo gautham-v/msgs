@@ -13,6 +13,7 @@ pub mod filepick;
 pub mod format;
 pub mod help;
 pub mod message;
+pub mod notice;
 pub mod palette;
 pub mod reactions;
 pub mod status;
@@ -45,6 +46,11 @@ pub struct Panes {
     pub day: Option<Rect>,
     /// The scrolling message area.
     pub conversation: Rect,
+    /// The one row `copied N chars to clipboard` is written on, between the
+    /// messages and the composer. `None` whenever no notice is alive, which
+    /// is nearly always — the row belongs to the conversation the rest of the
+    /// time.
+    pub notice: Option<Rect>,
     /// The send box.
     pub composer: Rect,
     /// The row the chrome shares with the header — or the filter line, on
@@ -71,6 +77,7 @@ pub fn compute(area: Rect, app: &App) -> Panes {
             header: empty_at(area),
             day: None,
             conversation: empty_at(area),
+            notice: None,
             composer: empty_at(area),
             status: Rect {
                 height: 1.min(area.height),
@@ -80,7 +87,7 @@ pub fn compute(area: Rect, app: &App) -> Panes {
     }
 
     let (chat_list, chat_list_rows, convo) = split_chat_list(area, app);
-    let (header, day, conversation, composer) = split_conversation(convo, app);
+    let (header, day, conversation, notice, composer) = split_conversation(convo, app);
     let status = Rect {
         height: 1.min(header.height),
         ..header
@@ -93,6 +100,7 @@ pub fn compute(area: Rect, app: &App) -> Panes {
         header,
         day,
         conversation,
+        notice,
         composer,
         status,
     }
@@ -131,7 +139,7 @@ fn split_chat_list(area: Rect, app: &App) -> (Option<Rect>, Option<Rect>, Rect) 
     (Some(list), Some(rows), convo)
 }
 
-fn split_conversation(area: Rect, app: &App) -> (Rect, Option<Rect>, Rect, Rect) {
+fn split_conversation(area: Rect, app: &App) -> (Rect, Option<Rect>, Rect, Option<Rect>, Rect) {
     let mut rest = area;
     // Header text plus the rule under it.
     let header_height = if area.height >= 6 { 2 } else { 1 };
@@ -142,13 +150,20 @@ fn split_conversation(area: Rect, app: &App) -> (Rect, Option<Rect>, Rect, Rect)
     let composer_height = wanted.min(rest.height.saturating_sub(1)).max(1);
     let composer = take_bottom(&mut rest, composer_height, true).unwrap_or(empty_at(area));
 
+    // The copy notice is the one bit of chrome off the header's row, and it
+    // only exists while it has something to say. Like the day band it is a
+    // row of its own rather than a line painted over the bottom message, and
+    // it never takes the conversation's last row.
+    let room_for_a_notice = app.notice().is_some() && rest.height >= 2;
+    let notice = take_bottom(&mut rest, 1, room_for_a_notice);
+
     // The day band is a row of its own rather than a label painted over the
     // top message, so nothing a message says is ever hidden under it. It is
     // only worth a row once there are messages to label and a row to spare.
     let room_for_a_band = !app.message_rows.is_empty() && rest.height >= 3;
     let day = take_top(&mut rest, 1, room_for_a_band);
 
-    (header, day, rest, composer)
+    (header, day, rest, notice, composer)
 }
 
 fn take_top(rest: &mut Rect, rows: u16, when: bool) -> Option<Rect> {
@@ -237,6 +252,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let text = conversation::selection_text(frame.buffer_mut(), panes.conversation, &selection);
         app.copy_dragged(&text);
     }
+    if let Some(row) = panes.notice {
+        notice::render(frame, app, row);
+    }
     composer::render(frame, app, panes.composer);
     // The `@` picker stands on top of the composer, so it goes on after it
     // and before the chrome that shares the header's row.
@@ -298,6 +316,7 @@ mod tests {
         let mut rects = vec![panes.header, panes.conversation, panes.composer];
         rects.extend(panes.chat_list);
         rects.extend(panes.day);
+        rects.extend(panes.notice);
         rects.retain(|rect| rect.width > 0 && rect.height > 0);
         rects
     }
@@ -419,6 +438,37 @@ mod tests {
             let panes = compute(Rect::new(0, 0, 120, height), &app);
             assert!(
                 panes.conversation.height >= 1,
+                "no message rows at height {height}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_copy_notice_takes_a_row_only_while_it_is_alive() {
+        let mut app = app();
+        let area = Rect::new(0, 0, 120, 40);
+
+        let quiet = compute(area, &app);
+        assert!(quiet.notice.is_none(), "no notice, no row");
+
+        app.notify_copied(27);
+        let loud = compute(area, &app);
+        let notice = loud.notice.expect("a row for the notice");
+        assert_eq!(notice.height, 1);
+        assert_eq!(notice.y + 1, loud.composer.y, "directly above the composer");
+        assert_eq!(
+            notice.y,
+            loud.conversation.y + loud.conversation.height,
+            "and the row came off the bottom of the conversation"
+        );
+        assert_eq!(loud.conversation.height, quiet.conversation.height - 1);
+        assert_eq!(loud.composer, quiet.composer, "the composer does not move");
+
+        // Never at the cost of the conversation's last row.
+        for height in [4u16, 5, 6, 7] {
+            let tight = compute(Rect::new(0, 0, 120, height), &app);
+            assert!(
+                tight.conversation.height >= 1,
                 "no message rows at height {height}"
             );
         }
