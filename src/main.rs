@@ -28,6 +28,7 @@ use msgs::app::{App, WatcherStatus};
 use msgs::config::Config;
 use msgs::contacts::Contacts;
 use msgs::db::{Db, Source};
+use msgs::pins::Pins;
 use msgs::seen::Seen;
 use msgs::send::which;
 use msgs::{config, contacts, default_db_path, keymap, media, search, send, theme, ui};
@@ -71,6 +72,10 @@ struct Cli {
     #[arg(long)]
     no_contacts: bool,
 
+    /// Do not read Messages.app's pinned conversations; list every chat by recency.
+    #[arg(long)]
+    no_pins: bool,
+
     /// Mask phone numbers and addresses on screen, for a demo or a screenshot.
     /// Names from Contacts and message bodies still show.
     #[arg(long)]
@@ -105,6 +110,13 @@ fn main() -> Result<()> {
     // the status line and shows numbers.
     if !cli.no_contacts && app.config.contacts {
         app.enable_contacts_from_stores();
+    }
+
+    // The conversations pinned in Messages.app, out of its own preference file.
+    // Read-only, never written, and never fatal: a Mac that has pinned nothing
+    // simply has no such file, and the list is ordered by recency alone.
+    if !cli.no_pins && app.config.pins {
+        app.enable_pins_from_preferences();
     }
 
     // Whether Messages.app is up, asked on a timer on its own thread. The
@@ -409,6 +421,26 @@ fn check(cli: &Cli, warnings: &[String]) -> Result<()> {
         },
     );
 
+    // A path and a count. Which chats are pinned, and who they are with, stays
+    // out of the report the way every other address does.
+    row(
+        "pins",
+        &if cli.no_pins {
+            "off (--no-pins)".to_string()
+        } else {
+            Pins::default_path().map_or_else(
+                || "unavailable — no home directory".to_string(),
+                |path| {
+                    format!(
+                        "{} — {}",
+                        path.display(),
+                        Pins::load(&path).status().summary()
+                    )
+                },
+            )
+        },
+    );
+
     row(
         "config",
         &format!("{} — {config_state}", config_path.display()),
@@ -534,6 +566,7 @@ mod tests {
         assert!(cli.no_index);
         assert!(cli.no_images);
         assert!(!cli.no_contacts);
+        assert!(!cli.no_pins);
         assert!(!cli.check);
 
         let cli = Cli::parse_from(["msgs"]);
@@ -542,5 +575,9 @@ mod tests {
         assert!(!cli.no_index);
         assert!(!cli.no_images);
         assert!(!cli.no_contacts);
+        assert!(!cli.no_pins);
+
+        let cli = Cli::parse_from(["msgs", "--no-pins"]);
+        assert!(cli.no_pins);
     }
 }

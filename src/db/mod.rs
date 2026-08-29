@@ -250,8 +250,10 @@ pub struct Schema {
     /// `message.associated_message_emoji`, which carries custom-emoji tapbacks.
     pub tapback_emoji: bool,
     /// `chat.is_pinned`. Absent on every macOS to date — pinning lives in
-    /// Messages.app's preferences, not in the database.
+    /// Messages.app's preferences, not in the database. See [`crate::pins`].
     pub chat_is_pinned: bool,
+    /// `chat.original_group_id`, the identifier the pin state names a group by.
+    pub chat_original_group_id: bool,
 }
 
 /// An open, read-only connection to a Messages database.
@@ -309,6 +311,7 @@ impl Db {
         db.schema = Schema {
             tapback_emoji: db.has_column("message", "associated_message_emoji"),
             chat_is_pinned: db.has_column("chat", "is_pinned"),
+            chat_original_group_id: db.has_column("chat", "original_group_id"),
         };
         db
     }

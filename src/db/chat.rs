@@ -59,6 +59,12 @@ pub struct Chat {
     pub guid: String,
     /// `chat.chat_identifier`: the handle or group id the chat is addressed by.
     pub identifier: Option<String>,
+    /// `chat.group_id`: the identifier Messages gives a group thread.
+    pub group_id: Option<String>,
+    /// `chat.original_group_id`: the identifier the thread was created under,
+    /// and the one Messages.app's pin state refers to a group by. `None` on a
+    /// schema without the column, and on a one-to-one chat.
+    pub original_group_id: Option<String>,
     /// The name somebody gave the group, when there is one.
     pub display_name: Option<String>,
     /// `iMessage`, `SMS`, or `RCS`.
@@ -170,6 +176,22 @@ impl Chat {
     }
 }
 
+/// Put a chat list in the order the pane draws it: pinned first, newest first
+/// inside each group, and chats with no messages after everything that has one.
+///
+/// [`Db::chats`] leaves the list this way, and it is run again once
+/// [`crate::pins::Pins::apply`] has said which chats are pinned — the pin state
+/// lives in Messages.app's preferences rather than in a column the query could
+/// have ordered by.
+pub fn sort(chats: &mut [Chat]) {
+    chats.sort_by(|a, b| {
+        b.is_pinned()
+            .cmp(&a.is_pinned())
+            .then_with(|| b.last_message_date.cmp(&a.last_message_date))
+            .then_with(|| a.rowid.cmp(&b.rowid))
+    });
+}
+
 impl Db {
     /// Every chat, pinned first and newest first inside each group, with
     /// participants, counts, and the one-line preview filled in.
@@ -190,9 +212,16 @@ impl Db {
         } else {
             "NULL"
         };
+        // `original_group_id` is what Messages.app's pin state refers to a
+        // group by, and an older database may not have the column at all.
+        let original_group = if self.schema().chat_original_group_id {
+            "c.original_group_id"
+        } else {
+            "NULL"
+        };
         let sql = format!(
             "SELECT c.ROWID, c.guid, c.chat_identifier, c.display_name, c.service_name, \
-                    c.style, {pinned}, \
+                    c.style, {pinned}, c.group_id, {original_group}, \
                     COALESCE(MAX(m.date), 0), COALESCE(MAX(m.ROWID), 0), COUNT(m.ROWID), \
                     COALESCE(SUM(CASE WHEN m.is_from_me = 0 AND COALESCE(m.is_read, 0) = 0 \
                                        AND COALESCE(m.item_type, 0) = 0 \
@@ -208,21 +237,23 @@ impl Db {
         let mut statement = self.conn().prepare(&sql)?;
         let rows = statement.query_map([], |row| {
             let style: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or_default();
-            let unread_count: i64 = row.get::<_, Option<i64>>(10)?.unwrap_or_default();
+            let unread_count: i64 = row.get::<_, Option<i64>>(12)?.unwrap_or_default();
             Ok(Chat {
                 rowid: row.get(0)?,
                 guid: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
                 identifier: row.get(2)?,
+                group_id: row.get::<_, Option<String>>(7)?.filter(|id| !id.is_empty()),
+                original_group_id: row.get::<_, Option<String>>(8)?.filter(|id| !id.is_empty()),
                 display_name: row.get::<_, Option<String>>(3)?.filter(|s| !s.is_empty()),
                 service: row.get(4)?,
                 style,
                 is_group: style == STYLE_GROUP,
                 participants: Vec::new(),
                 is_pinned: row.get::<_, Option<i64>>(6)?.map(|flag| flag != 0),
-                last_message_date: row.get::<_, Option<i64>>(7)?.unwrap_or_default(),
-                last_message_rowid: row.get::<_, Option<i64>>(8)?.unwrap_or_default(),
+                last_message_date: row.get::<_, Option<i64>>(9)?.unwrap_or_default(),
+                last_message_rowid: row.get::<_, Option<i64>>(10)?.unwrap_or_default(),
                 preview: None,
-                message_count: row.get::<_, Option<i64>>(9)?.unwrap_or_default(),
+                message_count: row.get::<_, Option<i64>>(11)?.unwrap_or_default(),
                 unread_count,
                 // The local read state has not been over the row yet, so what
                 // msgs would draw is what the database said.
@@ -249,14 +280,7 @@ impl Db {
             chat.preview = previews.remove(&chat.last_message_rowid);
         }
 
-        // Pinned first, then newest first, with empty chats after everything
-        // that has a message.
-        chats.sort_by(|a, b| {
-            b.is_pinned()
-                .cmp(&a.is_pinned())
-                .then_with(|| b.last_message_date.cmp(&a.last_message_date))
-                .then_with(|| a.rowid.cmp(&b.rowid))
-        });
+        sort(&mut chats);
         Ok(chats)
     }
 
@@ -395,6 +419,8 @@ mod tests {
             rowid,
             guid: format!("iMessage;-;chat{rowid}"),
             identifier: Some(format!("chat{rowid}")),
+            group_id: None,
+            original_group_id: None,
             display_name: None,
             service: Some("iMessage".to_string()),
             style: 45,
