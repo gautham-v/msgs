@@ -340,11 +340,11 @@ fn o_on_a_link_opens_it_when_there_is_no_file_to_open() {
     app.load_conversation(fixtures::LINK_CHAT);
     app.focus = msgs::app::Focus::Conversation;
     app.messages.selected = 0;
+    // No browser tab may open from a test: the route to the browser is a
+    // field, and this one only records that it was taken.
+    app.browser = |_| Ok(());
 
     app.update(Action::OpenAttachment);
-    // The browser is not launched in a test environment, so the toast is
-    // whichever way `open` went — what matters is that it was not the
-    // "no attachment" refusal.
     let toast = app.status.active_toast().map(|(text, _)| text.to_string());
     assert!(
         toast.is_some_and(|text| !text.contains("no attachment")),

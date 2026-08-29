@@ -729,6 +729,9 @@ pub struct App {
     /// How text reaches the clipboard. A field so a test can drive `y`
     /// without touching the real pasteboard.
     clipboard: fn(&str) -> Result<(), crate::shell::Error>,
+    /// How a link reaches the browser. A field for the same reason: a test
+    /// that opens a link must not open a browser tab.
+    pub browser: fn(&str) -> Result<(), crate::shell::Error>,
     /// Rects from the last frame, for mouse hit-testing.
     pub panes: Panes,
     /// Last known mouse position, for the hover tint.
@@ -835,6 +838,7 @@ impl App {
             status,
             notice: None,
             clipboard: crate::shell::copy,
+            browser: crate::shell::open_url,
             panes: Panes::default(),
             hover: None,
             watcher: Watcher::off(),
@@ -2941,7 +2945,7 @@ impl App {
     /// Hand a link to the browser. The link is message content, so it is never
     /// echoed back onto the status line.
     fn open_link(&mut self, url: &str) {
-        match crate::shell::open_url(url) {
+        match (self.browser)(url) {
             Ok(()) => self.status.toast("opening the link"),
             Err(err) => self.status.error(format!("could not open the link: {err}")),
         }
