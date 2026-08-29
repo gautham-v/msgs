@@ -241,6 +241,117 @@ fn an_attachment_only_message_has_a_file_and_no_body() {
     assert!(photo.read_at().is_some());
 }
 
+/// The link fixture's page, oldest first.
+fn link_page(db: &Db) -> Vec<msgs::db::Message> {
+    db.messages_before(fixtures::LINK_CHAT, None, 50)
+        .expect("page")
+}
+
+#[test]
+fn a_link_balloon_hands_back_the_preview_messages_already_stored() {
+    let db = Db::open(&fixtures::link_database()).expect("open the link fixture");
+    assert!(
+        db.schema().link_preview,
+        "this schema carries payload_data and balloon_bundle_id"
+    );
+    let page = link_page(&db);
+
+    let linked = page
+        .iter()
+        .find(|message| message.rowid == fixtures::MSG_LINK)
+        .expect("the link message");
+    let preview = linked.link_preview.as_ref().expect("a preview");
+    assert_eq!(preview.url.as_deref(), Some(fixtures::LINK_URL));
+    assert_eq!(preview.title.as_deref(), Some(fixtures::LINK_TITLE));
+    assert_eq!(preview.site_name.as_deref(), Some(fixtures::LINK_SITE));
+    assert_eq!(preview.summary.as_deref(), Some(fixtures::LINK_SUMMARY));
+    assert_eq!(preview.site(), Some(fixtures::LINK_SITE));
+    assert_eq!(preview.host(), Some("example.invalid"));
+    assert!(!preview.is_empty());
+
+    // The URL is still the body, so the transcript keeps showing it.
+    assert_eq!(linked.text.as_deref(), Some(fixtures::LINK_URL));
+
+    // The picture is the second of the message's own attachments, which is
+    // where the archive said to look, and it is typed by its bytes rather than
+    // by the row Messages wrote.
+    let picture = preview.image.as_ref().expect("a preview picture");
+    assert_eq!(picture.rowid, linked.attachments[1].rowid);
+    assert_eq!(picture.mime_type.as_deref(), Some("image/png"));
+    assert!(picture.is_image());
+    assert!(!picture.hide_attachment);
+    assert_eq!(picture.path(), Some(fixtures::link_image()));
+    assert!(
+        linked.attachments.iter().all(|file| file.hide_attachment),
+        "the payload attachments themselves stay hidden"
+    );
+}
+
+#[test]
+fn an_unreadable_payload_is_no_preview_rather_than_an_error() {
+    let db = Db::open(&fixtures::link_database()).expect("open the link fixture");
+    let page = link_page(&db);
+
+    let broken = page
+        .iter()
+        .find(|message| message.rowid == fixtures::MSG_LINK_BROKEN)
+        .expect("the message with a broken payload");
+    assert!(broken.link_preview.is_none());
+
+    let bare = page
+        .iter()
+        .find(|message| message.rowid == fixtures::MSG_LINK_BARE)
+        .expect("the message with a bare URL");
+    assert!(bare.link_preview.is_none());
+    assert_eq!(bare.text.as_deref(), Some(fixtures::BARE_URL));
+}
+
+#[test]
+fn link_previews_can_be_switched_off_and_the_payload_is_never_read() {
+    let mut db = Db::open(&fixtures::link_database()).expect("open the link fixture");
+    assert!(db.link_previews(), "on unless somebody says otherwise");
+    db.set_link_previews(false);
+    assert!(
+        link_page(&db)
+            .iter()
+            .all(|message| message.link_preview.is_none())
+    );
+}
+
+#[test]
+fn a_database_without_the_payload_columns_simply_has_no_previews() {
+    // The shared fixture carries the columns; a `chat.db` old enough not to
+    // have them must page without asking for them.
+    let db = db();
+    assert!(db.schema().link_preview);
+    assert!(
+        db.messages_before(fixtures::CHAT_DIRECT, None, 50)
+            .expect("page")
+            .iter()
+            .all(|message| message.link_preview.is_none()),
+        "nothing in the shared fixture is a link balloon"
+    );
+}
+
+#[test]
+fn o_on_a_link_opens_it_when_there_is_no_file_to_open() {
+    let mut app = App::new(Config::default(), Vec::new());
+    app.open_db(fixtures::link_database());
+    app.load_conversation(fixtures::LINK_CHAT);
+    app.focus = msgs::app::Focus::Conversation;
+    app.messages.selected = 0;
+
+    app.update(Action::OpenAttachment);
+    // The browser is not launched in a test environment, so the toast is
+    // whichever way `open` went — what matters is that it was not the
+    // "no attachment" refusal.
+    let toast = app.status.active_toast().map(|(text, _)| text.to_string());
+    assert!(
+        toast.is_some_and(|text| !text.contains("no attachment")),
+        "`o` fell through to the link"
+    );
+}
+
 #[test]
 fn tapbacks_land_on_their_target_with_removals_already_applied() {
     let page = db()

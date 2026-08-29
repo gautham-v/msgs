@@ -620,7 +620,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
             let Some(attachment) = app
                 .message_rows
                 .get(entry.index)
-                .and_then(|message| message.attachments.get(spot.attachment))
+                .and_then(|message| spot.picture.of(message))
             else {
                 continue;
             };
@@ -644,6 +644,11 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
             // Where it actually landed, so a click can open it. The rect comes
             // from the very numbers the block reserved and `render` drew into,
             // clipped to the pane rather than measured again.
+            // A link preview's picture is not a file the reader can open, so
+            // it registers no hit and a click on it does nothing.
+            let Some(index) = spot.picture.attachment() else {
+                continue;
+            };
             let bottom = (top + i32::from(spot.rows)).min(i32::from(area.y + area.height));
             let visible_top = top.max(i32::from(area.y));
             if bottom > visible_top {
@@ -657,7 +662,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
                         height,
                     },
                     message: entry.index,
-                    attachment: spot.attachment,
+                    attachment: index,
                 });
             }
         }

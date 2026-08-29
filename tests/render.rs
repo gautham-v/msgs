@@ -732,6 +732,7 @@ fn message(rowid: i64, from_me: bool, handle_rowid: i64, text: &str, minutes: i6
         group_title: None,
         other_handle: None,
         group_action: None,
+        link_preview: None,
     }
 }
 

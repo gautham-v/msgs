@@ -99,6 +99,7 @@ Flags:
 | `--no-images` | do not draw pictures inline; show every attachment as a chip |
 | `--no-contacts` | do not read Contacts; show numbers and addresses instead of names |
 | `--no-pins` | do not read Messages.app's pinned conversations; list every chat by recency |
+| `--no-link-previews` | do not show the link previews Messages stored; leave the URL alone |
 | `--version` | print the version |
 
 ## Keys
@@ -290,6 +291,36 @@ alone. A path that is not a file on this Mac is not a drop at all and is typed
 into the composer like any other paste; a paste that is not a path is typed
 too, newlines included in the composer and flattened to spaces in the
 one-line fields.
+
+## Link previews
+
+When somebody sends a link, Messages.app fetches the page once — on the sending
+or the receiving device — and archives what it found next to the message:
+the title, the site's name, the page's own one-line summary, and the pictures it
+pulled down. msgs reads that archive and nothing else. **It never opens a
+socket.** A link Messages never previewed has no card, a preview stays exactly
+as stale as Messages left it, and no page is ever told you read the message.
+
+The card is drawn under the message, in the same column the rest of the block is
+set in: the picture where the terminal can draw one, then the title, the site,
+and one line of summary. Each row is truncated rather than wrapped, so a page
+with a paragraph for a title cannot push the thread around, and rows the preview
+has nothing for are simply not there. There is no box and no colour — the one
+accent on the block stays on the URL itself, which keeps its own line above the
+card, underlined the way every link is.
+
+`o` on a message opens its attachment; a message whose only content is a link
+has no file, so `o` opens the link in the browser instead. `Ctrl+L` does that
+from anywhere, and a click on the URL does too. The card's picture is not a file
+you can open or save — it belongs to the preview, not to the conversation — so
+clicking it does nothing.
+
+The pictures are ordinary attachment rows that Messages marks hidden and files
+under a `.pluginPayloadAttachment` name with no MIME type, so msgs types them by
+what their first bytes actually are and draws them through the same cache, at
+the same cap, as any photo. `--no-images` leaves the card as its three lines of
+text; `--no-link-previews`, or `link_previews = false` in the config, drops the
+card entirely and never reads the payload at all.
 
 ## Reading
 
@@ -550,6 +581,7 @@ mouse = true             # --no-mouse overrides this
 images = true            # draw pictures inline; --no-images overrides this
 contacts = true          # read Contacts for names; --no-contacts overrides this
 pins = true              # read Messages.app's pinned chats; --no-pins overrides this
+link_previews = true     # show the link previews Messages stored; --no-link-previews overrides this
 
 [theme]
 base = "dark"            # "light", "system" to follow macOS, or "terminal" to match the terminal
@@ -570,6 +602,7 @@ Every key, what it does, and what overrides it:
 | `images` | `true` | bool | draw pictures inline; `--no-images` overrides it to `false` |
 | `contacts` | `true` | bool | read Contacts for names; `--no-contacts` overrides it to `false` |
 | `pins` | `true` | bool | read Messages.app's pinned conversations so pinned chats come first; `--no-pins` overrides it to `false` |
+| `link_previews` | `true` | bool | show the link previews Messages already stored; `--no-link-previews` overrides it to `false` |
 | `[theme] base` | `terminal` | `dark`, `light`, `system`, `terminal` | the palette to start from; `--theme` overrides it and `Ctrl+T` cycles it at runtime |
 | `[theme]` | — | color per slot | any slot below, as `"#rrggbb"`, `"#rgb"`, or an ANSI index `0`–`255`, applied on top of `base` |
 

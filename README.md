@@ -22,6 +22,7 @@ Reactions need [`imsg`](https://github.com/steipete/imsg) (`brew install steipet
 
 - Chats, messages, group chats, names from Contacts, pictures inline, video posters
 - Conversations you pinned in Messages.app sit at the top of the list
+- Link previews from what Messages already stored — msgs never touches the network
 - Send text, files, replies, and reactions; live updates as messages land
 - Drag a file from Finder onto the window to attach it; `Enter` sends
 - `Ctrl+K` fuzzy jump to any chat or person, full-text search over every message

@@ -46,6 +46,26 @@ pub const MSG_GROUP_RENAME: i64 = 12;
 /// Body text that only exists inside `attributedBody`, never in `text`.
 pub const ATTRIBUTED_BODY: &str = "recovered from the typedstream";
 
+/// The chat [`link_database`] puts its link messages in.
+pub const LINK_CHAT: i64 = 1;
+/// A message whose link Messages built a full preview for.
+pub const MSG_LINK: i64 = 1;
+/// A message whose stored payload is not an archive at all.
+pub const MSG_LINK_BROKEN: i64 = 2;
+/// A message with a URL in the body that Messages never previewed.
+pub const MSG_LINK_BARE: i64 = 3;
+
+/// The invented page [`link_database`]'s preview is of.
+pub const LINK_URL: &str = "https://example.invalid/kitchen/nine-recipes";
+/// Its invented title.
+pub const LINK_TITLE: &str = "Nine Recipes for a Slow Sunday";
+/// The invented site it belongs to.
+pub const LINK_SITE: &str = "Example Kitchen";
+/// Its invented description.
+pub const LINK_SUMMARY: &str = "Nothing here was fetched: the fixture wrote it.";
+/// A URL nothing ever previewed.
+pub const BARE_URL: &str = "https://example.invalid/nothing-was-fetched";
+
 /// Nanoseconds per second, for readable timestamps.
 pub const SECOND: i64 = 1_000_000_000;
 /// An arbitrary but fixed instant in the Messages epoch: 2022-05-17 22:29:42Z.
@@ -75,6 +95,220 @@ pub fn database() -> PathBuf {
             path
         })
         .clone()
+}
+
+/// Path to the link-preview fixture, building it if it is not there yet.
+///
+/// Its own small database, so the shared fixture's two conversations stay
+/// exactly what every other test reads. One chat, three messages: a link
+/// Messages built a full preview for — title, summary, site, and a picture
+/// written beside the database — a payload that is not an archive at all, and a
+/// bare URL nothing ever previewed.
+pub fn link_database() -> PathBuf {
+    static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let path = fixture_dir().join("links.db");
+            if path.exists() {
+                return path;
+            }
+            let staging = path.with_extension(format!("db.building-{}", std::process::id()));
+            let _ = std::fs::remove_file(&staging);
+            build_links(&staging).expect("build the link fixture database");
+            std::fs::rename(&staging, &path).expect("move the link fixture into place");
+            path
+        })
+        .clone()
+}
+
+/// Where the fixture databases and the picture beside them live.
+fn fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+}
+
+/// The picture [`link_database`]'s preview points at: an invented PNG written
+/// beside the fixture, never a file out of `~/Library/Messages`.
+///
+/// Messages files these under a `.pluginPayloadAttachment` name with a
+/// generated UTI and no MIME type, so the fixture does too — proving that msgs
+/// finds the picture by what its bytes are rather than by what the row claims.
+pub fn link_image() -> PathBuf {
+    let path = fixture_dir().join("link-image.pluginPayloadAttachment");
+    if path.exists() {
+        return path;
+    }
+    let pixels = image::ImageBuffer::from_pixel(200, 100, image::Rgba::<u8>([9, 9, 9, 255]));
+    let staging = path.with_extension(format!("building-{}.png", std::process::id()));
+    image::DynamicImage::from(pixels)
+        .save_with_format(&staging, image::ImageFormat::Png)
+        .expect("write the fixture preview picture");
+    std::fs::rename(&staging, &path).expect("move the fixture picture into place");
+    path
+}
+
+/// One chat of link messages, and the attachments Messages hides beside them.
+fn build_links(path: &Path) -> rusqlite::Result<()> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch(SCHEMA)?;
+    handle(&conn, HANDLE_ALEX, "+15550000001", "iMessage")?;
+    chat(&conn, LINK_CHAT, "iMessage;-;+15550000001", 45, None)?;
+    conn.execute(
+        "INSERT INTO chat_handle_join (chat_id, handle_id) VALUES (?1, ?2)",
+        (LINK_CHAT, HANDLE_ALEX),
+    )?;
+
+    // The picture is the second attachment, which is where the archive below
+    // says to look for it; the first stands in for the site icon Messages
+    // stores alongside and nothing ever draws.
+    let payload = link_payload(1);
+    message(
+        &conn,
+        Row {
+            rowid: MSG_LINK,
+            chat: LINK_CHAT,
+            handle: HANDLE_ALEX,
+            from_me: false,
+            date: BASE,
+            text: Some(LINK_URL),
+            read: true,
+            payload: Some(&payload),
+            balloon: Some(URL_BALLOON),
+            ..Row::default()
+        },
+    )?;
+    plugin_attachment(&conn, 1, MSG_LINK, &fixture_dir().join("no-such-icon.ico"))?;
+    plugin_attachment(&conn, 2, MSG_LINK, &link_image())?;
+
+    message(
+        &conn,
+        Row {
+            rowid: MSG_LINK_BROKEN,
+            chat: LINK_CHAT,
+            handle: HANDLE_ALEX,
+            from_me: false,
+            date: BASE + 60 * SECOND,
+            text: Some(LINK_URL),
+            read: true,
+            payload: Some(b"this is not a property list"),
+            balloon: Some(URL_BALLOON),
+            ..Row::default()
+        },
+    )?;
+
+    message(
+        &conn,
+        Row {
+            rowid: MSG_LINK_BARE,
+            chat: LINK_CHAT,
+            handle: HANDLE_ALEX,
+            from_me: false,
+            date: BASE + 120 * SECOND,
+            text: Some(BARE_URL),
+            read: true,
+            ..Row::default()
+        },
+    )?;
+    Ok(())
+}
+
+/// The bundle id Messages stamps a rich-link balloon with.
+pub const URL_BALLOON: &str = "com.apple.messages.URLBalloonProvider";
+
+/// An `NSKeyedArchiver` archive shaped the way Messages writes one for a link.
+///
+/// `$objects` holds the graph and `$top.root` points into it; the title,
+/// summary, and site name are plain strings behind UID references, the URL is
+/// an `NSURL` (`NS.base` / `NS.relative`), and the picture is named by its
+/// position in the message's own attachments rather than by any path. Every
+/// string in it is invented above.
+fn link_payload(image_index: i64) -> Vec<u8> {
+    use plist::{Dictionary, Uid, Value};
+
+    let uid = |index: u64| Value::Uid(Uid::new(index));
+    let mut root = Dictionary::new();
+    root.insert("richLinkMetadata".to_string(), uid(2));
+    root.insert("richLinkIsPlaceholder".to_string(), Value::Boolean(false));
+
+    let mut metadata = Dictionary::new();
+    metadata.insert("title".to_string(), uid(3));
+    metadata.insert("summary".to_string(), uid(4));
+    metadata.insert("siteName".to_string(), uid(5));
+    metadata.insert("URL".to_string(), uid(6));
+    metadata.insert("image".to_string(), uid(8));
+
+    let mut url = Dictionary::new();
+    url.insert("NS.base".to_string(), uid(0));
+    url.insert("NS.relative".to_string(), uid(7));
+
+    let mut image = Dictionary::new();
+    image.insert(
+        "richLinkImageAttachmentSubstituteIndex".to_string(),
+        Value::Integer(image_index.into()),
+    );
+    image.insert("MIMEType".to_string(), uid(9));
+
+    let mut top = Dictionary::new();
+    top.insert("root".to_string(), uid(1));
+
+    let mut body = Dictionary::new();
+    body.insert("$version".to_string(), Value::Integer(100_000.into()));
+    body.insert(
+        "$archiver".to_string(),
+        Value::String("NSKeyedArchiver".to_string()),
+    );
+    body.insert("$top".to_string(), Value::Dictionary(top));
+    body.insert(
+        "$objects".to_string(),
+        Value::Array(vec![
+            Value::String("$null".to_string()),
+            Value::Dictionary(root),
+            Value::Dictionary(metadata),
+            Value::String(LINK_TITLE.to_string()),
+            Value::String(LINK_SUMMARY.to_string()),
+            Value::String(LINK_SITE.to_string()),
+            Value::Dictionary(url),
+            Value::String(LINK_URL.to_string()),
+            Value::Dictionary(image),
+            Value::String("image/png".to_string()),
+        ]),
+    );
+
+    let mut out = Vec::new();
+    Value::Dictionary(body)
+        .to_writer_binary(&mut out)
+        .expect("write the fixture archive");
+    out
+}
+
+/// One of the hidden `.pluginPayloadAttachment` rows Messages writes beside a
+/// link balloon.
+fn plugin_attachment(
+    conn: &Connection,
+    rowid: i64,
+    message_id: i64,
+    path: &Path,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO attachment (
+             ROWID, guid, original_guid, filename, uti, mime_type, transfer_name,
+             total_bytes, transfer_state, is_sticker, hide_attachment
+         ) VALUES (?1, ?2, ?2, ?3, 'dyn.fixture-plugin-payload', NULL, ?4, ?5, 5, 0, 1)",
+        rusqlite::params![
+            rowid,
+            format!("LINK-ATTACH-{rowid}"),
+            path.display().to_string(),
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_string()),
+            std::fs::metadata(path).map_or(0, |meta| i64::try_from(meta.len()).unwrap_or(0)),
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (?1, ?2)",
+        (message_id, rowid),
+    )
+    .map(|_| ())
 }
 
 /// How many messages [`large_database`] invents.
@@ -523,6 +757,10 @@ struct Row<'a> {
     group_action_type: i64,
     group_title: Option<&'a str>,
     other_handle: i64,
+    /// The `NSKeyedArchiver` blob a balloon message carries.
+    payload: Option<&'a [u8]>,
+    /// Which balloon wrote that payload.
+    balloon: Option<&'a str>,
 }
 
 fn message(conn: &Connection, row: Row<'_>) -> rusqlite::Result<()> {
@@ -530,8 +768,9 @@ fn message(conn: &Connection, row: Row<'_>) -> rusqlite::Result<()> {
         "INSERT INTO message (
              ROWID, guid, text, attributedBody, handle_id, service, is_from_me, is_read,
              date, date_delivered, date_read, date_edited, item_type, group_action_type,
-             group_title, other_handle, thread_originator_guid, associated_message_type
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 'iMessage', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 0)",
+             group_title, other_handle, thread_originator_guid, associated_message_type,
+             payload_data, balloon_bundle_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'iMessage', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 0, ?17, ?18)",
         rusqlite::params![
             row.rowid,
             guid(row.rowid),
@@ -549,6 +788,8 @@ fn message(conn: &Connection, row: Row<'_>) -> rusqlite::Result<()> {
             row.group_title,
             row.other_handle,
             row.thread_originator,
+            row.payload,
+            row.balloon,
         ],
     )?;
     conn.execute(
@@ -856,7 +1097,9 @@ CREATE TABLE message (
     reply_to_guid TEXT,
     thread_originator_guid TEXT,
     thread_originator_part TEXT,
-    date_edited INTEGER DEFAULT 0
+    date_edited INTEGER DEFAULT 0,
+    balloon_bundle_id TEXT,
+    payload_data BLOB
 );
 
 CREATE TABLE chat_message_join (

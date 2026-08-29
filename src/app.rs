@@ -770,7 +770,8 @@ impl App {
     pub fn open_db(&mut self, path: PathBuf) {
         self.db_path = Some(path.clone());
         match Db::open(&path) {
-            Ok(db) => {
+            Ok(mut db) => {
+                db.set_link_previews(self.config.link_previews);
                 self.status.db = DbStatus::Ready;
                 self.db_error = None;
                 self.db = Some(db);
@@ -2495,7 +2496,18 @@ impl App {
     }
 
     /// `o`: hand the selected attachment to `open`.
+    ///
+    /// A message with no file but a link in it opens the link instead, because
+    /// that is the thing on the row and `o` is the key for opening it. A link
+    /// balloon's own pictures are hidden attachments, so there is never a file
+    /// for `o` to fight over.
     fn open_attachment(&mut self) {
+        if self.selected_attachment().is_none()
+            && let Some(url) = self.selected_url()
+        {
+            self.open_link(&url);
+            return;
+        }
         self.open_attachment_at(None);
     }
 
@@ -2784,15 +2796,28 @@ impl App {
 
     /// `Ctrl+L`: open the first link in the selected message.
     fn open_selected_link(&mut self) {
-        let link = self
-            .selected_message()
-            .and_then(|message| message.text.as_deref())
-            .and_then(crate::ui::format::first_link);
-        let Some(url) = link else {
+        let Some(url) = self.selected_url() else {
             self.status.toast("no link in the selected message");
             return;
         };
         self.open_link(&url);
+    }
+
+    /// The link on the selected message: the first one in the body, or — for a
+    /// message Messages stored as a link balloon, whose body may be nothing
+    /// but the preview — the URL that preview is of.
+    fn selected_url(&self) -> Option<String> {
+        let message = self.selected_message()?;
+        message
+            .text
+            .as_deref()
+            .and_then(crate::ui::format::first_link)
+            .or_else(|| {
+                message
+                    .link_preview
+                    .as_ref()
+                    .and_then(|preview| preview.url.clone())
+            })
     }
 
     /// Hand a link to the browser. The link is message content, so it is never
@@ -3165,6 +3190,7 @@ fn echo_row(pending: &Pending) -> Message {
         group_title: None,
         other_handle: None,
         group_action: None,
+        link_preview: None,
     }
 }
 
@@ -3839,6 +3865,7 @@ mod tests {
             group_title: None,
             other_handle: None,
             group_action: None,
+            link_preview: None,
         }
     }
 
