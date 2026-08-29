@@ -46,9 +46,12 @@ Reactions need [`imsg`](https://github.com/steipete/imsg) (`brew install steipet
 | `PgUp` `PgDn` | page through the conversation | lists |
 | `g` / `G` (`Home` / `End`) | jump to top / bottom | lists |
 | `Ctrl+U` | mark everything seen here, or give the unread back | lists |
+| `any letter` | start typing straight into the composer | lists |
 | `/` | filter chats by name | chat list |
+| `→` | open the selected chat | chat list |
 | `/` | open the jump palette | conversation |
-| `i` | start typing in the composer | conversation |
+| `←` | back to the chat list | conversation |
+| `→` / `i` | start typing in the composer | conversation |
 | `o` | open the selected attachment | conversation |
 | `s` | save the selected attachment | conversation |
 | `r` | quote the selected message in a reply | conversation |

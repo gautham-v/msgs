@@ -4,7 +4,7 @@
 //! until `Enter` sends it.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
@@ -13,9 +13,11 @@ use crate::app::{App, Focus};
 
 /// Draw the composer, and place the terminal cursor in it when it has focus.
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
-    if area.width < 5 || area.height < 3 {
+    // One rectangle for the draft, so a click lands on the character the
+    // cursor was drawn under.
+    let Some(inner) = text_area(area) else {
         return;
-    }
+    };
     let theme = &app.theme;
     // The `@` picker takes the keys but not the draft: the cursor stays here
     // while it is open, because that is where what is typed is going.
@@ -44,7 +46,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(theme.text_secondary),
         )));
     }
-    let inner = block.inner(boxed);
+    debug_assert_eq!(inner, block.inner(boxed));
     frame.render_widget(block, boxed);
 
     let text = field.text();
@@ -116,9 +118,63 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// The `❯ ` marker in front of the first line of the draft, a cell in from
-/// the border.
+/// the border. Continuation lines are set in past it, so one width serves
+/// every row.
 const PROMPT: &str = " ❯ ";
 const PROMPT_WIDTH: u16 = 3;
+
+/// The rows the draft itself is drawn on: a column of air either side of the
+/// pane, then the border. `None` when the pane is too small to draw at all,
+/// which is the same test [`render`] leaves on.
+///
+/// One function, so a click lands where the cursor was drawn.
+#[must_use]
+pub fn text_area(area: Rect) -> Option<Rect> {
+    if area.width < 5 || area.height < 3 {
+        return None;
+    }
+    Some(Rect::new(
+        area.x + 2,
+        area.y + 1,
+        area.width - 4,
+        area.height - 2,
+    ))
+}
+
+/// Where a click at `position` puts the text cursor: a byte offset into
+/// `text`, or `None` when the click missed the drawn draft.
+///
+/// `cursor` is where the cursor is now, because that is what decides how far
+/// the box has scrolled. Past the end of what is written — a click in the
+/// blank right of the last character, or on a row below the draft — the
+/// answer is the end of the draft, where `End` goes.
+#[must_use]
+pub fn offset_at(text: &str, cursor: usize, area: Rect, position: Position) -> Option<usize> {
+    let inner = text_area(area)?;
+    if !inner.contains(position) {
+        return None;
+    }
+    let (cursor_row, _) = cursor_cell(text, cursor);
+    let scroll = cursor_row.saturating_sub(usize::from(inner.height).saturating_sub(1));
+    let row = usize::from(position.y - inner.y) + scroll;
+
+    let lines: Vec<&str> = text.split('\n').collect();
+    let Some(line) = lines.get(row) else {
+        return Some(text.len());
+    };
+    // Every line is set in past the prompt column, so a click left of it is
+    // the start of that line.
+    let start: usize = lines[..row].iter().map(|line| line.len() + 1).sum();
+    let text_x = inner.x + PROMPT_WIDTH;
+    if position.x < text_x {
+        return Some(start);
+    }
+    let column = usize::from(position.x - text_x);
+    match line.char_indices().nth(column) {
+        Some((index, _)) => Some(start + index),
+        None => Some(text.len()),
+    }
+}
 
 /// The dim line shown in an empty box: `Message Priya`, or what the path
 /// prompt is waiting for.
@@ -175,7 +231,8 @@ pub(crate) fn hint_line<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::cursor_cell;
+    use super::{PROMPT_WIDTH, cursor_cell, offset_at, text_area};
+    use ratatui::layout::{Position, Rect};
 
     #[test]
     fn cursor_cell_counts_lines_and_characters() {
@@ -189,5 +246,65 @@ mod tests {
     fn cursor_cell_counts_characters_not_bytes() {
         let text = "héllo";
         assert_eq!(cursor_cell(text, text.len()), (0, 5));
+    }
+
+    #[test]
+    fn a_click_lands_on_the_character_under_it() {
+        let pane = Rect::new(30, 20, 50, 3);
+        let inner = text_area(pane).expect("room for the box");
+        assert_eq!(inner, Rect::new(32, 21, 46, 1));
+        let text_x = inner.x + PROMPT_WIDTH;
+
+        let text = "one two";
+        let at = |x| offset_at(text, 0, pane, Position::new(x, inner.y));
+        assert_eq!(at(text_x), Some(0));
+        assert_eq!(at(text_x + 4), Some(4));
+        // Left of the prompt is the start of the line; past the last
+        // character is the end of the draft.
+        assert_eq!(at(inner.x), Some(0));
+        assert_eq!(at(text_x + 7), Some(text.len()));
+        assert_eq!(at(text_x + 30), Some(text.len()));
+        // Outside the box entirely.
+        assert_eq!(offset_at(text, 0, pane, Position::new(31, inner.y)), None);
+        assert_eq!(offset_at(text, 0, pane, Position::new(text_x, 20)), None);
+    }
+
+    #[test]
+    fn a_click_on_a_wrapped_draft_counts_the_lines_above_it() {
+        let pane = Rect::new(0, 0, 50, 4);
+        let inner = text_area(pane).expect("room for the box");
+        assert_eq!(inner.height, 2);
+        let text = "one\ntwo";
+        let cursor = text.len();
+        let at = |x, y| offset_at(text, cursor, pane, Position::new(x, y));
+        let text_x = inner.x + PROMPT_WIDTH;
+        assert_eq!(at(text_x + 1, inner.y), Some(1));
+        assert_eq!(at(text_x + 1, inner.y + 1), Some(5));
+        // A row with nothing written on it is the end of the draft.
+        let short = "one";
+        assert_eq!(
+            offset_at(short, 0, pane, Position::new(text_x, inner.y + 1)),
+            Some(short.len())
+        );
+    }
+
+    #[test]
+    fn a_pane_too_small_for_the_box_has_no_text_area() {
+        assert_eq!(text_area(Rect::new(0, 0, 4, 3)), None);
+        assert_eq!(text_area(Rect::new(0, 0, 50, 2)), None);
+    }
+
+    #[test]
+    fn a_click_on_a_scrolled_draft_follows_the_cursor_line() {
+        // Four lines in a two-row box: the box is showing the last two.
+        let pane = Rect::new(0, 0, 50, 4);
+        let text = "one\ntwo\nthree\nfour";
+        let inner = text_area(pane).expect("room for the box");
+        let text_x = inner.x + PROMPT_WIDTH;
+        assert_eq!(
+            offset_at(text, text.len(), pane, Position::new(text_x, inner.y)),
+            Some(8),
+            "the top row of the box is the third line"
+        );
     }
 }
