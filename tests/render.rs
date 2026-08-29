@@ -1499,3 +1499,73 @@ fn taking_a_reaction_back_removes_the_chip_before_the_database_does() {
     let buffer = frame(&mut app, 120, 34);
     assert!(!my_chip(&buffer, "❤"), "the chip goes at once");
 }
+
+/// A throwaway tree for the `@` picker, removed when the test ends. Never the
+/// reader's own folders: `App::picker_roots` is pointed at this instead.
+struct TempTree(PathBuf);
+
+impl TempTree {
+    fn new() -> Self {
+        let base = std::env::temp_dir().join(format!(
+            "msgs-render-picker-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("Downloads")).expect("a temporary tree");
+        std::fs::write(base.join("Downloads/report.pdf"), b"x").expect("a file");
+        Self(base)
+    }
+
+    fn root(&self) -> PathBuf {
+        self.0.join("Downloads")
+    }
+}
+
+impl Drop for TempTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn an_at_opens_the_file_picker_over_the_composer_and_enter_chips_the_file() {
+    let tree = TempTree::new();
+    let mut app = app();
+    app.update(Action::FocusPane(Focus::Composer));
+    app.picker_roots = Some(vec![tree.root()]);
+
+    type_text(&mut app, "look at @rep");
+    assert_eq!(app.focus, Focus::FilePicker);
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("terminal");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw succeeded");
+    let buffer = terminal.backend().buffer().clone();
+    assert!(contains(&buffer, "report.pdf"), "the matched file");
+    assert!(contains(&buffer, "Enter attach"), "the picker footer");
+    assert!(
+        contains(&buffer, "look at @rep"),
+        "the draft is still there"
+    );
+
+    // The picker sits above the send box, and the draft keeps the cursor.
+    let composer = app.panes.composer;
+    let listed = rows(&buffer)
+        .iter()
+        .position(|row| row.contains("report.pdf"))
+        .expect("a row with the file on it");
+    assert!(
+        u16::try_from(listed).expect("a row number") < composer.y,
+        "the picker is drawn above the composer"
+    );
+    let cursor = terminal.backend().cursor_position();
+    assert!(cursor.y > composer.y && cursor.y < composer.y + composer.height);
+
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.focus, Focus::Composer);
+    let buffer = frame(&mut app, 120, 34);
+    assert!(contains(&buffer, "report.pdf"), "the chip names the file");
+    assert!(contains(&buffer, "look at "), "and the draft carries on");
+}

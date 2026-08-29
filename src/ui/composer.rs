@@ -1,6 +1,7 @@
 //! The send box: a rounded hairline box with the `❯` prompt and the draft, a
-//! column in from either edge of the pane. A file dropped from Finder waits
-//! above the draft as a `📎 name` chip until `Enter` sends it.
+//! column in from either edge of the pane. A file dropped from Finder or
+//! queued by the `@` picker waits above the draft as a `📎 name` chip
+//! until `Enter` sends it.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -16,7 +17,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let theme = &app.theme;
-    let focused = app.focus == Focus::Composer;
+    // The `@` picker takes the keys but not the draft: the cursor stays here
+    // while it is open, because that is where what is typed is going.
+    let focused = matches!(app.focus, Focus::Composer | Focus::FilePicker);
     let attaching = app.attach_prompt.as_ref();
     let field = attaching.unwrap_or(&app.composer);
 

@@ -10,11 +10,13 @@ use std::time::{Duration, Instant};
 
 use chrono::Local;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use nucleo_matcher::{Config as MatcherConfig, Matcher};
 use ratatui::layout::{Position, Rect};
 
 use crate::config::{Config, MIN_WIDTH_FOR_CHAT_LIST};
 use crate::contacts::Contacts;
 use crate::db::{AttachmentRef, Chat, Db, DbError, MAX_PAGE, Message, PAGE, Source};
+use crate::filepick::{self, Entry};
 use crate::jump::{self, Jump};
 use crate::media::{self, Images};
 use crate::pins::Pins;
@@ -68,6 +70,12 @@ pub enum Focus {
     Conversation,
     /// The send box under the conversation.
     Composer,
+    /// The `@` file picker, listing files just above the composer.
+    ///
+    /// Not an overlay: the draft keeps the cursor and every key that is not
+    /// the picker's own still types into it, which is what makes typing after
+    /// the `@` narrow the list.
+    FilePicker,
     /// The `Ctrl+K` jump palette, floating over everything.
     Palette,
     /// The `?` help modal.
@@ -432,6 +440,21 @@ impl TextField {
         std::mem::take(&mut self.text)
     }
 
+    /// Replace the bytes in `start..end` with `text`, leaving the cursor at
+    /// the end of what was put in.
+    ///
+    /// This is how the `@` picker rewrites the run it owns — the `@` and
+    /// everything typed after it — without disturbing the rest of the draft.
+    pub fn splice(&mut self, start: usize, end: usize, text: &str) {
+        let start = start.min(self.text.len());
+        let end = end.clamp(start, self.text.len());
+        if !self.text.is_char_boundary(start) || !self.text.is_char_boundary(end) {
+            return;
+        }
+        self.text.replace_range(start..end, text);
+        self.cursor = start + text.len();
+    }
+
     /// Move the cursor one character left.
     pub fn cursor_left(&mut self) {
         if let Some(prev) = self.prev_boundary() {
@@ -475,6 +498,95 @@ impl TextField {
             .chars()
             .next()
             .map(|c| self.cursor + c.len_utf8())
+    }
+}
+
+/// The `@` file picker, open in front of the composer while `Some`.
+///
+/// The query lives in the draft rather than in a field of its own: everything
+/// from the `@` to the cursor is what the picker matches, so an ordinary
+/// keystroke narrows the list, `Backspace` widens it, and `Esc` walks away
+/// leaving exactly what was typed. [`FilePicker::at`] is where that run
+/// starts, which is also where the cursor goes back to once a file is picked.
+pub struct FilePicker {
+    /// Byte offset of the `@` that opened it, inside the draft.
+    pub at: usize,
+    /// The roots the listing came from, resolved once when the picker opened.
+    pub roots: Vec<PathBuf>,
+    /// What is being listed, most recently modified first.
+    pub entries: Vec<Entry>,
+    /// Which of [`FilePicker::entries`] match, best first, with the character
+    /// ranges of each label that matched.
+    pub rows: Vec<filepick::Match>,
+    /// Selection and scroll of the result list.
+    pub list: ListPane,
+    /// The directory part the entries were listed for, so only a move between
+    /// directories reads the disk again.
+    listed: Option<String>,
+    /// The query the rows were filtered for, so a redraw does not re-match.
+    built: Option<String>,
+    /// Reused scratch memory, the way the palette keeps one.
+    matcher: Matcher,
+}
+
+impl std::fmt::Debug for FilePicker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FilePicker")
+            .field("at", &self.at)
+            .field("entries", &self.entries.len())
+            .field("rows", &self.rows.len())
+            .field("selected", &self.list.selected)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FilePicker {
+    /// Open a picker for an `@` at byte offset `at` in the draft, listing
+    /// `roots`.
+    #[must_use]
+    pub fn new(at: usize, roots: Vec<PathBuf>) -> Self {
+        Self {
+            at,
+            roots,
+            entries: Vec::new(),
+            rows: Vec::new(),
+            list: ListPane::default(),
+            listed: None,
+            built: None,
+            matcher: Matcher::new(MatcherConfig::DEFAULT),
+        }
+    }
+
+    /// The highlighted entry, if the list has one.
+    #[must_use]
+    pub fn selected(&self) -> Option<&Entry> {
+        self.rows
+            .get(self.list.selected)
+            .and_then(|row| self.entries.get(row.index))
+    }
+
+    /// Re-list and re-match for `query`, doing neither when nothing moved.
+    ///
+    /// The listing is cached per directory: typing after the `@` only
+    /// re-matches what is already in memory, and only a `/` — a different
+    /// directory part — sends the picker back to the filesystem.
+    pub fn refresh(&mut self, query: &str) {
+        let (dir, _) = filepick::split(query);
+        if self.listed.as_deref() != Some(dir) {
+            let home = dirs::home_dir();
+            self.entries =
+                filepick::entries_for(query, &self.roots, home.as_deref(), filepick::CAP);
+            self.listed = Some(dir.to_string());
+            self.built = None;
+        }
+        if self.built.as_deref() == Some(query) {
+            return;
+        }
+        self.built = Some(query.to_string());
+        self.rows = filepick::filter(&self.entries, query, &mut self.matcher);
+        self.list.set_len(self.rows.len());
+        self.list.selected = 0;
+        self.list.offset = 0;
     }
 }
 
@@ -633,9 +745,16 @@ pub struct App {
     /// The `Ctrl+A` path prompt, which takes the composer's place while it is
     /// open.
     pub attach_prompt: Option<TextField>,
-    /// Files dropped onto the composer and waiting for `Enter`, in the order
-    /// they were dropped. Each is a chip at the top of the send box.
+    /// Files dropped onto the composer or queued by the `@` picker and waiting
+    /// for `Enter`, in the order they arrived. Each is a chip at the top of the
+    /// send box.
     pub attached: Vec<PathBuf>,
+    /// The `@` file picker, open in front of the composer while `Some`.
+    pub file_picker: Option<FilePicker>,
+    /// Where the `@` picker looks. `None` is [`filepick::roots`] — the real
+    /// folders — and the tests set it to a temporary tree, which is what keeps
+    /// them out of anybody's home directory.
+    pub picker_roots: Option<Vec<PathBuf>>,
     /// Messages sent but not yet read back out of `chat.db`, oldest first.
     /// They are drawn as ordinary blocks at the end of the open conversation.
     pub pending: Vec<Pending>,
@@ -763,6 +882,8 @@ impl App {
             composer: TextField::default(),
             attach_prompt: None,
             attached: Vec::new(),
+            file_picker: None,
+            picker_roots: None,
             pending: Vec::new(),
             pending_tapbacks: Vec::new(),
             reaction_picker: None,
@@ -1973,6 +2094,9 @@ impl App {
     }
 
     fn open_overlay(&mut self, overlay: Focus) {
+        // The picker is not an overlay, so an overlay opening over it would
+        // leave it on screen with nothing steering it.
+        self.close_file_picker();
         if !self.focus.is_overlay() {
             self.overlay_return = self.focus;
         }
@@ -1994,6 +2118,9 @@ impl App {
     fn active_field(&mut self) -> Option<&mut TextField> {
         match self.focus {
             Focus::Composer => Some(self.attach_prompt.as_mut().unwrap_or(&mut self.composer)),
+            // The picker never takes the draft away: what is typed while it
+            // is open is the query, and it is typed where it will stay.
+            Focus::FilePicker => Some(&mut self.composer),
             Focus::Palette => Some(&mut self.palette),
             Focus::ChatList => self.chat_filter.as_mut(),
             _ => None,
@@ -2006,6 +2133,7 @@ impl App {
             Focus::ChatList => Some(&mut self.chats),
             Focus::Conversation => Some(&mut self.messages),
             Focus::Palette => Some(&mut self.jump.list),
+            Focus::FilePicker => self.file_picker.as_mut().map(|picker| &mut picker.list),
             Focus::Help | Focus::Composer | Focus::Reactions | Focus::DbError => None,
         }
     }
@@ -2016,7 +2144,12 @@ impl App {
             Action::Quit => self.should_quit = true,
             Action::FocusNext => self.cycle_focus(true),
             Action::FocusPrev => self.cycle_focus(false),
-            Action::FocusPane(pane) => self.focus = pane,
+            Action::FocusPane(pane) => {
+                if pane != Focus::FilePicker {
+                    self.close_file_picker();
+                }
+                self.focus = pane;
+            }
             Action::FocusComposer => self.focus = Focus::Composer,
             Action::ToggleChatList => self.toggle_chat_list(),
             Action::CycleTheme => self.cycle_theme(),
@@ -2036,12 +2169,19 @@ impl App {
             Action::Cancel => self.cancel(),
             Action::StartFilter => self.start_filter(),
             Action::Insert(c) => {
-                // The picker is a menu, not a text field: a digit picks the
-                // reaction at that position and sends it.
+                // The reaction picker is a menu, not a text field: a digit
+                // picks the reaction at that position and sends it.
                 if self.focus == Focus::Reactions {
                     self.pick_reaction(c);
+                } else if self.focus == Focus::FilePicker && c == '/' && self.enter_directory() {
+                    // A `/` on a highlighted directory is the way into it,
+                    // and `enter_directory` writes the query that lists it.
                 } else {
+                    let opens = c == '@' && self.at_opens_the_picker();
                     self.edit(|field| field.insert(c));
+                    if opens {
+                        self.open_file_picker();
+                    }
                 }
             }
             Action::Backspace => self.backspace(),
@@ -2066,6 +2206,7 @@ impl App {
         // arrow key, and a click all leave the chat list in the same state.
         self.refresh(!matches!(action, Action::Scroll(_)));
         self.refresh_jump();
+        self.refresh_file_picker();
     }
 
     /// `Ctrl+K`: open the palette with the list you already have.
@@ -2423,6 +2564,7 @@ impl App {
                 }
             }
             Focus::Palette => self.jump_to_selected(),
+            Focus::FilePicker => self.pick_file(),
             Focus::Conversation => self.focus = Focus::Composer,
             Focus::Reactions => self.send_reaction(),
             Focus::Help => self.close_overlay(),
@@ -2465,6 +2607,10 @@ impl App {
                     self.focus = Focus::ChatList;
                 }
             }
+            // `Esc` in the picker leaves the `@` and whatever was typed after
+            // it standing in the draft, which is how a literal `@` is had at
+            // the start of a word.
+            Focus::FilePicker => self.close_file_picker(),
             Focus::DbError => {}
         }
     }
@@ -2475,6 +2621,144 @@ impl App {
         }
         self.focus = Focus::ChatList;
         self.chat_filter = Some(TextField::default());
+    }
+
+    /// Whether an `@` about to be typed opens the picker rather than landing
+    /// in the draft as a character.
+    fn at_opens_the_picker(&self) -> bool {
+        if self.focus != Focus::Composer || self.attach_prompt.is_some() {
+            return false;
+        }
+        let cursor = self.composer.cursor();
+        self.composer
+            .text()
+            .get(..cursor)
+            .is_some_and(filepick::triggers)
+    }
+
+    /// Open the picker on the `@` the cursor has just gone past.
+    fn open_file_picker(&mut self) {
+        let at = self.composer.cursor().saturating_sub(1);
+        let roots = self.picker_roots.clone().unwrap_or_else(filepick::roots);
+        self.file_picker = Some(FilePicker::new(at, roots));
+        self.focus = Focus::FilePicker;
+    }
+
+    /// Close the picker, leaving the draft exactly as it stands.
+    fn close_file_picker(&mut self) {
+        if self.file_picker.take().is_some() && self.focus == Focus::FilePicker {
+            self.focus = Focus::Composer;
+        }
+    }
+
+    /// What the picker is matching: the draft from just past the `@` to the
+    /// cursor. `None` once that run is not there any more, which is what a
+    /// backspace past the `@` leaves behind.
+    fn picker_query(&self) -> Option<String> {
+        let picker = self.file_picker.as_ref()?;
+        let text = self.composer.text();
+        if text
+            .get(picker.at..)
+            .is_none_or(|rest| !rest.starts_with('@'))
+        {
+            return None;
+        }
+        let start = picker.at + 1;
+        let query = text.get(start..self.composer.cursor())?;
+        // A newline ends the run: the draft has moved on to another line.
+        (!query.contains('\n')).then(|| query.to_string())
+    }
+
+    /// Re-list and re-match after a keystroke, and close the picker once the
+    /// `@` it hangs off is gone.
+    ///
+    /// Called after every action, and cheap when nothing changed: the listing
+    /// is kept per directory and the rows remember the query they were built
+    /// for.
+    fn refresh_file_picker(&mut self) {
+        if self.file_picker.is_none() {
+            return;
+        }
+        if self.focus != Focus::FilePicker {
+            self.close_file_picker();
+            return;
+        }
+        let Some(query) = self.picker_query() else {
+            self.close_file_picker();
+            return;
+        };
+        if let Some(picker) = self.file_picker.as_mut() {
+            picker.refresh(&query);
+        }
+    }
+
+    /// Write the query that lists the highlighted directory, which is what a
+    /// `/` does in the picker. `false` when there is no directory under the
+    /// cursor, so the `/` is typed instead.
+    fn enter_directory(&mut self) -> bool {
+        let Some((at, query)) = self.file_picker.as_ref().and_then(|picker| {
+            let entry = picker.selected().filter(|entry| entry.is_dir)?;
+            Some((picker.at, filepick::descend(entry)))
+        }) else {
+            return false;
+        };
+        let cursor = self.composer.cursor();
+        self.composer.splice(at, cursor, &format!("@{query}"));
+        true
+    }
+
+    /// `Backspace` in the picker with the cursor just past a `/`: leave the
+    /// directory rather than eat its name a letter at a time. `false` when
+    /// the query is not sitting on a boundary, so the backspace is ordinary.
+    fn ascend_directory(&mut self) -> bool {
+        let Some((at, up)) = self.file_picker.as_ref().and_then(|picker| {
+            let query = self.picker_query()?;
+            if !query.ends_with('/') {
+                return None;
+            }
+            Some((picker.at, filepick::ascend(&query)?))
+        }) else {
+            return false;
+        };
+        let cursor = self.composer.cursor();
+        self.composer.splice(at, cursor, &format!("@{up}"));
+        true
+    }
+
+    /// `Enter` in the picker: queue the highlighted file, or go into the
+    /// highlighted directory.
+    ///
+    /// The `@` and everything typed after it come back out of the draft, and
+    /// the cursor lands where the `@` was, so typing carries straight on.
+    fn pick_file(&mut self) {
+        if self.enter_directory() {
+            return;
+        }
+        let Some(entry) = self
+            .file_picker
+            .as_ref()
+            .and_then(FilePicker::selected)
+            .cloned()
+        else {
+            self.status.toast("nothing there to attach");
+            return;
+        };
+        let at = self.file_picker.as_ref().map_or(0, |picker| picker.at);
+        let cursor = self.composer.cursor();
+        self.composer.splice(at, cursor, "");
+        let label = file_label(&entry.path);
+        self.attached.push(entry.path);
+        self.close_file_picker();
+        self.status.toast(format!("attached {label}"));
+    }
+
+    /// The chips drawn above the draft, one per queued file.
+    #[must_use]
+    pub fn attachment_chips(&self) -> Vec<String> {
+        self.attached
+            .iter()
+            .map(|path| format!("📎 {}", file_label(path)))
+            .collect()
     }
 
     /// `Ctrl+A`: ask for a path, in the composer's place.
@@ -2812,7 +3096,24 @@ impl App {
             self.attach_prompt = None;
             return;
         }
+        // A `/` behind the cursor is a directory the picker went into, and
+        // one `Backspace` comes back out of it.
+        if self.focus == Focus::FilePicker && self.ascend_directory() {
+            return;
+        }
+        // With nothing left to delete, `Backspace` takes the last queued
+        // file back off the draft rather than doing nothing at all.
+        if self.focus == Focus::Composer
+            && self.composer.is_empty()
+            && let Some(path) = self.attached.pop()
+        {
+            self.status
+                .toast(format!("took {} back off", file_label(&path)));
+            return;
+        }
         self.edit(TextField::backspace);
+        // Backspacing past the `@` takes the `@` with it, and the picker with
+        // that; `refresh_file_picker` notices on the way out of `update`.
     }
 
     /// `y`: put the selected message on the clipboard.
@@ -3303,6 +3604,15 @@ fn recent_enough(echoed: i64, arrived: i64) -> bool {
         return true;
     };
     (arrived - echoed).abs() <= RECONCILE_SLACK
+}
+
+/// What a file is called on a chip and in the echo that sends it.
+#[must_use]
+fn file_label(path: &std::path::Path) -> String {
+    path.file_name().map_or_else(
+        || "attachment".to_string(),
+        |name| name.to_string_lossy().to_string(),
+    )
 }
 
 /// Expand a leading `~` and make the path absolute, the way a shell would.
@@ -3954,6 +4264,155 @@ mod tests {
             Some("iMessage;-;+15550000000")
         );
         assert_eq!(recorded[0].2, Outgoing::Text("on my way".to_string()));
+    }
+
+    /// A throwaway tree for the `@` picker: a `Downloads` root with two files
+    /// and a directory in it. Never the reader's own home — every picker test
+    /// points [`App::picker_roots`] at one of these and it goes when the test
+    /// ends.
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new(tag: &str) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "msgs-picker-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(base.join("Downloads/trip")).expect("a temporary tree");
+            std::fs::write(base.join("Downloads/report.pdf"), b"x").expect("a file");
+            std::fs::write(base.join("Downloads/notes.txt"), b"x").expect("a file");
+            std::fs::write(base.join("Downloads/trip/beach.jpg"), b"x").expect("a file");
+            Self(base)
+        }
+
+        fn root(&self) -> PathBuf {
+            self.0.join("Downloads")
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// An app whose `@` picker lists a temporary tree and nothing else.
+    fn app_with_files(tag: &str) -> (App, TempTree) {
+        let tree = TempTree::new(tag);
+        let mut app = app_with_chat();
+        app.picker_roots = Some(vec![tree.root()]);
+        (app, tree)
+    }
+
+    #[test]
+    fn an_at_opens_the_picker_at_a_word_start_and_types_itself_anywhere_else() {
+        let (mut app, _tree) = app_with_files("trigger");
+        compose(&mut app, "sam@example.invalid");
+        assert!(app.file_picker.is_none(), "an address is not a picker");
+        assert_eq!(app.focus, Focus::Composer);
+
+        compose(&mut app, " @");
+        assert_eq!(app.focus, Focus::FilePicker);
+        let picker = app.file_picker.as_ref().expect("the picker");
+        assert_eq!(picker.at, app.composer.cursor() - 1);
+        assert_eq!(picker.rows.len(), 3, "two files and a directory");
+    }
+
+    #[test]
+    fn typing_after_the_at_narrows_the_list_and_enter_hangs_the_file_above_the_box() {
+        let (mut app, _tree) = app_with_files("attach");
+        compose(&mut app, "look at @rep");
+        assert_eq!(app.focus, Focus::FilePicker);
+        let picker = app.file_picker.as_ref().expect("the picker");
+        assert_eq!(picker.rows.len(), 1);
+        assert!(
+            picker
+                .selected()
+                .expect("a highlighted file")
+                .label
+                .ends_with("report.pdf")
+        );
+
+        app.update(Action::Activate);
+        // The `@` and the query come back out, and the cursor is where the
+        // `@` was, so typing carries on.
+        assert_eq!(app.composer.text(), "look at ");
+        assert_eq!(app.composer.cursor(), "look at ".len());
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(app.file_picker.is_none());
+        assert_eq!(app.attachment_chips(), vec!["📎 report.pdf".to_string()]);
+    }
+
+    #[test]
+    fn a_slash_goes_into_the_highlighted_directory_and_a_backspace_comes_back_out() {
+        let (mut app, _tree) = app_with_files("descend");
+        compose(&mut app, "@tri");
+        assert_eq!(app.focus, Focus::FilePicker);
+
+        app.update(Action::Insert('/'));
+        assert_eq!(app.composer.text(), "@Downloads/trip/");
+        let picker = app.file_picker.as_ref().expect("the picker");
+        assert_eq!(picker.rows.len(), 1);
+        assert_eq!(
+            picker.selected().expect("the file").label,
+            "Downloads/trip/beach.jpg"
+        );
+
+        // One `Backspace` on the boundary leaves the whole directory.
+        app.update(Action::Backspace);
+        assert_eq!(app.composer.text(), "@Downloads/");
+        assert_eq!(app.focus, Focus::FilePicker);
+        assert_eq!(app.file_picker.as_ref().expect("the picker").rows.len(), 3);
+    }
+
+    #[test]
+    fn esc_keeps_the_at_and_backspacing_past_it_closes_the_picker() {
+        let (mut app, _tree) = app_with_files("escape");
+        compose(&mut app, "@no");
+        app.update(Action::Cancel);
+        assert!(app.file_picker.is_none());
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(
+            app.composer.text(),
+            "@no",
+            "the `@` stays where it was typed"
+        );
+
+        // And backspacing over the `@` takes the picker with it.
+        compose(&mut app, " @");
+        assert_eq!(app.focus, Focus::FilePicker);
+        app.update(Action::Backspace);
+        assert!(app.file_picker.is_none());
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.composer.text(), "@no ");
+    }
+
+    #[test]
+    fn enter_sends_the_queued_files_ahead_of_the_words() {
+        let (mut app, tree) = app_with_files("send");
+        compose(&mut app, "@rep");
+        app.update(Action::Activate);
+        compose(&mut app, "here you go");
+        app.update(Action::Activate);
+
+        let recorded = app.outbox.recorded();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(
+            recorded[0].2,
+            Outgoing::File(tree.root().join("report.pdf"))
+        );
+        assert_eq!(recorded[1].2, Outgoing::Text("here you go".to_string()));
+        assert!(app.attached.is_empty(), "the chips go with the send");
+        assert!(app.composer.is_empty());
+
+        // A `Backspace` on an empty draft takes the last chip back off.
+        compose(&mut app, "@rep");
+        app.update(Action::Activate);
+        assert_eq!(app.attached.len(), 1);
+        app.update(Action::Backspace);
+        assert!(app.attached.is_empty());
     }
 
     /// One invented message in the open conversation, selected.
