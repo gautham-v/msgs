@@ -6,7 +6,10 @@
 //! one again takes it back.
 //!
 //! Without `imsg` on `$PATH` there is no way to put a reaction on the wire at
-//! all, so the picker says how to install it and the row is drawn dim.
+//! all, so the picker says how to install it and the row is drawn dim. The
+//! same goes for the message a stock Mac cannot reach: with System Integrity
+//! Protection on, `imsg` gets at the newest incoming message of a chat and no
+//! other, and the caption says so before `Enter` rather than after.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
@@ -15,13 +18,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 
 use crate::app::{App, ReactionPicker};
-use crate::send::{IMSG, IMSG_INSTALL, REACTIONS};
+use crate::send::{IMSG, IMSG_INSTALL, REACTIONS, SIP_REACH};
 use crate::theme::Theme;
 
 /// Width of the picker in columns, before clamping to the screen.
 const WIDTH: u16 = 52;
 /// Two borders plus the glyph row, a blank row, and the caption.
 const HEIGHT: u16 = 5;
+/// Blank columns kept either side of the text, inside the borders.
+const PAD: u16 = 1;
 
 /// Draw the picker centered over `area`.
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
@@ -47,7 +52,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme.border_active))
         .style(Style::new().bg(theme.bg_light).fg(theme.text_primary))
-        .padding(Padding::horizontal(1))
+        .padding(Padding::horizontal(PAD))
         .title_top(Span::styled(" react ", Style::new().fg(theme.gray)))
         .title_bottom(Span::styled(footer(picker), Style::new().fg(theme.gray)));
     let inner = block.inner(modal);
@@ -83,7 +88,7 @@ fn glyph_line(theme: &Theme, picker: &ReactionPicker) -> Line<'static> {
         if index == picker.selected {
             style = style.bg(theme.bg_highlight).add_modifier(Modifier::BOLD);
         }
-        if !picker.available {
+        if !picker.reaches() {
             style = style.add_modifier(Modifier::DIM);
         }
         spans.push(Span::styled(format!(" {} ", reaction.glyph()), style));
@@ -93,7 +98,8 @@ fn glyph_line(theme: &Theme, picker: &ReactionPicker) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The line under the glyphs: what the cursor is on, or how to get `imsg`.
+/// The line under the glyphs: what the cursor is on, or the one reason
+/// pressing `Enter` would not send anything.
 fn caption(theme: &Theme, picker: &ReactionPicker) -> Line<'static> {
     if !picker.available {
         return Line::from(vec![
@@ -101,14 +107,23 @@ fn caption(theme: &Theme, picker: &ReactionPicker) -> Line<'static> {
             Span::styled(IMSG_INSTALL, Style::new().fg(theme.text_secondary)),
         ]);
     }
+    if picker.fallback.is_none() && !picker.bridge {
+        return Line::from(Span::styled(SIP_REACH, Style::new().fg(theme.error)));
+    }
     let reaction = picker.reaction();
     let mut spans = vec![Span::styled(
         reaction.label().to_string(),
         Style::new().fg(theme.text_primary),
     )];
     if picker.holds(reaction) {
+        // Only the bridge takes a reaction back, so on a stock Mac the key
+        // says what it would do rather than promising it.
         spans.push(Span::styled(
-            " · yours, Enter takes it back",
+            if picker.bridge {
+                " · yours, Enter takes it back"
+            } else {
+                " · yours, and taking it back needs SIP off"
+            },
             Style::new().fg(theme.gray),
         ));
     }
@@ -117,7 +132,7 @@ fn caption(theme: &Theme, picker: &ReactionPicker) -> Line<'static> {
 
 /// The keys along the bottom border.
 fn footer(picker: &ReactionPicker) -> &'static str {
-    if picker.available {
+    if picker.reaches() {
         " ←→ choose · 1–6 · Enter react · Esc close "
     } else {
         " Esc close "
@@ -137,6 +152,7 @@ mod tests {
             selected: 0,
             standing: vec![Reaction::Like],
             available,
+            bridge: true,
             fallback: None,
         }
     }
@@ -181,5 +197,65 @@ mod tests {
         let said = text(&caption(&theme, &picker(false)));
         assert!(said.contains(IMSG_INSTALL));
         assert!(!footer(&picker(false)).contains("react"));
+    }
+
+    #[test]
+    fn a_message_no_route_reaches_says_so_instead_of_naming_a_reaction() {
+        // A stock Mac: SIP on, so the bridge is out, and this message is not
+        // the newest incoming one the other route can get at.
+        let theme = Theme::default();
+        let mut picker = picker(true);
+        picker.bridge = false;
+        assert!(!picker.reaches());
+        assert_eq!(text(&caption(&theme, &picker)), SIP_REACH);
+        assert!(!footer(&picker).contains("react"));
+    }
+
+    #[test]
+    fn every_caption_fits_between_the_borders() {
+        // The caption is one centered line inside a box of a fixed width, so
+        // a sentence that outgrows it is silently cut in half.
+        let theme = Theme::default();
+        let inner = usize::from(WIDTH) - 2 - 2 * usize::from(PAD);
+        let reachable = crate::send::ReactFallback {
+            chat_rowid: 1,
+            db: std::path::PathBuf::from("/tmp/msgs-test.db"),
+        };
+        let mut said = vec![text(&caption(&theme, &picker(false)))];
+        for bridge in [true, false] {
+            for fallback in [None, Some(reachable.clone())] {
+                for selected in 0..REACTIONS.len() {
+                    let mut picker = picker(true);
+                    picker.bridge = bridge;
+                    picker.fallback = fallback.clone();
+                    picker.selected = selected;
+                    said.push(text(&caption(&theme, &picker)));
+                }
+            }
+        }
+        for line in said {
+            assert!(line.chars().count() <= inner, "{} wide: {line}", line.len());
+        }
+        assert!(footer(&picker(true)).chars().count() <= usize::from(WIDTH) - 2);
+    }
+
+    #[test]
+    fn without_the_bridge_the_key_does_not_promise_to_take_a_reaction_back() {
+        let theme = Theme::default();
+        let mut picker = picker(true);
+        picker.bridge = false;
+        picker.fallback = Some(crate::send::ReactFallback {
+            chat_rowid: 1,
+            db: std::path::PathBuf::from("/tmp/msgs-test.db"),
+        });
+        picker.selected = 1;
+        assert!(picker.holds(Reaction::Like));
+        let said = text(&caption(&theme, &picker));
+        assert!(said.starts_with("like"));
+        assert!(!said.contains("Enter takes it back"), "{said}");
+        assert!(said.contains("SIP off"), "{said}");
+        // The other five still go out that way, so the row stays live.
+        assert!(picker.reaches());
+        assert!(footer(&picker).contains("react"));
     }
 }

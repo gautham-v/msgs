@@ -499,6 +499,9 @@ pub struct ReactionPicker {
     /// Whether `imsg` is on `$PATH`. Without it the picker only says how to
     /// get it, and answering it sends nothing.
     pub available: bool,
+    /// Whether `imsg tapback`'s IMCore bridge can load here, which it cannot
+    /// while System Integrity Protection is on — and SIP is on by default.
+    pub bridge: bool,
     /// The `imsg react` route, filled in only when the target is the newest
     /// incoming message of its chat — the one message that route can reach.
     pub fallback: Option<ReactFallback>,
@@ -515,6 +518,33 @@ impl ReactionPicker {
     #[must_use]
     pub fn holds(&self, reaction: Reaction) -> bool {
         self.standing.contains(&reaction)
+    }
+
+    /// Whether a reaction chosen here could reach this message at all, which
+    /// on a stock Mac means the `imsg react` route and this message being the
+    /// newest incoming one.
+    #[must_use]
+    pub fn reaches(&self) -> bool {
+        self.available && (self.bridge || self.fallback.is_some())
+    }
+
+    /// Why nothing would happen on `Enter`, or `None` when something would.
+    ///
+    /// The picker says this before the key is pressed and the toast says it
+    /// after, so the two never disagree.
+    #[must_use]
+    pub fn refusal(&self) -> Option<SendError> {
+        if !self.available {
+            return Some(SendError::NoHelper);
+        }
+        if self.bridge {
+            return None;
+        }
+        if self.fallback.is_none() {
+            return Some(SendError::OutOfReach);
+        }
+        // `imsg react` adds a reaction; only the bridge can take one away.
+        self.holds(self.reaction()).then_some(SendError::NoTakeBack)
     }
 
     /// Move the cursor, wrapping around the row the way a six-item menu should.
@@ -2626,6 +2656,7 @@ impl App {
             selected,
             standing,
             available: self.outbox.has_helper(),
+            bridge: self.outbox.has_bridge(),
             fallback,
         });
         self.open_overlay(Focus::Reactions);
@@ -2678,10 +2709,10 @@ impl App {
         let Some(picker) = self.reaction_picker.clone() else {
             return;
         };
-        if !picker.available {
-            // Nothing is sent and nothing is chipped on: without the helper
-            // there is no way to put a reaction on the wire at all.
-            self.status.error(SendError::NoHelper.to_string());
+        if let Some(refusal) = picker.refusal() {
+            // Nothing is sent and nothing is chipped on: there is no route
+            // this reaction could take, and the picker already said so.
+            self.status.error(refusal.to_string());
             return;
         }
         let Some(target) = self.outgoing_target() else {
@@ -2709,6 +2740,7 @@ impl App {
             id,
             target,
             Outgoing::Tapback {
+                db: self.db_path.clone(),
                 message_guid: picker.target_guid,
                 part: picker.part,
                 reaction,
@@ -4019,6 +4051,7 @@ mod tests {
         assert_eq!(
             recorded[0].2,
             Outgoing::Tapback {
+                db: None,
                 message_guid: "ABCD-1234".to_string(),
                 part: 0,
                 reaction: REACTIONS[1],
@@ -4028,6 +4061,80 @@ mod tests {
         );
         // The loaded page is still exactly what the database said.
         assert!(app.message_rows[0].tapbacks.is_empty());
+    }
+
+    #[test]
+    fn the_reaction_names_the_database_msgs_was_pointed_at() {
+        // `--db` moves msgs off the default chat.db, and imsg resolves the
+        // chat guid in whichever database it is handed.
+        let mut app = app_with_message();
+        app.db_path = Some(PathBuf::from("/tmp/msgs-test.db"));
+        app.update(Action::React);
+        app.update(Action::Activate);
+        let Outgoing::Tapback { db, .. } = &app.outbox.recorded()[0].2 else {
+            panic!("a tapback");
+        };
+        assert_eq!(
+            db.as_deref(),
+            Some(std::path::Path::new("/tmp/msgs-test.db"))
+        );
+    }
+
+    #[test]
+    fn a_message_a_stock_mac_cannot_reach_is_refused_before_anything_is_sent() {
+        // SIP on means no bridge, and without the bridge only the newest
+        // incoming message can be reached — this one is not it.
+        let mut app = app_with_message();
+        let mut newer = message_row("EFGH-5678");
+        newer.rowid = 6;
+        app.message_rows.push(newer);
+        app.messages.set_len(2);
+        app.messages.selected = 0;
+        app.update(Action::React);
+        let picker = app.reaction_picker.as_mut().expect("picker");
+        picker.bridge = false;
+        assert!(picker.fallback.is_none());
+        assert!(!picker.reaches());
+        assert_eq!(picker.refusal(), Some(SendError::OutOfReach));
+
+        app.update(Action::Activate);
+        assert!(
+            app.outbox.recorded().is_empty(),
+            "nothing is handed to imsg that imsg could not deliver"
+        );
+        assert!(app.pending_tapbacks.is_empty(), "and no chip goes up");
+        let (text, is_error) = app.status.active_toast().expect("a toast");
+        assert!(is_error);
+        assert_eq!(text, send::SIP_REACH);
+    }
+
+    #[test]
+    fn taking_a_reaction_back_is_refused_without_the_bridge() {
+        // The newest incoming message is reachable, but only to add one:
+        // `imsg react` has no way to undo.
+        let mut app = app_with_message();
+        app.db_path = Some(PathBuf::from("/tmp/msgs-test.db"));
+        app.message_rows[0].tapbacks = vec![mine(REACTIONS[2].kind())];
+        app.update(Action::React);
+        let picker = app.reaction_picker.as_mut().expect("picker");
+        picker.bridge = false;
+        assert!(picker.fallback.is_some());
+        assert!(picker.reaches(), "the row is still live for the other five");
+        assert_eq!(picker.refusal(), Some(SendError::NoTakeBack));
+
+        app.update(Action::Activate);
+        assert!(app.outbox.recorded().is_empty());
+        let (text, _) = app.status.active_toast().expect("a toast");
+        assert!(text.contains("SIP"), "{text}");
+
+        // The picker stays open on a refusal, so another glyph is one key
+        // away — and any of the other five does go out the fallback route.
+        assert_eq!(app.focus, Focus::Reactions);
+        let picker = app.reaction_picker.as_mut().expect("picker");
+        picker.selected = 0;
+        assert_eq!(picker.refusal(), None);
+        app.update(Action::Activate);
+        assert_eq!(app.outbox.recorded().len(), 1);
     }
 
     #[test]
@@ -4041,6 +4148,7 @@ mod tests {
         assert_eq!(
             recorded[0].2,
             Outgoing::Tapback {
+                db: None,
                 message_guid: "ABCD-1234".to_string(),
                 part: 0,
                 reaction: REACTIONS[3],
@@ -4073,6 +4181,7 @@ mod tests {
         assert_eq!(
             app.outbox.recorded()[0].2,
             Outgoing::Tapback {
+                db: None,
                 message_guid: "ABCD-1234".to_string(),
                 part: 0,
                 reaction: REACTIONS[2],

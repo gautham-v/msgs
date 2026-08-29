@@ -388,7 +388,16 @@ fn check(cli: &Cli, warnings: &[String]) -> Result<()> {
         "imsg",
         &send::imsg_path().map_or_else(
             || format!("not on PATH — no tapbacks; {}", send::IMSG_INSTALL),
-            |path| path.display().to_string(),
+            |path| {
+                // Which of `imsg`'s two routes is open is the difference
+                // between reacting to any message and reacting to one.
+                let reach = if send::bridge_available() {
+                    "SIP off — reactions reach any message"
+                } else {
+                    send::SIP_REACH
+                };
+                format!("{} — {reach}", path.display())
+            },
         ),
     );
 
