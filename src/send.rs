@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::time::Duration;
 
 use crate::db::Chat;
 
@@ -296,8 +297,55 @@ pub fn send_file(target: &Target, path: &Path) -> Result<(), SendError> {
     if !path.is_file() {
         return Err(SendError::NoFile);
     }
-    let script = file_script(target, path).ok_or(SendError::NoTarget)?;
+    // Messages.app reads the file itself, and it is sandboxed: a path under
+    // Desktop, Documents, or Downloads is one macOS asks permission for, and
+    // a script cannot answer that prompt — the message goes out and never
+    // delivers. A copy in the outbox is somewhere it can read unasked.
+    let staged = stage(path, outbox_dir().as_deref()).unwrap_or_else(|| path.to_path_buf());
+    let script = file_script(target, &staged).ok_or(SendError::NoTarget)?;
     run(&script)
+}
+
+/// Where outgoing files are copied before Messages is asked to send them:
+/// `~/Library/Caches/msgs/outbox`.
+#[must_use]
+pub fn outbox_dir() -> Option<PathBuf> {
+    Some(dirs::cache_dir()?.join("msgs").join("outbox"))
+}
+
+/// How long a staged copy is kept before [`stage`] sweeps it out.
+const OUTBOX_KEEP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Copy `path` into `outbox` under its own name, in a folder of its own so
+/// two files called the same thing cannot collide, and sweep out copies
+/// older than [`OUTBOX_KEEP`]. `None` when there is no outbox or the copy
+/// fails, in which case the original path is what gets sent.
+#[must_use]
+pub fn stage(path: &Path, outbox: Option<&Path>) -> Option<PathBuf> {
+    let outbox = outbox?;
+    let name = path.file_name()?;
+    std::fs::create_dir_all(outbox).ok()?;
+    if let Ok(entries) = std::fs::read_dir(outbox) {
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .map(|modified| modified.elapsed().unwrap_or_default() > OUTBOX_KEEP)
+                .unwrap_or(false);
+            if old {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or_default();
+    let folder = outbox.join(format!("{stamp}-{}", std::process::id()));
+    std::fs::create_dir_all(&folder).ok()?;
+    let staged = folder.join(name);
+    std::fs::copy(path, &staged).ok()?;
+    Some(staged)
 }
 
 /// Hand one script to `osascript` and wait for it.
@@ -644,6 +692,35 @@ impl Outbox {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn staging_copies_into_the_outbox_under_the_same_name_and_sweeps_old_copies() {
+        let dir = std::env::temp_dir().join(format!("msgs-outbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let outbox = dir.join("outbox");
+        let stale = outbox.join("0-0");
+        std::fs::create_dir_all(&stale).expect("stale folder");
+        std::fs::write(stale.join("old.txt"), b"old").expect("stale file");
+        let long_ago = std::time::SystemTime::now() - OUTBOX_KEEP - Duration::from_secs(60);
+        for path in [stale.join("old.txt"), stale.clone()] {
+            std::fs::File::open(&path)
+                .and_then(|file| file.set_modified(long_ago))
+                .expect("backdate");
+        }
+        let source = dir.join("note.txt");
+        std::fs::write(&source, b"hello").expect("source");
+
+        let staged = stage(&source, Some(&outbox)).expect("staged");
+        assert_eq!(staged.file_name(), source.file_name());
+        assert!(staged.starts_with(&outbox));
+        assert_eq!(std::fs::read(&staged).expect("copy"), b"hello");
+        assert!(!stale.exists(), "the day-old copy is swept");
+        assert_eq!(stage(&source, None), None);
+        assert_eq!(stage(&dir.join("missing.txt"), Some(&outbox)), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_presence_probe_that_is_off_never_asks_and_never_answers() {
         let mut off = Presence::off();
@@ -677,8 +754,6 @@ mod tests {
         assert_eq!(probe.poll(), None);
         assert!(probe.is_on());
     }
-
-    use super::*;
 
     fn direct() -> Target {
         Target {

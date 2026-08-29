@@ -349,6 +349,14 @@ into the composer like any other paste; a paste that is not a path is typed
 too, newlines included in the composer and flattened to spaces in the
 one-line fields.
 
+Whichever way a file is picked, Messages.app is the one that reads it, and it
+is sandboxed: a file under `~/Desktop`, `~/Documents`, or `~/Downloads` is one
+macOS would ask it permission for, and nothing can answer that prompt on a
+script's behalf — the message would appear in the thread and never deliver. So
+msgs first copies the file into `~/Library/Caches/msgs/outbox`, a place
+Messages can read unasked, and sends that copy; copies older than a day are
+swept out the next time something is sent.
+
 An `@` at the start of a word in the composer goes the same way with a list
 instead of a typed path. It opens a picker just above the send box, listing
 what is in `~/Downloads`, `~/Desktop`, `~/Pictures`, `~/Documents`, and the
