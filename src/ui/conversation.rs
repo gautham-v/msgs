@@ -10,6 +10,7 @@
 
 use chrono::Local;
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -281,6 +282,139 @@ impl Hits {
     }
 }
 
+/// A drag of the mouse over the conversation, in absolute terminal cells.
+///
+/// It is a linear selection, the way a terminal's own is: everything between
+/// the two ends in reading order, not the rectangle they corner. The scroll
+/// and the pane it was made against are kept with it so a view that has moved
+/// underneath drops it rather than tinting cells that now say something else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    /// The cell the drag started on.
+    pub anchor: Position,
+    /// The cell the pointer is on now.
+    pub cursor: Position,
+    /// Where the conversation was scrolled to when the drag started.
+    pub scroll: Scroll,
+    /// The pane it was drawn over.
+    pub area: Rect,
+}
+
+impl Selection {
+    /// A selection of the single cell `at`, which is what a click leaves
+    /// until the pointer moves.
+    #[must_use]
+    pub const fn new(at: Position, scroll: Scroll, area: Rect) -> Self {
+        Self {
+            anchor: at,
+            cursor: at,
+            scroll,
+            area,
+        }
+    }
+
+    /// The two ends in reading order: row first, then column.
+    #[must_use]
+    pub fn span(&self) -> (Position, Position) {
+        if (self.anchor.y, self.anchor.x) <= (self.cursor.y, self.cursor.x) {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+
+    /// Whether the drag never left the cell it started on, which is a click.
+    #[must_use]
+    pub fn is_click(&self) -> bool {
+        self.anchor == self.cursor
+    }
+}
+
+/// The half-open column range of `row` that `selection` covers.
+///
+/// Clipped to the pane's own text columns, so the scrollbar's column
+/// ([`message::MARGIN_RIGHT`]) is never selected and never copied. The day
+/// band is a pane of its own above this one, so it is out of reach already.
+#[must_use]
+pub fn selected_columns(selection: &Selection, area: Rect, row: u16) -> Option<(u16, u16)> {
+    if area.width <= message::MARGIN_RIGHT || area.height == 0 {
+        return None;
+    }
+    if row < area.y || row >= area.y.saturating_add(area.height) {
+        return None;
+    }
+    let (start, end) = selection.span();
+    if row < start.y || row > end.y {
+        return None;
+    }
+    let text_end = area.x + area.width - message::MARGIN_RIGHT;
+    let first = if row == start.y {
+        start.x.max(area.x)
+    } else {
+        area.x
+    };
+    let last = if row == end.y {
+        end.x.saturating_add(1)
+    } else {
+        text_end
+    };
+    let first = first.clamp(area.x, text_end);
+    let last = last.clamp(area.x, text_end);
+    (first < last).then_some((first, last))
+}
+
+/// What a selection covers, read back off the frame that drew it: the visible
+/// cells of each row, trailing blanks trimmed, rows joined with newlines.
+///
+/// The cells are the words as the reader saw them — wrapping, the name column,
+/// and the clock included — because that is what was pointed at.
+#[must_use]
+pub fn selection_text(buffer: &Buffer, area: Rect, selection: &Selection) -> String {
+    let (start, end) = selection.span();
+    let mut out = String::new();
+    let mut first_row = true;
+    for row in start.y..=end.y {
+        let Some((first, last)) = selected_columns(selection, area, row) else {
+            continue;
+        };
+        let mut line = String::new();
+        for column in first..last {
+            if let Some(cell) = buffer.cell((column, row)) {
+                line.push_str(cell.symbol());
+            }
+        }
+        if !first_row {
+            out.push('\n');
+        }
+        first_row = false;
+        out.push_str(line.trim_end());
+    }
+    out
+}
+
+/// Tint the selected cells with `bg_highlight`.
+///
+/// The rows are already drawn; only the background under them changes, which
+/// is why this is done to the buffer rather than by a widget over the top —
+/// nothing a message says is covered by it.
+fn render_selection(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(selection) = app.selection else {
+        return;
+    };
+    let highlight = app.theme.bg_highlight;
+    let buffer = frame.buffer_mut();
+    for row in area.y..area.y.saturating_add(area.height) {
+        let Some((first, last)) = selected_columns(&selection, area, row) else {
+            continue;
+        };
+        for column in first..last {
+            if let Some(cell) = buffer.cell_mut((column, row)) {
+                cell.set_bg(highlight);
+            }
+        }
+    }
+}
+
 /// The chat's name and address, with a rule underneath when there is a row
 /// to spare for it.
 pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -546,6 +680,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
     }
 
     render_scrollbar(frame, app, area, heights);
+    // The drag's tint goes on last of the words, and before the pill so the
+    // pill stays legible over it.
+    render_selection(frame, app, area);
     hits.pill = render_new_pill(frame, app, area);
     hits
 }
@@ -828,5 +965,88 @@ mod tests {
         let (start, length) = thumb(100_000, 20, 99_999).expect("a bar");
         assert_eq!(length, 1);
         assert_eq!(start, 19);
+    }
+
+    /// A pane four rows of ten columns, the last column the scrollbar's.
+    fn pane() -> (Buffer, Rect) {
+        let area = Rect::new(0, 0, 10, 4);
+        let buffer = Buffer::with_lines([
+            "abcdefgh \u{2502}",
+            "ijkl     \u{2502}",
+            "mnopqrst \u{2502}",
+            "uvwxyz   \u{2502}",
+        ]);
+        (buffer, area)
+    }
+
+    fn drag(from: (u16, u16), to: (u16, u16), area: Rect) -> Selection {
+        let mut selection = Selection::new(Position::new(from.0, from.1), Scroll::default(), area);
+        selection.cursor = Position::new(to.0, to.1);
+        selection
+    }
+
+    #[test]
+    fn a_span_reads_the_same_dragged_either_way() {
+        let area = Rect::new(0, 0, 10, 4);
+        let down = drag((2, 1), (5, 3), area);
+        let up = drag((5, 3), (2, 1), area);
+        assert_eq!(down.span(), up.span());
+        let (start, end) = down.span();
+        assert_eq!((start.x, start.y), (2, 1));
+        assert_eq!((end.x, end.y), (5, 3));
+
+        // Backwards along one row orders by column.
+        let (start, end) = drag((7, 2), (3, 2), area).span();
+        assert_eq!((start.x, end.x), (3, 7));
+        assert_eq!(start.y, end.y);
+
+        assert!(drag((4, 1), (4, 1), area).is_click());
+        assert!(!drag((4, 1), (5, 1), area).is_click());
+    }
+
+    #[test]
+    fn a_selection_is_linear_and_stops_short_of_the_scrollbar() {
+        let area = Rect::new(0, 0, 10, 4);
+        let selection = drag((4, 1), (2, 3), area);
+        assert_eq!(selected_columns(&selection, area, 0), None, "above it");
+        assert_eq!(selected_columns(&selection, area, 1), Some((4, 9)));
+        assert_eq!(
+            selected_columns(&selection, area, 2),
+            Some((0, 9)),
+            "a whole row, but never the scrollbar's column"
+        );
+        assert_eq!(selected_columns(&selection, area, 3), Some((0, 3)));
+        assert_eq!(selected_columns(&selection, area, 4), None, "below it");
+
+        // A drag that ends on the scrollbar still stops at the words.
+        let selection = drag((0, 0), (9, 0), area);
+        assert_eq!(selected_columns(&selection, area, 0), Some((0, 9)));
+    }
+
+    #[test]
+    fn the_text_is_what_the_rows_showed_with_the_blanks_trimmed() {
+        let (buffer, area) = pane();
+
+        let selection = drag((2, 0), (3, 2), area);
+        assert_eq!(
+            selection_text(&buffer, area, &selection),
+            "cdefgh\nijkl\nmnop"
+        );
+
+        // One row, one word.
+        let selection = drag((0, 1), (3, 1), area);
+        assert_eq!(selection_text(&buffer, area, &selection), "ijkl");
+
+        // The whole pane: every row, and no scrollbar on any of them.
+        let selection = drag((0, 0), (9, 3), area);
+        assert_eq!(
+            selection_text(&buffer, area, &selection),
+            "abcdefgh\nijkl\nmnopqrst\nuvwxyz"
+        );
+
+        // A single cell is a click, and says so little that nothing copies it.
+        let selection = drag((1, 0), (1, 0), area);
+        assert!(selection.is_click());
+        assert_eq!(selection_text(&buffer, area, &selection), "b");
     }
 }

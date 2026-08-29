@@ -26,7 +26,7 @@ use crate::send::{
 };
 use crate::theme::{self, Base, TerminalColors, Theme};
 use crate::ui::Panes;
-use crate::ui::conversation::{Hits, Measured, Scroll};
+use crate::ui::conversation::{Hits, Measured, Scroll, Selection};
 use crate::ui::message::{self, Ctx};
 use crate::watch::Watcher;
 
@@ -580,6 +580,13 @@ pub struct App {
     pub measured: Measured,
     /// What the conversation put where on the last frame, for mouse clicks.
     pub hits: Hits,
+    /// The mouse's drag over the conversation, while one is up. It is drawn as
+    /// a tint and copied on release; nothing else reads it.
+    pub selection: Option<Selection>,
+    /// Set by the mouse release when the drag covered more than a cell. The
+    /// next frame reads the words back off the buffer it just drew and clears
+    /// it, which is cheaper than keeping a copy of the pane's cells here.
+    pub copy_selection_pending: bool,
     /// Set when a freshly opened conversation still has to be pinned to its
     /// newest message, which needs a pane height to do.
     pending_bottom: bool,
@@ -716,6 +723,8 @@ impl App {
             convo: Scroll::default(),
             measured: Measured::default(),
             hits: Hits::default(),
+            selection: None,
+            copy_selection_pending: false,
             pending_bottom: false,
             should_quit: false,
             chats: ListPane::default(),
@@ -1350,6 +1359,15 @@ impl App {
         // Back at the newest message: the pill has been read, so it goes away.
         if self.new_below > 0 && self.at_bottom() {
             self.new_below = 0;
+        }
+        // A view that has moved — or a pane that has changed shape — is no
+        // longer the one the drag was made over, so the selection goes rather
+        // than tint cells that now say something else.
+        if self
+            .selection
+            .is_some_and(|selection| selection.scroll != self.convo || selection.area != area)
+        {
+            self.clear_selection();
         }
     }
 
@@ -2378,6 +2396,12 @@ impl App {
     }
 
     fn cancel(&mut self) {
+        // A drag-selection is the frontmost thing on the conversation, so
+        // `Esc` takes that away before it moves focus anywhere.
+        if self.selection.is_some() && !self.focus.is_overlay() {
+            self.clear_selection();
+            return;
+        }
         match self.focus {
             Focus::Help | Focus::Palette | Focus::Reactions => self.close_overlay(),
             Focus::ChatList => {
@@ -2871,14 +2895,93 @@ impl App {
                 if self.focus.is_overlay() {
                     return;
                 }
+                // Any press starts over: the last drag's tint goes away with
+                // the click that follows it, the way a terminal's own does.
+                self.clear_selection();
                 if let Some(pane) = target {
                     self.focus = pane;
                     self.click(pane, position);
+                    // The press is also the anchor of a drag that may not
+                    // happen. A release on the same cell is a plain click and
+                    // takes it away again.
+                    if pane == Focus::Conversation {
+                        self.selection = Some(Selection::new(
+                            position,
+                            self.convo,
+                            self.panes.conversation,
+                        ));
+                    }
                 }
             }
-            MouseEventKind::ScrollUp => self.wheel(target, -WHEEL_ROWS),
-            MouseEventKind::ScrollDown => self.wheel(target, WHEEL_ROWS),
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.focus.is_overlay() {
+                    return;
+                }
+                self.extend_selection(position);
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.focus.is_overlay() {
+                    return;
+                }
+                self.end_selection();
+            }
+            MouseEventKind::ScrollUp => {
+                self.clear_selection();
+                self.wheel(target, -WHEEL_ROWS);
+            }
+            MouseEventKind::ScrollDown => {
+                self.clear_selection();
+                self.wheel(target, WHEEL_ROWS);
+            }
             _ => {}
+        }
+    }
+
+    /// Take the drag to `position`, clamped to the pane it started in.
+    fn extend_selection(&mut self, position: Position) {
+        let area = self.panes.conversation;
+        if area.width == 0 || area.height == 0 {
+            self.clear_selection();
+            return;
+        }
+        if let Some(selection) = self.selection.as_mut() {
+            selection.cursor = Position::new(
+                position.x.clamp(area.x, area.x + area.width - 1),
+                position.y.clamp(area.y, area.y + area.height - 1),
+            );
+        }
+    }
+
+    /// The button came up: a drag of more than one cell is worth copying, a
+    /// click is not and leaves nothing behind.
+    fn end_selection(&mut self) {
+        match self.selection {
+            Some(selection) if !selection.is_click() => self.copy_selection_pending = true,
+            _ => self.clear_selection(),
+        }
+    }
+
+    /// Drop the selection — a scroll, an `Esc`, or the next click.
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+        self.copy_selection_pending = false;
+    }
+
+    /// Put a released drag on the clipboard, once the frame that drew it has
+    /// read the words back off its own buffer.
+    ///
+    /// Like `y`, the text goes to the pasteboard and nowhere else — not to the
+    /// status line, not to a log. The tint stays until the next click, so what
+    /// was copied is still visible.
+    pub fn copy_dragged(&mut self, text: &str) {
+        self.copy_selection_pending = false;
+        if text.trim().is_empty() {
+            self.status.toast("nothing to copy there");
+            return;
+        }
+        match crate::shell::copy(text) {
+            Ok(()) => self.status.toast("copied to the clipboard"),
+            Err(err) => self.status.error(format!("could not copy: {err}")),
         }
     }
 
@@ -3404,6 +3507,93 @@ mod tests {
 
         assert_eq!(app.focus, Focus::Conversation);
         assert_eq!(app.messages.selected, 3);
+    }
+
+    /// A mouse event at a cell, the way the terminal reports one.
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn a_drag_over_the_conversation_selects_and_leaves_the_copying_to_the_frame() {
+        let mut app = with_measured_conversation(100);
+        app.hits = Hits {
+            rows: (0..20).map(|row| Some(row / 2)).collect(),
+            ..Hits::default()
+        };
+
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 5));
+        let selection = app.selection.expect("the press anchors one");
+        assert!(selection.is_click(), "nothing is selected until it moves");
+        assert_eq!(app.messages.selected, 2, "the press still picks the block");
+
+        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 55, 8));
+        let (start, end) = app.selection.expect("the drag keeps it").span();
+        assert_eq!((start.x, start.y), (40, 5));
+        assert_eq!((end.x, end.y), (55, 8));
+        assert!(!app.copy_selection_pending, "nothing is copied mid-drag");
+
+        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 55, 8));
+        assert!(
+            app.copy_selection_pending,
+            "the frame that drew the words reads them back"
+        );
+        assert!(
+            app.selection.is_some(),
+            "and the tint stays until the next click"
+        );
+    }
+
+    #[test]
+    fn a_drag_stays_on_the_pane_and_a_plain_click_leaves_nothing() {
+        let mut app = with_measured_conversation(100);
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 5));
+        // Dragged off the edges: both ends stay on cells that were drawn.
+        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 200, 200));
+        let (_, end) = app.selection.expect("a selection").span();
+        assert_eq!((end.x, end.y), (79, 20));
+        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 200, 200));
+        assert!(app.copy_selection_pending);
+
+        // Press and release on one cell is a click: no tint, nothing copied.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 5));
+        assert!(
+            !app.copy_selection_pending,
+            "the press clears the last drag"
+        );
+        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 40, 5));
+        assert!(app.selection.is_none());
+        assert!(!app.copy_selection_pending);
+    }
+
+    #[test]
+    fn a_scroll_or_an_escape_drops_the_selection() {
+        let mut app = with_measured_conversation(100);
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 5));
+        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 9));
+        assert!(app.selection.is_some());
+
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 40, 5));
+        assert!(app.selection.is_none(), "the words moved out from under it");
+
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 5));
+        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 9));
+        app.update(Action::Cancel);
+        assert!(app.selection.is_none());
+        assert_eq!(app.focus, Focus::Conversation, "and Esc does nothing else");
+
+        // A scrolled view drops it as the next frame settles, too.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 5));
+        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 9));
+        app.update(Action::Scroll(3));
+        let area = app.panes.conversation;
+        app.prepare_conversation(area);
+        assert!(app.selection.is_none());
     }
 
     #[test]
