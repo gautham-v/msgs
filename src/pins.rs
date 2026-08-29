@@ -45,7 +45,7 @@
 //! Nothing in this module prints an address, a name, or an identifier. Errors
 //! carry a reason and at most a path.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use plist::Value;
@@ -216,22 +216,33 @@ impl Pins {
     /// Whether `chat` is one of the pinned conversations.
     #[must_use]
     pub fn covers(&self, chat: &Chat) -> bool {
-        if ids(chat).any(|id| self.groups.contains(&id)) {
-            return true;
+        self.key_for(chat).is_some()
+    }
+
+    /// The pin `chat` answers to — a group identifier or a normalized
+    /// address — or `None` when it is not pinned.
+    ///
+    /// Two chat rows that answer to the same pin are one conversation the
+    /// database keeps twice (an iMessage row and an SMS row, or a thread
+    /// re-created around the same people), which is what [`Pins::apply`]
+    /// uses to pin only one of them.
+    fn key_for(&self, chat: &Chat) -> Option<String> {
+        if let Some(id) = ids(chat).find(|id| self.groups.contains(id)) {
+            return Some(id);
         }
         // A group is pinned as a group. Matching a participant's address here
         // would pin every group that one pinned person happens to be in.
         if chat.is_group {
-            return false;
+            return None;
         }
         if let Some(key) = chat.identifier.as_deref().and_then(normalize)
             && self.handles.contains(&key)
         {
-            return true;
+            return Some(key);
         }
         match chat.participants.as_slice() {
-            [only] => normalize(&only.id).is_some_and(|key| self.handles.contains(&key)),
-            _ => false,
+            [only] => normalize(&only.id).filter(|key| self.handles.contains(key)),
+            _ => None,
         }
     }
 
@@ -241,12 +252,30 @@ impl Pins {
     /// database, the way [`crate::contacts::Contacts::apply`] is the one place
     /// a name is attached. A [`Pins::off`] set writes nothing, so a database
     /// that does record pinning in SQL keeps its own answer.
+    ///
+    /// One pin is one row in the list: when several chat rows answer to the
+    /// same pin, the one that spoke last is pinned and the rest are left where
+    /// they were, so a duplicate row cannot stand in the pinned section twice.
     pub fn apply(&self, chats: &mut [Chat]) {
         if !self.is_on() {
             return;
         }
-        for chat in chats {
-            chat.is_pinned = Some(self.covers(chat));
+        let mut newest: HashMap<String, usize> = HashMap::new();
+        for (index, chat) in chats.iter().enumerate() {
+            let Some(key) = self.key_for(chat) else {
+                continue;
+            };
+            let better = newest.get(&key).is_none_or(|&held| {
+                let held = &chats[held];
+                (chat.last_message_date, held.rowid) > (held.last_message_date, chat.rowid)
+            });
+            if better {
+                newest.insert(key, index);
+            }
+        }
+        let pinned: HashSet<usize> = newest.into_values().collect();
+        for (index, chat) in chats.iter_mut().enumerate() {
+            chat.is_pinned = Some(pinned.contains(&index));
         }
     }
 
@@ -466,6 +495,26 @@ mod tests {
         unpinned.is_group = true;
         unpinned.original_group_id = Some("o-id-2".to_string());
         assert!(!pins.covers(&unpinned));
+    }
+
+    #[test]
+    fn one_pin_pins_one_row_however_many_the_database_keeps() {
+        let pins = Pins::from_entries([("+15550000001", None)]);
+        // The same conversation as an SMS row, an older iMessage row, and an
+        // empty row, the way macOS leaves them.
+        let mut older = direct(1, "+15550000001");
+        older.last_message_date = 10;
+        let mut newest = direct(2, "+15550000001");
+        newest.guid = "SMS;-;+15550000001".to_string();
+        newest.last_message_date = 20;
+        let empty = direct(3, "+15550000001");
+        let mut chats = vec![older, newest, empty];
+        pins.apply(&mut chats);
+        assert_eq!(
+            chats.iter().map(Chat::is_pinned).collect::<Vec<_>>(),
+            [false, true, false]
+        );
+        assert!(chats.iter().all(|chat| chat.is_pinned.is_some()));
     }
 
     #[test]
