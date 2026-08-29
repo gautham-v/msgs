@@ -387,8 +387,10 @@ fn check(cli: &Cli, warnings: &[String]) -> Result<()> {
     row(
         "live updates",
         match watcher.status() {
-            WatcherStatus::Watching => "watching chat.db and its WAL",
-            WatcherStatus::Polling => "no file watcher — polling every 2s instead",
+            WatcherStatus::Watching => {
+                "watching chat.db and its WAL, re-reading every 2s regardless"
+            }
+            WatcherStatus::Polling => "no file watcher — re-reading every 2s instead",
             WatcherStatus::Off => "off",
         },
     );

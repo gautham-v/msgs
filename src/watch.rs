@@ -7,10 +7,15 @@
 //! re-query rather than one per write.
 //!
 //! Nothing here reads the database, so nothing here can leak message content:
-//! it deals in file names and instants only. If the platform watcher cannot be
-//! started at all — no notification backend, a path that cannot be watched —
-//! the same interface falls back to a two-second timer, and
-//! [`Watcher::status`] says which of the two is running.
+//! it deals in file names and instants only.
+//!
+//! A two-second timer runs underneath the watcher at all times. It is not only
+//! the fallback for a watcher that will not start: macOS hands out no FSEvents
+//! for `~/Library/Messages` even to a process allowed to read `chat.db` out of
+//! it, so a watcher there starts cleanly, reports no error, and then says
+//! nothing forever. The timer is what makes that silence cost two seconds
+//! instead of the rest of the session. [`Watcher::status`] reports whether a
+//! platform watcher is running as well.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -33,7 +38,12 @@ pub const DEBOUNCE: Duration = Duration::from_millis(300);
 /// resetting the debounce and the screen would never move.
 pub const MAX_HOLD: Duration = Duration::from_secs(1);
 
-/// How often the fallback timer re-reads when no watcher could be started.
+/// How often the timer re-reads on its own.
+///
+/// This runs whether or not a platform watcher started, because a watcher that
+/// starts is not the same as a watcher that reports: macOS delivers no
+/// FSEvents at all for `~/Library/Messages`. It is the ceiling on how stale
+/// the screen can get, not the normal path.
 pub const POLL_EVERY: Duration = Duration::from_secs(2);
 
 /// The debounce, split out so it can be tested without a filesystem.
@@ -200,7 +210,9 @@ impl Watcher {
     /// Whether the database should be re-read now.
     ///
     /// Call once per frame. While watching, this is true a debounce after the
-    /// last write to the store; while polling, once every [`POLL_EVERY`].
+    /// last write to the store, and in any case at least once every
+    /// [`POLL_EVERY`] — the timer runs under the watcher rather than instead
+    /// of it, because a watcher can report nothing without ever failing.
     pub fn ready(&mut self) -> bool {
         self.ready_at(Instant::now())
     }
@@ -224,7 +236,25 @@ impl Watcher {
                     self.last_poll = now;
                     return true;
                 }
-                self.debounce.ready(now)
+                if self.debounce.ready(now) {
+                    // A watcher that is talking keeps the floor pushed out
+                    // ahead of itself, so the timer costs nothing.
+                    self.last_poll = now;
+                    return true;
+                }
+                // The floor. A watcher can start, report `Watching`, and then
+                // deliver nothing at all — macOS hands out no FSEvents for
+                // `~/Library/Messages` even to a process that is allowed to
+                // read `chat.db` out of it. That failure is silent by
+                // construction: there is no error to notice and no event to
+                // wait for, so a watcher trusted on its own word would leave
+                // the screen frozen until something else re-queried. The timer
+                // runs underneath regardless and caps how long that can last.
+                if now.saturating_duration_since(self.last_poll) >= POLL_EVERY {
+                    self.last_poll = now;
+                    return true;
+                }
+                false
             }
         }
     }
@@ -328,6 +358,50 @@ mod tests {
             .map(|name| name.to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["chat.db", "chat.db-wal", "chat.db-shm"]);
+    }
+
+    #[test]
+    fn a_silent_watcher_still_gets_read_on_the_timer() {
+        // The real failure this guards: macOS starts the FSEvents stream for
+        // `~/Library/Messages` without complaint and then delivers nothing at
+        // all, so `status` says `Watching` while the screen never moves. The
+        // timer has to run underneath regardless.
+        let mut watcher = Watcher::off();
+        // A live channel nothing ever sends on: exactly what the FSEvents
+        // stream for `~/Library/Messages` behaves like. The sender is held so
+        // draining sees an empty queue rather than a hung-up one.
+        let (_tx, rx) = channel();
+        watcher.events = Some(rx);
+        watcher.status = WatcherStatus::Watching;
+        let start = Instant::now();
+        watcher.last_poll = start;
+
+        // No events, no debounce, no error — and still a read on the floor.
+        assert!(!watcher.ready_at(start + POLL_EVERY / 2));
+        assert!(watcher.ready_at(start + POLL_EVERY));
+        assert_eq!(watcher.status(), WatcherStatus::Watching);
+        // Consumed: the floor does not fire twice for the same interval.
+        assert!(!watcher.ready_at(start + POLL_EVERY));
+        assert!(watcher.ready_at(start + POLL_EVERY * 2));
+    }
+
+    #[test]
+    fn a_talking_watcher_reads_on_its_events_not_the_timer() {
+        let mut watcher = Watcher::off();
+        // A live channel nothing ever sends on: exactly what the FSEvents
+        // stream for `~/Library/Messages` behaves like. The sender is held so
+        // draining sees an empty queue rather than a hung-up one.
+        let (_tx, rx) = channel();
+        watcher.events = Some(rx);
+        watcher.status = WatcherStatus::Watching;
+        let start = Instant::now();
+        watcher.last_poll = start;
+
+        // A write lands well inside the polling interval; the debounce is what
+        // fires, and it pushes the floor out ahead of itself.
+        watcher.debounce.record(start);
+        assert!(watcher.ready_at(start + DEBOUNCE));
+        assert!(!watcher.ready_at(start + DEBOUNCE + POLL_EVERY / 2));
     }
 
     #[test]
