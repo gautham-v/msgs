@@ -127,19 +127,22 @@ binding applies.
 | `PgUp` `PgDn` | page through the conversation |
 | `g` / `G` (`Home` / `End`) | jump to top / bottom |
 | `Ctrl+U` | mark everything seen here, or give the unread back |
+| `any letter` | start typing straight into the composer |
 
 **Chat list**
 
 | Key | Action |
 |---|---|
 | `/` | filter chats by name |
+| `→` | open the selected chat |
 
 **Conversation**
 
 | Key | Action |
 |---|---|
 | `/` | open the jump palette |
-| `i` | start typing in the composer |
+| `←` | back to the chat list |
+| `→` / `i` | start typing in the composer |
 | `o` | open the selected attachment |
 | `s` | save the selected attachment |
 | `r` | quote the selected message in a reply |
@@ -181,10 +184,25 @@ binding applies.
 |---|---|
 | `r` / `Enter` | try to open chat.db again |
 
+There are three ways to the composer without reaching for `Tab`: `→` from the
+conversation, `i`, or simply typing. Any printable key a pane does not already
+use — a letter, a digit, a space — goes to the composer along with the focus,
+so a reply can be started by writing it. Every key that already meant
+something still does: `j` and `k` still move, `y` still copies, `/` still
+filters. The one place typing does nothing is the chat-list screen on a
+terminal too narrow to dock the list, because no composer is drawn there.
+
+`←` and `→` walk the same path `Tab` cycles: `→` from the chat list opens the
+selected chat, `←` from the conversation goes back to the list — docking it
+again if `Ctrl+B` had hidden it — and `→` goes on to the composer. In the
+composer and the palette they stay cursor movement, and in the react picker
+they choose the reaction.
+
 The mouse works too, unless `--no-mouse` is passed: click a chat row or a
-message block to select it, click a link to open it, click the `↓ N new` pill
-to go to what it is counting, and roll the wheel over a pane to scroll it
-without moving focus. The jump palette and the help modal are keyboard-only —
+message block to select it, click a link to open it, click in the composer to
+put the text cursor where you clicked, click the `↓ N new` pill to go to what
+it is counting, and roll the wheel over a pane to scroll it without moving
+focus. The jump palette and the help modal are keyboard-only —
 they swallow clicks so a stray one cannot act on the screen behind them.
 
 ## When it cannot start

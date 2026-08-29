@@ -104,6 +104,8 @@ pub enum Action {
     FocusPane(Focus),
     /// Jump straight to the send box.
     FocusComposer,
+    /// Go to the chat list, docking it first if it was hidden.
+    FocusChatList,
     /// Show or hide the chat list.
     ToggleChatList,
     /// `Ctrl+T`: the next theme base — dark, light, the system's, then the
@@ -157,6 +159,9 @@ pub enum Action {
     Attach,
     /// Type a character into whatever text field has focus.
     Insert(char),
+    /// A printable key pressed in a pane: start the message it looks like the
+    /// start of, in the composer.
+    ComposeChar(char),
     /// Delete the character before the cursor.
     Backspace,
     /// Delete the character after the cursor.
@@ -443,6 +448,16 @@ impl TextField {
         if let Some(next) = self.next_boundary() {
             self.cursor = next;
         }
+    }
+
+    /// Put the cursor at `offset`, clamped into the text and back onto a
+    /// character boundary. This is where a click lands it.
+    pub fn set_cursor(&mut self, offset: usize) {
+        let mut offset = offset.min(self.text.len());
+        while !self.text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        self.cursor = offset;
     }
 
     /// Move the cursor to the start of the field.
@@ -1887,6 +1902,7 @@ impl App {
             Action::FocusPrev => self.cycle_focus(false),
             Action::FocusPane(pane) => self.focus = pane,
             Action::FocusComposer => self.focus = Focus::Composer,
+            Action::FocusChatList => self.focus_chat_list(),
             Action::ToggleChatList => self.toggle_chat_list(),
             Action::CycleTheme => self.cycle_theme(),
             Action::SelectPrev => self.move_selection(-1),
@@ -1913,6 +1929,7 @@ impl App {
                     self.edit(|field| field.insert(c));
                 }
             }
+            Action::ComposeChar(c) => self.compose_char(c),
             Action::Backspace => self.backspace(),
             Action::DeleteForward => self.edit(TextField::delete_forward),
             Action::DeleteWordBack => self.edit(TextField::delete_word_back),
@@ -2324,12 +2341,33 @@ impl App {
         }
     }
 
-    fn start_filter(&mut self) {
+    /// `←` from the conversation: the chat list gets the keys, and is docked
+    /// again first if the toggle had hidden it. On a terminal too narrow to
+    /// dock it, this is the list screen — the same place `Ctrl+B` goes.
+    fn focus_chat_list(&mut self) {
         if !self.too_narrow_for_the_chat_list() && !self.show_chat_list {
             self.show_chat_list = true;
         }
         self.focus = Focus::ChatList;
+    }
+
+    fn start_filter(&mut self) {
+        self.focus_chat_list();
         self.chat_filter = Some(TextField::default());
+    }
+
+    /// A printable key nothing in the pane claims: the reader is writing a
+    /// reply, so the composer takes both the focus and the character.
+    ///
+    /// The list screen is the exception. There is no composer drawn on it, so
+    /// a letter there would type into a box nobody can see; the key stays
+    /// dead and the list keeps the focus.
+    fn compose_char(&mut self, c: char) {
+        if self.list_screen() {
+            return;
+        }
+        self.focus = Focus::Composer;
+        self.edit(|field| field.insert(c));
     }
 
     /// `Ctrl+A`: ask for a path, in the composer's place.
@@ -2776,6 +2814,23 @@ impl App {
                 self.open_attachment_at(Some(attachment));
             } else if let Some(index) = self.hits.message_at(self.panes.conversation, position.y) {
                 self.messages.selected = index;
+            }
+        } else if pane == Focus::Composer {
+            // The draft is a text field, so a click in it is a cursor move —
+            // to the character under the pointer, or to the end when there is
+            // nothing written that far along.
+            let offset = {
+                let field = self.attach_prompt.as_ref().unwrap_or(&self.composer);
+                crate::ui::composer::offset_at(
+                    field.text(),
+                    field.cursor(),
+                    self.panes.composer,
+                    position,
+                )
+            };
+            if let Some(offset) = offset {
+                let field = self.attach_prompt.as_mut().unwrap_or(&mut self.composer);
+                field.set_cursor(offset);
             }
         }
     }
@@ -3232,6 +3287,134 @@ mod tests {
 
         assert_eq!(app.focus, Focus::Conversation);
         assert_eq!(app.messages.selected, 3);
+    }
+
+    #[test]
+    fn clicking_the_composer_focuses_it_and_puts_the_cursor_where_it_landed() {
+        use crossterm::event::KeyModifiers;
+
+        let mut app = app();
+        app.focus = Focus::Conversation;
+        // As `ui::compute` hands it over: three rows at the foot of the pane.
+        app.panes.composer = Rect::new(30, 20, 50, 3);
+        app.composer = TextField::from_text("one two");
+        // The draft starts two columns in for the box and three more for the
+        // prompt, on the row inside the border.
+        let text_x = 35;
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: text_x + 4,
+            row: 21,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.composer.cursor(), 4);
+
+        // Past the end of what is written, the cursor goes to the end.
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: text_x + 20,
+            row: 21,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.composer.cursor(), app.composer.text().len());
+
+        // A click on the border focuses the box and leaves the cursor alone.
+        app.composer.set_cursor(1);
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 31,
+            row: 20,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.composer.cursor(), 1);
+        assert_eq!(app.composer.text(), "one two", "a click writes nothing");
+    }
+
+    #[test]
+    fn typing_in_a_pane_jumps_to_the_composer_with_the_character() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let press = |app: &mut App, code: KeyCode| {
+            if let Some(action) =
+                crate::keymap::resolve(KeyEvent::new(code, KeyModifiers::NONE), app.key_focus())
+            {
+                app.update(action);
+            }
+        };
+
+        let mut thread = app();
+        thread.panes.screen = Rect::new(0, 0, 120, 40);
+        thread.focus = Focus::Conversation;
+        press(&mut thread, KeyCode::Char('h'));
+        press(&mut thread, KeyCode::Char('i'));
+        assert_eq!(thread.focus, Focus::Composer);
+        assert_eq!(
+            thread.composer.text(),
+            "hi",
+            "the `i` typed, it did not focus"
+        );
+
+        // The chat list does the same, and a bound key there still navigates.
+        let mut listing = app();
+        listing.panes.screen = Rect::new(0, 0, 120, 40);
+        listing.chats.set_len(4);
+        press(&mut listing, KeyCode::Char('j'));
+        assert_eq!(listing.focus, Focus::ChatList);
+        assert_eq!(listing.chats.selected, 1);
+        press(&mut listing, KeyCode::Char('w'));
+        assert_eq!(listing.focus, Focus::Composer);
+        assert_eq!(listing.composer.text(), "w");
+
+        // On the list screen there is no composer to type into, so the key is
+        // dead and the list keeps the focus.
+        let mut narrow = app();
+        narrow.panes.screen = Rect::new(0, 0, MIN_WIDTH_FOR_CHAT_LIST - 1, 40);
+        assert!(narrow.list_screen());
+        press(&mut narrow, KeyCode::Char('w'));
+        assert_eq!(narrow.focus, Focus::ChatList);
+        assert!(narrow.composer.is_empty());
+    }
+
+    #[test]
+    fn left_and_right_walk_between_the_panes() {
+        let mut wide = app();
+        wide.panes.screen = Rect::new(0, 0, 120, 40);
+        assert_eq!(wide.focus, Focus::ChatList);
+
+        // Right out of the list opens the chat, the way Enter does.
+        wide.update(Action::Activate);
+        assert_eq!(wide.focus, Focus::Conversation);
+        wide.update(Action::FocusComposer);
+        assert_eq!(wide.focus, Focus::Composer);
+
+        wide.focus = Focus::Conversation;
+        wide.update(Action::FocusChatList);
+        assert_eq!(wide.focus, Focus::ChatList);
+
+        // A hidden list is docked again rather than skipped.
+        wide.update(Action::ToggleChatList);
+        assert!(!wide.show_chat_list);
+        assert_eq!(wide.focus, Focus::Conversation);
+        wide.update(Action::FocusChatList);
+        assert!(
+            wide.show_chat_list,
+            "the list comes back to receive the keys"
+        );
+        assert_eq!(wide.focus, Focus::ChatList);
+
+        // Too narrow to dock: the list is a screen, and this is the way to it.
+        let mut narrow = app();
+        narrow.panes.screen = Rect::new(0, 0, MIN_WIDTH_FOR_CHAT_LIST - 1, 40);
+        narrow.focus = Focus::Conversation;
+        narrow.update(Action::FocusChatList);
+        assert!(narrow.list_screen());
+        assert!(narrow.show_chat_list, "the docking flag is untouched");
+        // And Right — Activate — goes back to the thread.
+        narrow.update(Action::Activate);
+        assert_eq!(narrow.focus, Focus::Conversation);
     }
 
     #[test]
