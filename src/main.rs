@@ -7,7 +7,7 @@
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -67,6 +67,10 @@ struct Cli {
     /// Do not draw pictures inline; show every attachment as a chip.
     #[arg(long)]
     no_images: bool,
+
+    /// Do not play animated GIFs; show the first frame and leave it there.
+    #[arg(long)]
+    no_animate: bool,
 
     /// Do not read Contacts; show phone numbers and addresses instead of names.
     #[arg(long)]
@@ -159,7 +163,8 @@ fn main() -> Result<()> {
     // as keystrokes.
     app.set_terminal_colors(theme::query_terminal(Duration::from_millis(150)));
     if !cli.no_images && app.config.images {
-        app.enable_images(media::Images::detect());
+        let animate = !cli.no_animate && app.config.animate;
+        app.enable_images(media::Images::detect().animated(animate));
         let _ = terminal.clear();
     }
     let result = run(&mut terminal, &mut app);
@@ -179,11 +184,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Resu
         let _ = execute!(io::stdout(), EndSynchronizedUpdate);
         drawn?;
 
+        // A GIF on screen is the only thing that asks for a frame sooner than
+        // the tick; when nothing is playing this is exactly the old wait.
+        let timeout = app.next_animation_due().map_or(TICK, |due| due.min(TICK));
+
         // Drain everything queued before drawing again: a drag of the window
         // edge arrives as a burst of resize events, and one frame at the end
         // of the burst is the whole point of it.
         let mut waited = false;
-        while event::poll(if waited { Duration::ZERO } else { TICK })? {
+        while event::poll(if waited { Duration::ZERO } else { timeout })? {
             waited = true;
             match event::read()? {
                 // Terminals with the kitty keyboard protocol also report key
@@ -204,6 +213,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Resu
                 break;
             }
         }
+        app.tick_animations(Instant::now());
         app.tick();
 
         if app.should_quit {
@@ -480,6 +490,21 @@ fn check(cli: &Cli, warnings: &[String]) -> Result<()> {
     );
 
     row(
+        "animated gifs",
+        &if cli.no_images {
+            "off (--no-images)".to_string()
+        } else if cli.no_animate {
+            "off (--no-animate)".to_string()
+        } else {
+            format!(
+                "played inline, up to {} frames and {} MB per gif",
+                media::MAX_FRAMES,
+                media::MAX_FRAME_BYTES / (1024 * 1024)
+            )
+        },
+    );
+
+    row(
         "sips",
         &which("sips").map_or_else(
             || "not on PATH — HEIC photos will stay chips".to_string(),
@@ -573,6 +598,7 @@ mod tests {
             "--no-index",
             "--no-images",
             "--no-link-previews",
+            "--no-animate",
         ]);
         assert_eq!(
             cli.db.as_deref(),
@@ -582,6 +608,7 @@ mod tests {
         assert!(cli.no_index);
         assert!(cli.no_images);
         assert!(cli.no_link_previews);
+        assert!(cli.no_animate);
         assert!(!cli.no_contacts);
         assert!(!cli.no_pins);
         assert!(!cli.check);
@@ -592,6 +619,7 @@ mod tests {
         assert!(!cli.no_index);
         assert!(!cli.no_images);
         assert!(!cli.no_link_previews);
+        assert!(!cli.no_animate);
         assert!(!cli.no_contacts);
         assert!(!cli.no_pins);
 

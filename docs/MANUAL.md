@@ -94,9 +94,10 @@ Flags:
 | `--no-mouse` | do not capture the mouse; the terminal's own selection works instead |
 | `--theme <NAME>` | `dark`, `light`, `system`, or `terminal`; overrides `base` in the config's `[theme]` |
 | `--redact` | mask phone numbers and addresses on screen (`+1 (•••) •••-••39`), for a demo or a screenshot; names and message bodies still show |
-| `--check` | print a readiness report (Full Disk Access, database, row counts, unread, read state, live updates, Messages.app and whether it is running, `osascript`, `imsg`, search index, contacts, pins, terminal graphics) and exit |
+| `--check` | print a readiness report (Full Disk Access, database, row counts, unread, read state, live updates, Messages.app and whether it is running, `osascript`, `imsg`, search index, contacts, pins, terminal graphics, GIF playback) and exit |
 | `--no-index` | do not build or use the full-text message index |
 | `--no-images` | do not draw pictures inline; show every attachment as a chip |
+| `--no-animate` | do not play animated GIFs; show the first frame and leave it there |
 | `--no-contacts` | do not read Contacts; show numbers and addresses instead of names |
 | `--no-pins` | do not read Messages.app's pinned conversations; list every chat by recency |
 | `--no-link-previews` | do not show the link previews Messages stored; leave the URL alone |
@@ -256,6 +257,20 @@ and keep their aspect ratio, and the file name and size move onto the meta line
 under them. `--no-images`, or `images = false` in the config, turns the whole
 thing off and leaves every attachment as a chip.
 
+A GIF plays where it was sent. Its frames are decoded and encoded once, on the
+same thread the conversions run on, and then the event loop simply wakes when
+the next one is due — the frames are already made, so a playing GIF costs a
+lookup and a draw. Every frame is encoded at the size the still was measured
+at, so a picture that starts moving never changes the height of the block it is
+in, and a GIF that will not encode that way is left standing as its first frame.
+The work is capped: at most 48 frames, and at most 24 MB of decoded frame data
+for one file — a GIF over either cap shows its first frame and stays there, and
+only the GIFs actually on screen are ever stepped. `--no-animate`, or
+`animate = false` in the config, leaves every GIF on its first frame. All of it
+needs a terminal that can draw pictures at all: half-blocks animate too, but a
+terminal without kitty, iTerm2, or sixel graphics is drawing a coarse
+approximation of one.
+
 HEIC is what an iPhone camera sends and nothing in Rust reads it, so `sips` —
 the converter macOS ships — turns one into a JPEG the first time it is on
 screen. That runs on its own thread, so a thread full of photos never blocks a
@@ -274,7 +289,11 @@ An attachment whose bytes never reached this Mac says
 `(not downloaded on this Mac)` rather than pretending to be there.
 
 `o` opens the selected message's attachment with `open` — clicking a picture
-opens that one the same way — and `s` copies it into
+opens that one the same way — except a GIF, which goes to Quick Look instead:
+`open` hands one to Preview.app, which lays its frames out as a list of pages
+and never plays it, and Quick Look is the same preview the Finder gives a file
+on the spacebar. A Mac without `qlmanage` falls back to `open`. `s` copies it
+into
 `~/Downloads` without ever overwriting anything — a name already taken gets
 ` (2)` before the extension. Both read the file and nothing else; `chat.db` is
 untouched. `Ctrl+A` goes the other way and sends a file to the open
@@ -579,6 +598,7 @@ chat_list_width = 30     # columns, 18–60, never more than half the screen
 page_step = 10           # rows PageUp / PageDown move a list by
 mouse = true             # --no-mouse overrides this
 images = true            # draw pictures inline; --no-images overrides this
+animate = true           # play animated gifs; --no-animate overrides this
 contacts = true          # read Contacts for names; --no-contacts overrides this
 pins = true              # read Messages.app's pinned chats; --no-pins overrides this
 link_previews = true     # show the link previews Messages stored; --no-link-previews overrides this
@@ -600,6 +620,7 @@ Every key, what it does, and what overrides it:
 | `page_step` | `10` | ≥ 1 rows | rows `PageUp` / `PageDown` move a list by; the conversation pages by its own height and the wheel is always three rows |
 | `mouse` | `true` | bool | capture the mouse; `--no-mouse` overrides it to `false` |
 | `images` | `true` | bool | draw pictures inline; `--no-images` overrides it to `false` |
+| `animate` | `true` | bool | play animated GIFs inline, up to 48 frames and 24 MB of frames each; `--no-animate` overrides it to `false`, and so does anything that turns pictures off |
 | `contacts` | `true` | bool | read Contacts for names; `--no-contacts` overrides it to `false` |
 | `pins` | `true` | bool | read Messages.app's pinned conversations so pinned chats come first; `--no-pins` overrides it to `false` |
 | `link_previews` | `true` | bool | show the link previews Messages already stored; `--no-link-previews` overrides it to `false` |

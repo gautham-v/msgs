@@ -1,5 +1,7 @@
 //! The few things msgs asks the rest of the machine to do: put text on the
-//! clipboard, open a link, and open an attachment.
+//! clipboard, open a link, and open an attachment — with [`opener`] deciding
+//! which of two ways an attachment is opened, because Preview.app shows a GIF
+//! as a stack of pages and Quick Look plays it.
 //!
 //! All of them are deliberately tiny and all of them are one-way. Nothing here
 //! reads anything back, nothing here logs what it was given — the text handed
@@ -138,6 +140,33 @@ pub fn open_url(url: &str) -> Result<(), Error> {
         .map_err(|_| Error::NotAvailable)
 }
 
+/// Which of the two ways a file is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opener {
+    /// `open`, which is whatever the Finder would use.
+    Finder,
+    /// Quick Look, which plays an animation rather than paging through it.
+    QuickLook,
+}
+
+/// Which opener a file gets, decided by its extension alone.
+///
+/// A GIF handed to `open` lands in Preview.app, which lays its frames out as a
+/// list of pages and never plays one. Quick Look — the same preview the Finder
+/// gives a file on the spacebar — animates it.
+#[must_use]
+pub fn opener(path: &Path) -> Opener {
+    let animated = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"));
+    if animated {
+        Opener::QuickLook
+    } else {
+        Opener::Finder
+    }
+}
+
 /// Open a file with whatever the Finder would open it with.
 ///
 /// The path comes from the `attachment` table, so it is checked to be a real
@@ -152,8 +181,31 @@ pub fn open_path(path: &Path) -> Result<(), Error> {
     if !path.is_file() {
         return Err(Error::NotAFile);
     }
+    // Quick Look is a nicety, so a Mac without `qlmanage` falls back to the
+    // ordinary opener rather than failing to open the file at all.
+    if opener(path) == Opener::QuickLook && quick_look(path).is_ok() {
+        return Ok(());
+    }
     Command::new("open")
         .arg("--")
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| Error::NotAvailable)
+}
+
+/// Show a file in a Quick Look window, the way the spacebar does in the Finder.
+///
+/// `qlmanage` has no `--` to end its flags, so only an absolute path is handed
+/// to it; anything else falls back to `open`, which does.
+fn quick_look(path: &Path) -> Result<(), Error> {
+    if !path.is_absolute() {
+        return Err(Error::NotAvailable);
+    }
+    Command::new("qlmanage")
+        .arg("-p")
         .arg(path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -197,6 +249,17 @@ mod tests {
             open_url("mailto:someone@example.invalid"),
             Err(Error::NotALink)
         );
+    }
+
+    #[test]
+    fn a_gif_is_played_and_everything_else_is_opened() {
+        assert_eq!(opener(Path::new("/tmp/clip.gif")), Opener::QuickLook);
+        assert_eq!(opener(Path::new("/tmp/CLIP.GIF")), Opener::QuickLook);
+        assert_eq!(opener(Path::new("/tmp/a.b/clip.Gif")), Opener::QuickLook);
+        assert_eq!(opener(Path::new("/tmp/shot.png")), Opener::Finder);
+        assert_eq!(opener(Path::new("/tmp/clip.mov")), Opener::Finder);
+        assert_eq!(opener(Path::new("/tmp/gif")), Opener::Finder);
+        assert_eq!(opener(Path::new("/tmp/notagif.pdf")), Opener::Finder);
     }
 
     #[test]

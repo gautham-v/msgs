@@ -33,6 +33,9 @@ pub struct Config {
     /// Draw pictures inline where the terminal can. `--no-images` overrides
     /// this to `false`.
     pub images: bool,
+    /// Play animated GIFs inline. `--no-animate` overrides this to `false`,
+    /// and so does anything that turns pictures off altogether.
+    pub animate: bool,
     /// Read the macOS Contacts stores so handles become names.
     /// `--no-contacts` overrides this to `false`.
     pub contacts: bool,
@@ -57,6 +60,7 @@ impl Default for Config {
             page_step: DEFAULT_PAGE_STEP,
             mouse: true,
             images: true,
+            animate: true,
             contacts: true,
             pins: true,
             link_previews: true,
@@ -157,6 +161,7 @@ mod tests {
             chat_list_width = 24
             page_step = 5
             mouse = false
+            animate = false
             contacts = false
             pins = false
             link_previews = false
@@ -172,6 +177,8 @@ mod tests {
         assert_eq!(config.chat_list_width, 24);
         assert_eq!(config.page_step, 5);
         assert!(!config.mouse);
+        assert!(!config.animate);
+        assert!(config.images, "an untouched key keeps its default");
         assert!(!config.contacts);
         assert!(!config.pins);
         assert!(!config.link_previews);

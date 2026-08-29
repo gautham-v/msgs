@@ -10,6 +10,10 @@
 //!   on screen — the encoded protocol data for it. Terminals that speak the
 //!   kitty graphics protocol get real pixels; everything else falls back to
 //!   unicode half-blocks, which every terminal can draw.
+//! - [`reel`] and [`Animation`] are the moving part: a GIF's frames, decoded
+//!   and encoded on the worker thread and then played by the event loop. Every
+//!   frame is encoded at the size the still was measured at, so a picture that
+//!   starts moving never changes the height of the block it is in.
 //! - [`convert`], [`poster`] and [`save_to_downloads`] are the file-system
 //!   errands: HEIC through `sips` into a cached JPEG, a video's poster frame
 //!   through `qlmanage` into a cached PNG, and `s` copying an attachment out to
@@ -26,7 +30,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect, Size};
@@ -35,7 +40,8 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
 use ratatui_image::{FontSize, Resize};
 
-use image::{ImageDecoder, metadata::Orientation};
+use image::codecs::gif::GifDecoder;
+use image::{AnimationDecoder, ImageDecoder, metadata::Orientation};
 
 use crate::db::AttachmentRef;
 
@@ -57,6 +63,28 @@ const MAX_DECODE_BYTES: u64 = 64 * 1024 * 1024;
 /// under the reader — but the encoded pixels behind them are evicted oldest
 /// first, so a long scroll through a photo thread does not grow without bound.
 const MAX_ENCODED: usize = 32;
+
+/// How many frames of an animation are ever decoded. A longer GIF plays its
+/// first [`MAX_FRAMES`] and loops there rather than costing the whole file.
+pub const MAX_FRAMES: usize = 48;
+
+/// What the decoded frames of one animation may come to. A GIF over the cap is
+/// left as its first frame: playing it is not worth the memory.
+pub const MAX_FRAME_BYTES: u64 = 24 * 1024 * 1024;
+
+/// The shortest a frame is ever shown. GIFs in the wild ask for nothing at
+/// all, which would have the event loop spinning instead of waiting.
+const MIN_DELAY: Duration = Duration::from_millis(30);
+
+/// What a frame that asks for no delay is shown for, which is what a browser
+/// does with one.
+const DEFAULT_DELAY: Duration = Duration::from_millis(100);
+
+/// How many animations are kept encoded past the ones on screen. The pictures
+/// actually being looked at are never dropped — the screen is what bounds
+/// those — so this only decides how far back a scroll can go and still find a
+/// GIF still moving.
+const MAX_PLAYING: usize = 4;
 
 /// How the terminal is drawing pictures, for `--check` and the status line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,12 +416,183 @@ fn decode_oriented(path: &Path) -> Option<image::DynamicImage> {
     Some(image)
 }
 
+/// Whether an attachment is a GIF, the one thing here that moves.
+///
+/// Only a file that is decoded as it is: a HEIC and a video both reach the
+/// screen as a converted still, and neither of those has frames to play.
+#[must_use]
+pub fn is_animated(attachment: &AttachmentRef) -> bool {
+    if prep(attachment) != Prep::Direct {
+        return false;
+    }
+    let gif = |text: &str| text.to_ascii_lowercase().contains("gif");
+    attachment.mime_type.as_deref().is_some_and(gif)
+        || attachment.uti.as_deref().is_some_and(gif)
+        || attachment
+            .filename
+            .as_deref()
+            .and_then(|name| name.rsplit_once('.'))
+            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("gif"))
+}
+
+/// The frames of an animation, decoded and waiting to be encoded.
+pub struct Reel {
+    /// Every frame, all the size of the first: a GIF's own canvas.
+    pub frames: Vec<image::RgbaImage>,
+    /// How long each frame is shown, in step with [`Reel::frames`].
+    pub delays: Vec<Duration>,
+}
+
+/// Decode `path` as an animation, inside the caps.
+///
+/// `None` for everything that should stay a still: a file that is not a
+/// readable GIF, one that holds a single frame, and one whose decoded frames
+/// would come to more than `max_bytes`. Frames past `max_frames` are simply
+/// left undecoded, so a very long GIF costs a bounded amount of work rather
+/// than being refused.
+#[must_use]
+pub fn reel(path: &Path, max_frames: usize, max_bytes: u64) -> Option<Reel> {
+    let file = std::fs::File::open(path).ok()?;
+    let decoder = GifDecoder::new(std::io::BufReader::new(file)).ok()?;
+    let mut frames: Vec<image::RgbaImage> = Vec::new();
+    let mut delays = Vec::new();
+    let mut bytes: u64 = 0;
+    for frame in decoder.into_frames() {
+        // A truncated GIF keeps whatever decoded cleanly rather than losing
+        // the animation over its last frame.
+        let Ok(frame) = frame else { break };
+        let delay = Duration::from(frame.delay());
+        let buffer = frame.into_buffer();
+        // Every frame is the canvas the GIF was authored at, which is what
+        // lets all of them encode to one size — and so to one block height.
+        if frames
+            .first()
+            .is_some_and(|first| first.dimensions() != buffer.dimensions())
+        {
+            break;
+        }
+        bytes = bytes.saturating_add(u64::from(buffer.width()) * u64::from(buffer.height()) * 4);
+        if bytes > max_bytes {
+            return None;
+        }
+        frames.push(buffer);
+        delays.push(if delay.is_zero() {
+            DEFAULT_DELAY
+        } else {
+            delay.max(MIN_DELAY)
+        });
+        if frames.len() >= max_frames {
+            break;
+        }
+    }
+    (frames.len() > 1).then_some(Reel { frames, delays })
+}
+
+/// Encode every frame at `size`, so playing one is a lookup and a draw.
+///
+/// `None` when a frame will not encode, and when one comes back a size other
+/// than the still's: a picture that changed size mid-play would move every
+/// message under it, so the animation is dropped and the still stands.
+fn encode_reel(
+    picker: &Picker,
+    reel: Reel,
+    size: Size,
+) -> Option<(Vec<SlicedProtocol>, Vec<Duration>)> {
+    let mut frames = Vec::with_capacity(reel.frames.len());
+    for buffer in reel.frames {
+        let image = image::DynamicImage::ImageRgba8(buffer);
+        let protocol =
+            SlicedProtocol::new_with_resize(picker, image, size, Resize::Fit(None)).ok()?;
+        if protocol.size() != size {
+            return None;
+        }
+        frames.push(protocol);
+    }
+    Some((frames, reel.delays))
+}
+
+/// A GIF on screen: every frame already encoded, and which one is up.
+///
+/// The frames all report the size the still was measured at — a reel that
+/// encodes to anything else is thrown away rather than drawn — so
+/// [`Images::cells`] answers the same number whether a picture is playing or
+/// standing still.
+pub struct Animation {
+    frames: Vec<SlicedProtocol>,
+    delays: Vec<Duration>,
+    current: usize,
+    /// When the frame on screen stops being the right one.
+    due: Instant,
+}
+
+impl Animation {
+    /// Build one, `None` unless there are at least two frames and a delay for
+    /// each of them.
+    fn new(frames: Vec<SlicedProtocol>, delays: Vec<Duration>, now: Instant) -> Option<Self> {
+        let first = *delays.first()?;
+        (frames.len() > 1 && frames.len() == delays.len()).then(|| Self {
+            frames,
+            delays,
+            current: 0,
+            due: now + first,
+        })
+    }
+
+    /// The frame to draw.
+    fn frame(&self) -> &SlicedProtocol {
+        &self.frames[self.current]
+    }
+
+    /// The size every frame reports, which is the size the block reserved.
+    fn size(&self) -> Size {
+        self.frame().size()
+    }
+
+    /// Step to the frame `now` calls for. `true` when the picture changed.
+    ///
+    /// One lap at most: a window left in the background for an hour comes back
+    /// moving again rather than replaying every frame it missed.
+    fn advance(&mut self, now: Instant) -> bool {
+        if now < self.due {
+            return false;
+        }
+        for _ in 0..self.frames.len() {
+            self.current = (self.current + 1) % self.frames.len();
+            self.due += self.delays[self.current];
+            if now < self.due {
+                return true;
+            }
+        }
+        self.due = now + self.delays[self.current];
+        true
+    }
+
+    /// How long until this picture is due for its next frame.
+    fn due_in(&self, now: Instant) -> Duration {
+        self.due.saturating_duration_since(now)
+    }
+}
+
+/// What the worker thread is asked for. Both jobs are the work that must not
+/// happen on the thread that draws.
+enum Job {
+    /// A HEIC, or a video's poster frame, through the tool macOS ships.
+    Convert(PathBuf, PathBuf, Prep),
+    /// A GIF's frames, decoded and then encoded for the terminal.
+    Animate(Key, PathBuf, Size, Box<Picker>),
+}
+
+/// A finished animation on its way back to the cache.
+type Encoded = (Key, Vec<SlicedProtocol>, Vec<Duration>);
+
 /// What the cache knows about one attachment.
 enum Entry {
     /// The size is known; the protocol data has not been built yet.
     Sized(Size),
     /// Ready to draw.
     Ready(Size, Box<SlicedProtocol>),
+    /// Ready to draw, and moving: a GIF with every frame encoded.
+    Playing(Size, Box<Animation>),
     /// Not a picture msgs can draw. It stays a chip.
     Unusable,
 }
@@ -401,7 +600,7 @@ enum Entry {
 impl Entry {
     const fn size(&self) -> Option<Size> {
         match self {
-            Self::Sized(size) | Self::Ready(size, _) => Some(*size),
+            Self::Sized(size) | Self::Ready(size, _) | Self::Playing(size, _) => Some(*size),
             Self::Unusable => None,
         }
     }
@@ -427,7 +626,18 @@ pub struct Images {
     queued: RefCell<Vec<i64>>,
     /// Encoded pictures in the order they were encoded, for eviction.
     encoded: RefCell<Vec<Key>>,
-    jobs: Option<Sender<(PathBuf, PathBuf, Prep)>>,
+    /// Whether GIFs play. `false` leaves every one of them on its first frame.
+    animate: bool,
+    /// Animations already asked for, so none is decoded twice.
+    asked: RefCell<Vec<Key>>,
+    /// Encoded animations, oldest first, for [`Images::retire`].
+    playing: RefCell<Vec<Key>>,
+    /// Pictures drawn on the last frame: the only ones a tick advances, so a
+    /// GIF far up the scrollback costs nothing.
+    visible: RefCell<Vec<Key>>,
+    jobs: Option<Sender<Job>>,
+    /// Finished animations coming back from the worker.
+    reels: Option<Receiver<Encoded>>,
     /// Set by the worker when a conversion lands, so the app knows to measure
     /// the page again and let the picture in.
     arrived: Arc<AtomicBool>,
@@ -444,6 +654,8 @@ impl std::fmt::Debug for Images {
         f.debug_struct("Images")
             .field("backend", &self.backend)
             .field("cached", &self.entries.borrow().len())
+            .field("animate", &self.animate)
+            .field("playing", &self.playing.borrow().len())
             .finish()
     }
 }
@@ -459,7 +671,12 @@ impl Images {
             entries: RefCell::new(HashMap::new()),
             queued: RefCell::new(Vec::new()),
             encoded: RefCell::new(Vec::new()),
+            animate: false,
+            asked: RefCell::new(Vec::new()),
+            playing: RefCell::new(Vec::new()),
+            visible: RefCell::new(Vec::new()),
             jobs: None,
+            reels: None,
             arrived: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -493,21 +710,38 @@ impl Images {
             ProtocolType::Halfblocks => Backend::Halfblocks,
         };
         let arrived = Arc::new(AtomicBool::new(false));
-        let (sender, receiver) = channel::<(PathBuf, PathBuf, Prep)>();
+        let (sender, receiver) = channel::<Job>();
+        let (done, reels) = channel::<Encoded>();
         let flag = Arc::clone(&arrived);
-        // `sips` and `qlmanage` are a process launch per picture. It happens off the UI thread
-        // so a thread full of photos never stalls a keystroke; the flag is how
-        // the finished work gets back onto the screen.
+        // `sips` and `qlmanage` are a process launch per picture, and a GIF is
+        // a decode and an encode per frame. All of it happens off the UI thread
+        // so a thread full of photos never stalls a keystroke; the flag and the
+        // channel are how the finished work gets back onto the screen.
         let spawned = std::thread::Builder::new()
             .name("msgs-convert".to_string())
             .spawn(move || {
-                while let Ok((source, target, how)) = receiver.recv() {
-                    let made = match how {
-                        Prep::QuickLook => poster(&source, &target),
-                        _ => convert(&source, &target),
-                    };
-                    if made {
-                        flag.store(true, Ordering::SeqCst);
+                while let Ok(job) = receiver.recv() {
+                    match job {
+                        Job::Convert(source, target, how) => {
+                            let made = match how {
+                                Prep::QuickLook => poster(&source, &target),
+                                _ => convert(&source, &target),
+                            };
+                            if made {
+                                flag.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        Job::Animate(key, path, size, picker) => {
+                            let Some(reel) = reel(&path, MAX_FRAMES, MAX_FRAME_BYTES) else {
+                                continue;
+                            };
+                            let Some((frames, delays)) = encode_reel(&picker, reel, size) else {
+                                continue;
+                            };
+                            if done.send((key, frames, delays)).is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             })
@@ -519,9 +753,29 @@ impl Images {
             entries: RefCell::new(HashMap::new()),
             queued: RefCell::new(Vec::new()),
             encoded: RefCell::new(Vec::new()),
+            animate: true,
+            asked: RefCell::new(Vec::new()),
+            playing: RefCell::new(Vec::new()),
+            visible: RefCell::new(Vec::new()),
             jobs: spawned.then_some(sender),
+            reels: spawned.then_some(reels),
             arrived,
         }
+    }
+
+    /// Whether GIFs play, which is what `animate` in the config and
+    /// `--no-animate` decide. A cache that does not animate draws every GIF's
+    /// first frame and nothing else.
+    #[must_use]
+    pub fn animated(mut self, on: bool) -> Self {
+        self.animate = on;
+        self
+    }
+
+    /// Whether GIFs play.
+    #[must_use]
+    pub const fn animates(&self) -> bool {
+        self.animate
     }
 
     /// How pictures are being drawn.
@@ -605,7 +859,7 @@ impl Images {
         if queued.contains(&rowid) {
             return;
         }
-        if jobs.send((source, target, how)).is_ok() {
+        if jobs.send(Job::Convert(source, target, how)).is_ok() {
             queued.push(rowid);
         }
     }
@@ -651,10 +905,137 @@ impl Images {
         let key = (attachment.rowid, room);
         self.encode(attachment, key);
         let entries = self.entries.borrow();
-        let Some(Entry::Ready(_, protocol)) = entries.get(&key) else {
-            return;
+        let protocol = match entries.get(&key) {
+            Some(Entry::Ready(_, protocol)) => protocol.as_ref(),
+            Some(Entry::Playing(_, animation)) => animation.frame(),
+            _ => return,
         };
         SlicedImage::new(protocol, SignedPosition::from((0, offset))).render(area, buffer);
+        drop(entries);
+        // On screen this frame, which is what decides whether it is worth
+        // waking the loop up for.
+        let mut visible = self.visible.borrow_mut();
+        if !visible.contains(&key) {
+            visible.push(key);
+        }
+    }
+
+    /// Forget what was on screen, at the top of every frame.
+    ///
+    /// [`Images::render`] fills the list back in as the pictures are drawn, so
+    /// a GIF that scrolled away stops costing anything the moment it is no
+    /// longer painted.
+    pub fn begin_frame(&self) {
+        self.visible.borrow_mut().clear();
+    }
+
+    /// Take in whatever animations the worker finished. `true` when one landed,
+    /// which is a redraw.
+    pub fn absorb(&self) -> bool {
+        let Some(reels) = self.reels.as_ref() else {
+            return false;
+        };
+        let now = Instant::now();
+        let mut landed = false;
+        // Empty and disconnected are the same answer here: nothing more is
+        // coming this frame.
+        while let Ok((key, frames, delays)) = reels.try_recv() {
+            landed |= self.install(key, frames, delays, now);
+        }
+        if landed {
+            self.retire();
+        }
+        landed
+    }
+
+    /// Put one finished animation over the still it was decoded for.
+    ///
+    /// Refused unless the frames report exactly the size the entry is already
+    /// holding: the rows the block reserved are the rows the picture gets,
+    /// whether or not it moves.
+    fn install(
+        &self,
+        key: Key,
+        frames: Vec<SlicedProtocol>,
+        delays: Vec<Duration>,
+        now: Instant,
+    ) -> bool {
+        let Some(animation) = Animation::new(frames, delays, now) else {
+            return false;
+        };
+        let mut entries = self.entries.borrow_mut();
+        // A resize since the job went out has already thrown the entry away,
+        // and the frames were encoded for a size nothing is asking for now.
+        let Some(size) = entries.get(&key).and_then(Entry::size) else {
+            return false;
+        };
+        if size != animation.size() {
+            return false;
+        }
+        entries.insert(key, Entry::Playing(size, Box::new(animation)));
+        drop(entries);
+        self.playing.borrow_mut().push(key);
+        true
+    }
+
+    /// Drop the animations nothing is looking at, back to their measured size.
+    ///
+    /// What is on screen is kept however many that is — the screen itself is
+    /// what bounds it, and dropping a picture being watched would only have it
+    /// decoded again. A dropped one is forgotten rather than blacklisted, so
+    /// scrolling back to it starts it moving again.
+    fn retire(&self) {
+        let visible = self.visible.borrow();
+        let mut playing = self.playing.borrow_mut();
+        let mut entries = self.entries.borrow_mut();
+        let mut asked = self.asked.borrow_mut();
+        let mut index = 0;
+        while playing.len() > MAX_PLAYING && index < playing.len() {
+            let key = playing[index];
+            if visible.contains(&key) {
+                index += 1;
+                continue;
+            }
+            playing.remove(index);
+            asked.retain(|held| *held != key);
+            if let Some(Entry::Playing(size, _)) = entries.get(&key) {
+                let size = *size;
+                entries.insert(key, Entry::Sized(size));
+            }
+        }
+    }
+
+    /// How long until a picture on screen is due for its next frame.
+    ///
+    /// `None` when nothing on screen is moving, which is how the event loop
+    /// goes back to its ordinary wait.
+    #[must_use]
+    pub fn next_due(&self, now: Instant) -> Option<Duration> {
+        let entries = self.entries.borrow();
+        self.visible
+            .borrow()
+            .iter()
+            .filter_map(|key| match entries.get(key) {
+                Some(Entry::Playing(_, animation)) => Some(animation.due_in(now)),
+                _ => None,
+            })
+            .min()
+    }
+
+    /// Step every picture on screen to the frame `now` calls for. `true` when
+    /// one of them changed, which is a redraw.
+    ///
+    /// The frames are already encoded, so this is a comparison and an index.
+    pub fn advance(&self, now: Instant) -> bool {
+        let visible = self.visible.borrow();
+        let mut entries = self.entries.borrow_mut();
+        let mut moved = false;
+        for key in visible.iter() {
+            if let Some(Entry::Playing(_, animation)) = entries.get_mut(key) {
+                moved |= animation.advance(now);
+            }
+        }
+        moved
     }
 
     /// Turn a measured picture into protocol data, once.
@@ -679,11 +1060,43 @@ impl Images {
             .map_or(Entry::Unusable, |protocol| {
                 Entry::Ready(protocol.size(), Box::new(protocol))
             });
-        let ready = matches!(entry, Entry::Ready(..));
+        // The still goes up first, so a GIF is on screen from the frame it is
+        // measured on; the frames replace it whenever the worker is done.
+        let encoded = match &entry {
+            Entry::Ready(size, _) => Some(*size),
+            _ => None,
+        };
         self.entries.borrow_mut().insert(key, entry);
-        if ready {
+        if let Some(size) = encoded {
             self.encoded.borrow_mut().push(key);
             self.evict();
+            self.queue_animation(attachment, key, size);
+        }
+    }
+
+    /// Ask the worker for a GIF's frames, at most once per picture.
+    ///
+    /// `size` is what the still encoded to, and what every frame has to come
+    /// back as, so the block's height is decided once.
+    fn queue_animation(&self, attachment: &AttachmentRef, key: Key, size: Size) {
+        if !self.animate || !is_animated(attachment) {
+            return;
+        }
+        let (Some(jobs), Some(picker)) = (self.jobs.as_ref(), self.picker.as_ref()) else {
+            return;
+        };
+        let Some(path) = attachment.path().filter(|path| path.is_file()) else {
+            return;
+        };
+        let mut asked = self.asked.borrow_mut();
+        if asked.contains(&key) {
+            return;
+        }
+        if jobs
+            .send(Job::Animate(key, path, size, Box::new(picker.clone())))
+            .is_ok()
+        {
+            asked.push(key);
         }
     }
 
@@ -694,6 +1107,8 @@ impl Images {
         let mut entries = self.entries.borrow_mut();
         while encoded.len() > MAX_ENCODED {
             let oldest = encoded.remove(0);
+            // A playing picture is not on this list's terms: `retire` is what
+            // bounds those, and dropping one here would stop it mid-frame.
             if let Some(Entry::Ready(size, _)) = entries.get(&oldest) {
                 let size = *size;
                 entries.insert(oldest, Entry::Sized(size));
@@ -955,6 +1370,213 @@ mod tests {
         for room in 20..20 + u16::try_from(MAX_ENCODED).unwrap_or(0) + 8 {
             assert!(images.cells(&attachment, room).is_some());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A synthetic animated GIF: flat frames of a made-up color, written by
+    /// `image`'s own encoder. Never a real attachment, and never a file out of
+    /// `~/Library/Messages`.
+    fn gif(tag: &str, count: u32, delay_ms: u32) -> (PathBuf, PathBuf) {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        use image::{Delay, Frame, Rgba, RgbaImage};
+
+        let dir = std::env::temp_dir().join(format!("msgs-media-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp directory");
+        let path = dir.join("clip.gif");
+        let file = std::fs::File::create(&path).expect("a file to write");
+        let mut encoder = GifEncoder::new(std::io::BufWriter::new(file));
+        encoder.set_repeat(Repeat::Infinite).expect("a looping gif");
+        for index in 0..count {
+            let shade = u8::try_from(40 + index * 40).unwrap_or(u8::MAX);
+            // Sixty by forty: six cells by two at the half-blocks picker's
+            // ten-by-twenty, so the frames need no resizing to land on cells.
+            let buffer = RgbaImage::from_pixel(60, 40, Rgba([shade, 120, 200, 255]));
+            encoder
+                .encode_frame(Frame::from_parts(
+                    buffer,
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(delay_ms, 1),
+                ))
+                .expect("an encoded frame");
+        }
+        drop(encoder);
+        (dir, path)
+    }
+
+    /// The attachment row a written GIF stands behind.
+    fn gif_attachment(path: &Path) -> AttachmentRef {
+        let mut attachment = attachment("image/gif", "clip.gif");
+        attachment.filename = Some(path.display().to_string());
+        attachment
+    }
+
+    #[test]
+    fn only_a_gif_is_treated_as_something_that_moves() {
+        assert!(is_animated(&attachment("image/gif", "clip.gif")));
+        assert!(is_animated(&attachment("image/png", "clip.GIF")));
+        // A picture whose name says nothing, told apart by its UTI.
+        let mut by_uti = attachment("image/x-unknown", "attachment");
+        by_uti.uti = Some("com.compuserve.gif".to_string());
+        assert!(is_animated(&by_uti));
+        assert!(!is_animated(&attachment("image/png", "shot.png")));
+        assert!(!is_animated(&attachment("image/heic", "IMG.HEIC")));
+        assert!(!is_animated(&attachment("video/quicktime", "clip.mov")));
+        assert!(!is_animated(&attachment("application/pdf", "a.pdf")));
+    }
+
+    #[test]
+    fn a_gifs_frames_come_back_with_their_delays() {
+        let (dir, path) = gif("frames", 3, 60);
+        let reel = reel(&path, MAX_FRAMES, MAX_FRAME_BYTES).expect("an animation");
+        assert_eq!(reel.frames.len(), 3);
+        assert_eq!(reel.delays.len(), 3);
+        for frame in &reel.frames {
+            assert_eq!(frame.dimensions(), (60, 40), "every frame is the canvas");
+        }
+        for delay in &reel.delays {
+            assert_eq!(*delay, Duration::from_millis(60));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_frame_that_asks_for_nothing_is_still_shown_for_a_moment() {
+        let (dir, path) = gif("nodelay", 2, 0);
+        let reel = reel(&path, MAX_FRAMES, MAX_FRAME_BYTES).expect("an animation");
+        for delay in &reel.delays {
+            assert!(*delay >= MIN_DELAY, "{delay:?} would spin the event loop");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_caps_leave_a_gif_as_a_still() {
+        let (dir, path) = gif("caps", 4, 60);
+        // One frame is not an animation, which is what the frame cap comes to
+        // when it is asked for fewer than two.
+        assert!(reel(&path, 1, MAX_FRAME_BYTES).is_none());
+        // Past the frame cap, what is decoded is what was asked for.
+        let short = reel(&path, 2, MAX_FRAME_BYTES).expect("an animation");
+        assert_eq!(short.frames.len(), 2);
+        // 60 x 40 x 4 bytes is 9600 a frame: room for two of the four frames
+        // is not room for the animation, and it falls back to a still.
+        assert!(reel(&path, MAX_FRAMES, 9_600).is_none());
+        assert!(reel(&path, MAX_FRAMES, 19_200).is_none());
+        assert!(reel(&path, MAX_FRAMES, 38_400).is_some());
+        // Not a gif at all.
+        let (still, _) = png("notagif", 60, 40);
+        assert!(reel(&still.join("shot.png"), MAX_FRAMES, MAX_FRAME_BYTES).is_none());
+        let _ = std::fs::remove_dir_all(&still);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_frame_encodes_to_the_size_the_block_reserved() {
+        let (dir, path) = gif("sizes", 3, 60);
+        let images = Images::halfblocks();
+        let attachment = gif_attachment(&path);
+        let (columns, rows) = images.cells(&attachment, 40).expect("a size");
+        let size = Size::new(columns, rows);
+
+        let reel = reel(&path, MAX_FRAMES, MAX_FRAME_BYTES).expect("an animation");
+        let (frames, delays) =
+            encode_reel(&Picker::halfblocks(), reel, size).expect("every frame encoded");
+        assert_eq!(frames.len(), 3);
+        assert_eq!(delays.len(), 3);
+        for frame in &frames {
+            assert_eq!(frame.size(), size, "the height cannot move mid-play");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_frame_is_due_when_its_delay_is_up_and_a_long_stall_costs_one_lap() {
+        let (dir, path) = gif("timing", 3, 60);
+        let reel = reel(&path, MAX_FRAMES, MAX_FRAME_BYTES).expect("an animation");
+        let (frames, delays) =
+            encode_reel(&Picker::halfblocks(), reel, Size::new(6, 2)).expect("encoded frames");
+        let now = Instant::now();
+        let mut animation = Animation::new(frames, delays, now).expect("an animation");
+
+        assert!(!animation.advance(now), "nothing is due yet");
+        assert_eq!(animation.due_in(now), Duration::from_millis(60));
+        assert!(!animation.advance(now + Duration::from_millis(59)));
+        assert!(animation.advance(now + Duration::from_millis(60)));
+        assert_eq!(animation.current, 1);
+        assert!(animation.advance(now + Duration::from_millis(120)));
+        assert_eq!(animation.current, 2);
+        // Round the loop.
+        assert!(animation.advance(now + Duration::from_millis(180)));
+        assert_eq!(animation.current, 0);
+
+        // A window left in the background for an hour catches up in one lap
+        // rather than replaying every frame it missed.
+        let later = now + Duration::from_secs(3600);
+        assert!(animation.advance(later));
+        assert!(animation.due_in(later) > Duration::ZERO, "it keeps playing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_gif_on_screen_plays_and_one_that_is_not_costs_nothing() {
+        let (dir, path) = gif("play", 3, 60);
+        let images = Images::halfblocks();
+        assert!(images.animates());
+        let attachment = gif_attachment(&path);
+        let (columns, rows) = images.cells(&attachment, 40).expect("a size");
+
+        // Nothing has been drawn, so nothing is on screen to animate.
+        assert_eq!(images.next_due(Instant::now()), None);
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 8));
+        let area = Rect::new(0, 0, 40, 8);
+        // The still goes up first; the frames land whenever the worker is done
+        // with them, and the picture keeps the size it was measured at.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let playing = loop {
+            images.begin_frame();
+            images.render(&mut buffer, area, 0, &attachment, 40);
+            if images.absorb() {
+                break true;
+            }
+            if Instant::now() > deadline {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        assert!(playing, "the worker encoded the frames");
+        assert_eq!(images.cells(&attachment, 40), Some((columns, rows)));
+
+        // On screen and playing: the loop is told when to come back, and the
+        // frame moves on when it does.
+        images.begin_frame();
+        images.render(&mut buffer, area, 0, &attachment, 40);
+        let due = images.next_due(Instant::now()).expect("a frame is coming");
+        assert!(due <= Duration::from_millis(60), "{due:?}");
+        assert!(images.advance(Instant::now() + Duration::from_millis(60)));
+
+        // Scrolled away: nothing is on screen, so the loop goes back to its
+        // ordinary wait and no frame is stepped.
+        images.begin_frame();
+        assert_eq!(images.next_due(Instant::now()), None);
+        assert!(!images.advance(Instant::now() + Duration::from_secs(1)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cache_that_does_not_animate_leaves_a_gif_on_its_first_frame() {
+        let (dir, path) = gif("still", 3, 60);
+        let images = Images::halfblocks().animated(false);
+        assert!(!images.animates());
+        let attachment = gif_attachment(&path);
+        assert!(images.cells(&attachment, 40).is_some());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 8));
+        images.begin_frame();
+        images.render(&mut buffer, Rect::new(0, 0, 40, 8), 0, &attachment, 40);
+        // Nothing was ever asked for, so nothing can arrive.
+        assert!(!images.absorb());
+        assert_eq!(images.next_due(Instant::now()), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
