@@ -121,8 +121,16 @@ impl Seen {
     /// What msgs should show for `chat`: the database's count, less whatever
     /// was already on screen.
     #[must_use]
+    /// A conversation can be several `chat` rows — one per service for the
+    /// same address — and a floor may have been written under any of them by
+    /// an older msgs, so the highest one standing is the one that applies.
     pub fn unread(&self, chat: &Chat) -> i64 {
-        let floor = self.floors.get(&chat.rowid).copied().unwrap_or(0);
+        let floor = chat
+            .rowid_set()
+            .iter()
+            .filter_map(|rowid| self.floors.get(rowid).copied())
+            .max()
+            .unwrap_or(0);
         (chat.unread_count - floor).max(0)
     }
 
@@ -137,7 +145,7 @@ impl Seen {
         }
         let before = self.floors.len();
         self.floors.retain(|rowid, floor| {
-            let Some(chat) = chats.iter().find(|chat| chat.rowid == *rowid) else {
+            let Some(chat) = chats.iter().find(|chat| chat.owns(*rowid)) else {
                 return false;
             };
             // Messages.app reading the thread somewhere else lowers the
@@ -158,29 +166,38 @@ impl Seen {
     ///
     /// Returns whether anything moved, so a caller can skip a redraw and a
     /// write when nothing did.
-    pub fn mark(&mut self, chat_rowid: i64, unread_count: i64) -> bool {
+    pub fn mark(&mut self, chat_rowids: &[i64], unread_count: i64) -> bool {
         if !self.is_on() {
             return false;
         }
+        let Some((&chat_rowid, rest)) = chat_rowids.split_first() else {
+            return false;
+        };
+        // The floor is kept under the conversation's own rowid; anything a
+        // merged-away row still carries is folded away here.
+        let mut moved = false;
+        for rowid in rest {
+            moved |= self.floors.remove(rowid).is_some();
+        }
         let floor = unread_count.max(0);
         let previous = self.floors.get(&chat_rowid).copied().unwrap_or(0);
-        if previous == floor {
-            return false;
+        if previous != floor {
+            if floor == 0 {
+                self.floors.remove(&chat_rowid);
+            } else {
+                self.floors.insert(chat_rowid, floor);
+            }
+            moved = true;
         }
-        if floor == 0 {
-            self.floors.remove(&chat_rowid);
-        } else {
-            self.floors.insert(chat_rowid, floor);
-        }
-        self.dirty = true;
-        true
+        self.dirty |= moved;
+        moved
     }
 
     /// `Ctrl+U`: mark every chat in the list seen.
     pub fn mark_all(&mut self, chats: &[Chat]) -> bool {
         let mut moved = false;
         for chat in chats {
-            moved |= self.mark(chat.rowid, chat.unread_count);
+            moved |= self.mark(chat.rowid_set(), chat.unread_count);
         }
         moved
     }
@@ -260,7 +277,7 @@ mod tests {
     fn an_inert_state_changes_nothing() {
         let mut seen = Seen::off();
         let mut chats = vec![chat(1, 3)];
-        assert!(!seen.mark(1, 3));
+        assert!(!seen.mark(&[1], 3));
         seen.apply(&mut chats);
         assert_eq!(chats[0].unread, 3);
         assert!(!seen.is_on());
@@ -272,7 +289,7 @@ mod tests {
         let mut seen = Seen::load(&path, Path::new("/fixture/chat.db"));
         let mut chats = vec![chat(1, 3)];
 
-        assert!(seen.mark(1, 3));
+        assert!(seen.mark(&[1], 3));
         seen.apply(&mut chats);
         assert_eq!(chats[0].unread, 0);
         assert!(!chats[0].is_unread());
@@ -289,7 +306,7 @@ mod tests {
         let path = scratch("elsewhere");
         let mut seen = Seen::load(&path, Path::new("/fixture/chat.db"));
         let mut chats = vec![chat(1, 3)];
-        seen.mark(1, 3);
+        seen.mark(&[1], 3);
 
         // Messages.app reads the thread on another device: the database's own
         // count goes to zero, and the floor has to follow or the next message
@@ -308,8 +325,8 @@ mod tests {
     fn a_chat_that_is_gone_is_forgotten() {
         let path = scratch("forgotten");
         let mut seen = Seen::load(&path, Path::new("/fixture/chat.db"));
-        seen.mark(1, 2);
-        seen.mark(2, 2);
+        seen.mark(&[1], 2);
+        seen.mark(&[2], 2);
         let mut chats = vec![chat(2, 2)];
         seen.apply(&mut chats);
         assert_eq!(seen.marked(), 1);
@@ -359,5 +376,27 @@ mod tests {
         std::fs::write(&path, "{ not json").expect("write");
         assert!(Seen::load(&path, Path::new("/fixture/chat.db")).is_empty());
         let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
+    }
+
+    #[test]
+    fn a_floor_written_under_a_merged_away_row_still_applies() {
+        let mut seen = Seen::load(
+            &std::env::temp_dir().join("msgs-seen-merged.json"),
+            Path::new("db"),
+        );
+        seen.floors.clear();
+        // What an older msgs wrote, before the two rows were one conversation.
+        seen.floors.insert(9, 2);
+
+        let mut merged = chat(1, 3);
+        merged.rowids = vec![1, 9];
+        seen.apply(std::slice::from_mut(&mut merged));
+        assert_eq!(merged.unread, 1, "the floor under the other row counts");
+
+        // Opening it moves the floor onto the conversation and folds the old
+        // one away.
+        assert!(seen.mark(merged.rowid_set(), merged.unread_count));
+        assert_eq!(seen.floors.get(&9), None);
+        assert_eq!(seen.floors.get(&1), Some(&3));
     }
 }

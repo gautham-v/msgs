@@ -111,7 +111,7 @@ fn the_index_is_built_beside_the_app_and_never_inside_chat_db() {
     let messages: i64 = untouched
         .query_row("SELECT COUNT(*) FROM message", [], |row| row.get(0))
         .expect("count");
-    assert_eq!(messages, 11);
+    assert_eq!(messages, 13);
     assert!(
         !db.with_extension("db-wal").exists(),
         "the fixture gained no WAL"

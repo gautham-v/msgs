@@ -1,4 +1,4 @@
-  / filter                   │ Alex Nakamura · iMessage · +1 (55…  2 unread in 2 chats · ? help
+  / filter                   │ Alex Nakamura · iMessage · +1 (55…  3 unread in 2 chats · ? help
                              │──────────────────────────────────────────────────────────────────
   Fixture Group     5/18/22  │ May 18, 2022
   Bailey: named the conver…  │
@@ -11,9 +11,9 @@
                              │      ┄ 📷  photo.png · 2.0 KB · (not downloaded on t… ┄
                              │      Read 12:33 AM
                              │
-                             │ Alex  still unread                                      12:34 AM
-                             │
-                             │
+                             │ Alex  sent the other way                                12:32 AM
+                             │       and this one is new                               12:33 AM
+                             │       still unread                                      12:34 AM
                              │
                              │
                              │

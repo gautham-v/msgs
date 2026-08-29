@@ -54,7 +54,17 @@ impl Preview {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Chat {
     /// `chat.ROWID`, the id everything else joins against.
+    ///
+    /// When several `chat` rows were merged into this conversation this is the
+    /// rowid of the one holding the newest message; see [`Chat::rowids`].
     pub rowid: i64,
+    /// Every `chat.ROWID` this conversation is made of, [`Chat::rowid`] first.
+    ///
+    /// Messages.app shows one conversation per person, but `chat.db` keeps a
+    /// separate row per service — `iMessage;-;+1…` beside `SMS;-;+1…` — for the
+    /// same address. [`Db::chats`] merges those, and every query keyed by a
+    /// chat rowid takes this whole set so the thread is the union of them.
+    pub rowids: Vec<i64>,
     /// `chat.guid`, e.g. `iMessage;-;+15550000000`.
     pub guid: String,
     /// `chat.chat_identifier`: the handle or group id the chat is addressed by.
@@ -110,6 +120,25 @@ impl Chat {
     #[must_use]
     pub fn last_message_at(&self) -> Option<DateTime<Local>> {
         local_time(self.last_message_date)
+    }
+
+    /// Every `chat.ROWID` behind this conversation, never empty.
+    ///
+    /// Falls back to [`Chat::rowid`] alone for a row built by hand, which is
+    /// how the render tests make one.
+    #[must_use]
+    pub fn rowid_set(&self) -> &[i64] {
+        if self.rowids.is_empty() {
+            std::slice::from_ref(&self.rowid)
+        } else {
+            &self.rowids
+        }
+    }
+
+    /// Whether `rowid` is one of the rows this conversation was merged from.
+    #[must_use]
+    pub fn owns(&self, rowid: i64) -> bool {
+        self.rowid_set().contains(&rowid)
     }
 
     /// Whether msgs should draw the chat as unread.
@@ -238,8 +267,10 @@ impl Db {
         let rows = statement.query_map([], |row| {
             let style: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or_default();
             let unread_count: i64 = row.get::<_, Option<i64>>(12)?.unwrap_or_default();
+            let rowid: i64 = row.get(0)?;
             Ok(Chat {
-                rowid: row.get(0)?,
+                rowid,
+                rowids: vec![rowid],
                 guid: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
                 identifier: row.get(2)?,
                 group_id: row.get::<_, Option<String>>(7)?.filter(|id| !id.is_empty()),
@@ -268,6 +299,8 @@ impl Db {
             // whose style was never set, still sorts out correctly here.
             chat.is_group = chat.style == STYLE_GROUP || chat.participants.len() > 1;
         }
+
+        let mut chats = merge_by_address(chats);
 
         let mut previews = self.previews(
             &chats
@@ -410,6 +443,99 @@ impl Db {
     }
 }
 
+/// Fold the `chat` rows for one address into one conversation.
+///
+/// `chat.db` keeps a row per service for the same person — an `iMessage` one,
+/// an `SMS` one, sometimes an `RCS` one — and Messages.app shows them as a
+/// single thread. Two one-to-one rows belong together when their
+/// `chat_identifier`s normalize to the same address
+/// ([`crate::contacts::normalize`], the same rule contact lookup matches on),
+/// so a number written two ways still lands on one entry.
+///
+/// The survivor is the row holding the newest message: its rowid, guid, and
+/// service are the conversation's identity, and its service is what a reply is
+/// addressed on. Counts are summed, participants unioned, and every member
+/// rowid kept in [`Chat::rowids`].
+///
+/// Groups are left alone: a `chat…` identifier is a thread id, not an address.
+///
+/// One pass over the list, so a reload stays O(n).
+fn merge_by_address(chats: Vec<Chat>) -> Vec<Chat> {
+    let mut merged: Vec<Chat> = Vec::with_capacity(chats.len());
+    // Normalized address to where its conversation sits in `merged`.
+    let mut at: HashMap<String, usize> = HashMap::new();
+    for chat in chats {
+        let Some(key) = merge_key(&chat) else {
+            merged.push(chat);
+            continue;
+        };
+        match at.get(&key).copied() {
+            Some(index) => absorb(&mut merged[index], chat),
+            None => {
+                at.insert(key, merged.len());
+                merged.push(chat);
+            }
+        }
+    }
+    merged
+}
+
+/// The address two rows have to share to be the same conversation, or `None`
+/// for a row that is never merged.
+fn merge_key(chat: &Chat) -> Option<String> {
+    if chat.is_group {
+        return None;
+    }
+    let identifier = chat.identifier.as_deref()?.trim();
+    if identifier.is_empty() || identifier.starts_with("chat") {
+        return None;
+    }
+    crate::contacts::normalize(identifier)
+}
+
+/// Fold `other` into `into`, keeping whichever row is the newer as identity.
+fn absorb(into: &mut Chat, other: Chat) {
+    // The newer row is the conversation; the other is folded into it.
+    let (mut keep, other) = if newer(&other, into) {
+        (other, std::mem::take(into))
+    } else {
+        (std::mem::take(into), other)
+    };
+
+    let mut rowids = std::mem::take(&mut keep.rowids);
+    for rowid in other.rowids {
+        if !rowids.contains(&rowid) {
+            rowids.push(rowid);
+        }
+    }
+    keep.rowids = rowids;
+    keep.message_count += other.message_count;
+    keep.unread_count += other.unread_count;
+    keep.unread = keep.unread_count;
+    keep.is_pinned = match (keep.is_pinned, other.is_pinned) {
+        (Some(a), Some(b)) => Some(a || b),
+        (a, b) => a.or(b),
+    };
+    keep.display_name = keep.display_name.take().or(other.display_name);
+    for handle in other.participants {
+        if !keep
+            .participants
+            .iter()
+            .any(|had| had.rowid == handle.rowid)
+        {
+            keep.participants.push(handle);
+        }
+    }
+    keep.participants.sort_by_key(|handle| handle.rowid);
+    *into = keep;
+}
+
+/// Whether `a` holds a newer message than `b`; ties go to the higher rowid so
+/// the answer does not depend on the order rows came back in.
+fn newer(a: &Chat, b: &Chat) -> bool {
+    (a.last_message_date, a.rowid) > (b.last_message_date, b.rowid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,6 +543,7 @@ mod tests {
     fn chat(rowid: i64) -> Chat {
         Chat {
             rowid,
+            rowids: vec![rowid],
             guid: format!("iMessage;-;chat{rowid}"),
             identifier: Some(format!("chat{rowid}")),
             group_id: None,
@@ -434,6 +561,87 @@ mod tests {
             unread: 0,
             is_pinned: None,
         }
+    }
+
+    #[test]
+    fn two_service_rows_for_one_address_become_one_conversation() {
+        let mut older = chat(1);
+        older.identifier = Some("+15550000000".to_string());
+        older.service = Some("iMessage".to_string());
+        older.last_message_date = 100;
+        older.message_count = 3;
+        older.unread_count = 1;
+        older.participants = vec![Handle::new(
+            7,
+            "+15550000000".to_string(),
+            "iMessage".to_string(),
+        )];
+
+        let mut newer = chat(2);
+        // The same person, written the way the other service writes it.
+        newer.identifier = Some("(555) 000-0000".to_string());
+        newer.guid = "SMS;-;+15550000000".to_string();
+        newer.service = Some("SMS".to_string());
+        newer.last_message_date = 200;
+        newer.message_count = 2;
+        newer.unread_count = 2;
+        newer.participants = vec![Handle::new(
+            7,
+            "+15550000000".to_string(),
+            "SMS".to_string(),
+        )];
+
+        let merged = merge_by_address(vec![older, newer]);
+        assert_eq!(merged.len(), 1);
+        let one = &merged[0];
+        // The newer row is the identity, and both rows come with it.
+        assert_eq!(one.rowid, 2);
+        assert_eq!(one.rowid_set(), [2, 1]);
+        assert!(one.owns(1) && one.owns(2));
+        assert_eq!(one.service.as_deref(), Some("SMS"));
+        assert_eq!(one.last_message_date, 200);
+        assert_eq!(one.message_count, 5);
+        assert_eq!(one.unread_count, 3);
+        assert_eq!(one.unread, 3);
+        // One person, however many rows they were spread over.
+        assert_eq!(one.participants.len(), 1);
+    }
+
+    #[test]
+    fn different_addresses_and_groups_are_left_alone() {
+        let mut one = chat(1);
+        one.identifier = Some("+15550000000".to_string());
+        let mut two = chat(2);
+        two.identifier = Some("+15550000001".to_string());
+
+        // Two groups whose identifiers are both `chat…`: never the same
+        // conversation, however alike the strings are.
+        let mut group = chat(3);
+        group.identifier = Some("chat777".to_string());
+        group.is_group = true;
+        let mut other_group = chat(4);
+        other_group.identifier = Some("chat777".to_string());
+        other_group.is_group = true;
+
+        let merged = merge_by_address(vec![one, two, group, other_group]);
+        assert_eq!(merged.len(), 4);
+        assert!(merged.iter().all(|chat| chat.rowid_set().len() == 1));
+    }
+
+    #[test]
+    fn merging_does_not_depend_on_the_order_rows_came_back_in() {
+        let mut older = chat(1);
+        older.identifier = Some("sam@example.invalid".to_string());
+        older.last_message_date = 10;
+        let mut newer = chat(2);
+        newer.identifier = Some("SAM@Example.invalid".to_string());
+        newer.last_message_date = 20;
+
+        let forwards = merge_by_address(vec![older.clone(), newer.clone()]);
+        let backwards = merge_by_address(vec![newer, older]);
+        assert_eq!(forwards[0].rowid, 2);
+        assert_eq!(backwards[0].rowid, 2);
+        assert_eq!(forwards[0].rowid_set(), backwards[0].rowid_set());
     }
 
     #[test]

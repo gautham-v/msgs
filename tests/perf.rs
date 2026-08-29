@@ -197,16 +197,19 @@ fn a_page_costs_the_same_at_the_bottom_of_a_deep_thread_as_far_above_it() {
 
     let started = Instant::now();
     let newest = db
-        .messages_before(fixtures::PERF_DEEP_CHAT, None, PAGE)
+        .messages_before(&[fixtures::PERF_DEEP_CHAT], None, PAGE)
         .expect("the newest page");
     let bottom = started.elapsed();
     assert_eq!(newest.len(), PAGE);
 
     // Fifty thousand messages back up the same thread.
-    let deep_before = newest[0].rowid - 50_000;
+    let deep_before = (
+        newest[0].date - 50_000 * fixtures::SECOND,
+        newest[0].rowid - 50_000,
+    );
     let started = Instant::now();
     let older = db
-        .messages_before(fixtures::PERF_DEEP_CHAT, Some(deep_before), PAGE)
+        .messages_before(&[fixtures::PERF_DEEP_CHAT], Some(deep_before), PAGE)
         .expect("a page far above the newest");
     let top = started.elapsed();
     assert_eq!(older.len(), PAGE);

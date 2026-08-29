@@ -658,42 +658,68 @@ pub fn split_association(raw: &str) -> Option<(usize, &str)> {
 }
 
 impl Db {
-    /// The page of messages in `chat_rowid` ending just before `before_rowid`.
+    /// The page of messages in `chat_rowids` ending just before `before`.
     ///
-    /// `before_rowid` is `None` for the newest page and the smallest `rowid` of
-    /// the page you already have for every page above it, which is what the
-    /// conversation pane scrolls upward with. The result is oldest first.
+    /// `chat_rowids` is every `chat` row the conversation was merged from —
+    /// one per service for the same address — so a thread is the union of them,
+    /// in date order. The messages are stamped with the first rowid, which is
+    /// the conversation's own.
+    ///
+    /// `before` is `None` for the newest page and the `(date, rowid)` of the
+    /// oldest message you already have for every page above it, which is what
+    /// the conversation pane scrolls upward with. Ordering by date rather than
+    /// by rowid is what interleaves two services' rows, and the date read is
+    /// `chat_message_join.message_date` because that is the column the join is
+    /// indexed by; the rowid is only the tie-break, so the cursor still lands
+    /// on exactly one message. The result is oldest first.
     ///
     /// # Errors
     ///
     /// Fails if any of the three queries behind a page fails.
     pub fn messages_before(
         &self,
-        chat_rowid: i64,
-        before_rowid: Option<i64>,
+        chat_rowids: &[i64],
+        before: Option<(i64, i64)>,
         limit: usize,
     ) -> Result<Vec<Message>, DbError> {
+        let Some(&chat_rowid) = chat_rowids.first() else {
+            return Ok(Vec::new());
+        };
+        let mut params: Vec<Value> = chat_rowids.iter().map(|id| Value::Integer(*id)).collect();
+        let date = chat_rowids.len() + 1;
+        let rowid = date + 1;
+        params.push(before.map_or(Value::Null, |(date, _)| Value::Integer(date)));
+        params.push(before.map_or(Value::Null, |(_, rowid)| Value::Integer(rowid)));
+        let limit = clamp_limit(limit);
+        params.push(Value::Integer(limit));
         let sql = format!(
             "SELECT {COLUMNS} FROM message m \
              JOIN chat_message_join j ON j.message_id = m.ROWID \
              LEFT JOIN handle h ON h.ROWID = m.handle_id \
-             WHERE j.chat_id = ?1 AND (?2 IS NULL OR j.message_id < ?2) \
+             WHERE j.chat_id IN ({}) \
+               AND (?{date} IS NULL \
+                    OR j.message_date < ?{date} \
+                    OR (j.message_date = ?{date} AND j.message_id < ?{rowid})) \
                AND COALESCE(m.associated_message_type, 0) = 0 \
-             ORDER BY j.message_id DESC LIMIT ?3"
+             ORDER BY j.message_date DESC, j.message_id DESC LIMIT ?{}",
+            placeholders(chat_rowids.len()),
+            rowid + 1
         );
-        let limit = clamp_limit(limit);
         let mut statement = self.conn().prepare(&sql)?;
-        let rows = statement
-            .query_map(rusqlite::params![chat_rowid, before_rowid, limit], |row| {
-                row_to_message(row, chat_rowid)
-            })?;
+        let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
+            row_to_message(row, chat_rowid)
+        })?;
         let mut page = rows.collect::<Result<Vec<_>, _>>()?;
         page.reverse();
-        self.decorate(chat_rowid, &mut page)?;
+        self.decorate(chat_rowids, &mut page)?;
         Ok(page)
     }
 
-    /// The messages in `chat_rowid` newer than `after_rowid`, oldest first.
+    /// The messages in `chat_rowids` newer than `after_rowid`, by rowid.
+    ///
+    /// Rowid order, not date order: this is the live-update pass, and a row
+    /// `chat.db` has only just written always has the higher rowid whichever
+    /// service it came in on.
     ///
     /// This is what the live-update pass re-queries after `chat.db` changes.
     ///
@@ -702,26 +728,34 @@ impl Db {
     /// Fails if any of the three queries behind a page fails.
     pub fn messages_after(
         &self,
-        chat_rowid: i64,
+        chat_rowids: &[i64],
         after_rowid: i64,
         limit: usize,
     ) -> Result<Vec<Message>, DbError> {
+        let Some(&chat_rowid) = chat_rowids.first() else {
+            return Ok(Vec::new());
+        };
+        let mut params: Vec<Value> = chat_rowids.iter().map(|id| Value::Integer(*id)).collect();
+        let next = chat_rowids.len() + 1;
+        params.push(Value::Integer(after_rowid));
+        let limit = clamp_limit(limit);
+        params.push(Value::Integer(limit));
         let sql = format!(
             "SELECT {COLUMNS} FROM message m \
              JOIN chat_message_join j ON j.message_id = m.ROWID \
              LEFT JOIN handle h ON h.ROWID = m.handle_id \
-             WHERE j.chat_id = ?1 AND j.message_id > ?2 \
+             WHERE j.chat_id IN ({}) AND j.message_id > ?{next} \
                AND COALESCE(m.associated_message_type, 0) = 0 \
-             ORDER BY j.message_id ASC LIMIT ?3"
+             ORDER BY j.message_id ASC LIMIT ?{}",
+            placeholders(chat_rowids.len()),
+            next + 1
         );
-        let limit = clamp_limit(limit);
         let mut statement = self.conn().prepare(&sql)?;
-        let rows = statement
-            .query_map(rusqlite::params![chat_rowid, after_rowid, limit], |row| {
-                row_to_message(row, chat_rowid)
-            })?;
+        let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
+            row_to_message(row, chat_rowid)
+        })?;
         let mut page = rows.collect::<Result<Vec<_>, _>>()?;
-        self.decorate(chat_rowid, &mut page)?;
+        self.decorate(chat_rowids, &mut page)?;
         Ok(page)
     }
 
@@ -749,30 +783,38 @@ impl Db {
     /// # Errors
     ///
     /// Fails if the attachment tables cannot be read.
-    pub fn attachment_counts(&self, chat_rowid: i64) -> Result<(i64, i64), DbError> {
-        let sql = "SELECT COUNT(*), \
-                          COALESCE(SUM(CASE WHEN a.mime_type LIKE 'image/%' \
-                                              OR a.uti LIKE '%image%' \
-                                            THEN 1 ELSE 0 END), 0) \
-                   FROM chat_message_join j \
-                   JOIN message_attachment_join k ON k.message_id = j.message_id \
-                   JOIN attachment a ON a.ROWID = k.attachment_id \
-                   WHERE j.chat_id = ?1 \
-                     AND COALESCE(a.is_sticker, 0) = 0 \
-                     AND COALESCE(a.hide_attachment, 0) = 0";
-        Ok(self
-            .conn()
-            .query_row(sql, [chat_rowid], |row| Ok((row.get(0)?, row.get(1)?)))?)
+    pub fn attachment_counts(&self, chat_rowids: &[i64]) -> Result<(i64, i64), DbError> {
+        if chat_rowids.is_empty() {
+            return Ok((0, 0));
+        }
+        let sql = format!(
+            "SELECT COUNT(*), \
+                    COALESCE(SUM(CASE WHEN a.mime_type LIKE 'image/%' \
+                                        OR a.uti LIKE '%image%' \
+                                      THEN 1 ELSE 0 END), 0) \
+             FROM chat_message_join j \
+             JOIN message_attachment_join k ON k.message_id = j.message_id \
+             JOIN attachment a ON a.ROWID = k.attachment_id \
+             WHERE j.chat_id IN ({}) \
+               AND COALESCE(a.is_sticker, 0) = 0 \
+               AND COALESCE(a.hide_attachment, 0) = 0",
+            placeholders(chat_rowids.len())
+        );
+        Ok(self.conn().query_row(
+            &sql,
+            rusqlite::params_from_iter(chat_rowids.iter().copied()),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?)
     }
 
     /// Hang attachments and tapbacks off a page of messages.
-    fn decorate(&self, chat_rowid: i64, page: &mut [Message]) -> Result<(), DbError> {
+    fn decorate(&self, chat_rowids: &[i64], page: &mut [Message]) -> Result<(), DbError> {
         if page.is_empty() {
             return Ok(());
         }
         let ids: Vec<i64> = page.iter().map(|message| message.rowid).collect();
         let mut attachments = self.attachments_by_message(&ids)?;
-        let mut tapbacks = self.tapbacks_for(chat_rowid, page)?;
+        let mut tapbacks = self.tapbacks_for(chat_rowids, page)?;
         let mut payloads = self.link_payloads(&ids)?;
         for message in page.iter_mut() {
             message.attachments = attachments.remove(&message.rowid).unwrap_or_default();
@@ -879,7 +921,7 @@ impl Db {
     /// Reactions standing on a page, keyed by target GUID.
     fn tapbacks_for(
         &self,
-        chat_rowid: i64,
+        chat_rowids: &[i64],
         page: &[Message],
     ) -> Result<HashMap<String, Vec<Tapback>>, DbError> {
         // Nobody can react to a message that does not exist yet, so every
@@ -887,9 +929,10 @@ impl Db {
         // oldest message. That bound is what keeps this query off the rest of
         // a long conversation.
         let floor = page.iter().map(|message| message.rowid).min().unwrap_or(0);
-        let mut params: Vec<Value> = Vec::with_capacity(page.len() + 2);
-        params.push(Value::Integer(chat_rowid));
+        let mut params: Vec<Value> = Vec::with_capacity(page.len() + chat_rowids.len() + 1);
+        params.extend(chat_rowids.iter().map(|id| Value::Integer(*id)));
         params.push(Value::Integer(floor));
+        let after = chat_rowids.len() + 1;
         params.extend(page.iter().map(|message| Value::Text(message.guid.clone())));
 
         // The stored GUID is prefixed (`p:0/…`), so match on its tail rather
@@ -906,14 +949,15 @@ impl Db {
              FROM message m \
              JOIN chat_message_join j ON j.message_id = m.ROWID \
              LEFT JOIN handle h ON h.ROWID = m.handle_id \
-             WHERE j.chat_id = ?1 AND j.message_id > ?2 \
+             WHERE j.chat_id IN ({}) AND j.message_id > ?{after} \
                AND m.associated_message_guid IS NOT NULL \
                AND COALESCE(m.associated_message_type, 0) BETWEEN {} AND {} \
                AND SUBSTR(m.associated_message_guid, -36) IN ({}) \
              ORDER BY j.message_id",
+            placeholders(chat_rowids.len()),
             TAPBACK_RANGE.start(),
             TAPBACK_RANGE.end(),
-            placeholders_from(page.len(), 3)
+            placeholders_from(page.len(), after + 1)
         );
 
         let mut statement = self.conn().prepare(&sql)?;

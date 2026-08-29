@@ -1147,15 +1147,15 @@ impl App {
         let Some(rowid) = self.open_chat else {
             return;
         };
-        let Some(unread) = self
+        let Some((rowids, unread)) = self
             .chat_rows
             .iter()
             .find(|chat| chat.rowid == rowid)
-            .map(|chat| chat.unread_count)
+            .map(|chat| (chat.rowid_set().to_vec(), chat.unread_count))
         else {
             return;
         };
-        if self.seen.mark(rowid, unread) {
+        if self.seen.mark(&rowids, unread) {
             self.apply_seen();
         }
     }
@@ -1293,12 +1293,14 @@ impl App {
             self.chats.set_len(self.visible_chats.len());
         }
         // Narrowing or reordering the list must not drag the selection onto a
-        // different conversation, so it follows the chat it was on where it can.
+        // different conversation, so it follows the chat it was on where it can
+        // — including to the row a merged conversation now answers to, when a
+        // message on the other service made that the newer of the two.
         if let Some(rowid) = anchor
             && let Some(position) = self
                 .visible_chats
                 .iter()
-                .position(|index| self.chat_rows[*index].rowid == rowid)
+                .position(|index| self.chat_rows[*index].owns(rowid))
         {
             self.chats.selected = position;
         }
@@ -1354,6 +1356,30 @@ impl App {
         self.load_conversation(rowid);
     }
 
+    /// Every `chat.ROWID` behind the conversation `rowid` names.
+    ///
+    /// A conversation can be several `chat` rows — one per service for the
+    /// same address — and every message query takes the whole set. A rowid the
+    /// list does not know (a hand-built row in a test, a draft) stands for
+    /// itself.
+    #[must_use]
+    pub fn chat_rowid_set(&self, rowid: i64) -> Vec<i64> {
+        self.chat_rows
+            .iter()
+            .find(|chat| chat.rowid == rowid)
+            .map_or_else(|| vec![rowid], |chat| chat.rowid_set().to_vec())
+    }
+
+    /// The conversation a `chat.ROWID` belongs to, which is itself unless it
+    /// was merged into another row.
+    #[must_use]
+    pub fn merged_chat_rowid(&self, rowid: i64) -> i64 {
+        self.chat_rows
+            .iter()
+            .find(|chat| chat.owns(rowid))
+            .map_or(rowid, |chat| chat.rowid)
+    }
+
     /// The chat under the chat-list selection.
     #[must_use]
     pub fn selected_chat(&self) -> Option<&Chat> {
@@ -1371,10 +1397,11 @@ impl App {
     /// Load the newest page of `chat_rowid` into [`App::message_rows`], with
     /// the newest message selected.
     pub fn load_conversation(&mut self, chat_rowid: i64) {
+        let rowids = self.chat_rowid_set(chat_rowid);
         let Some(db) = self.db.as_ref() else {
             return;
         };
-        let page = db.messages_before(chat_rowid, None, PAGE);
+        let page = db.messages_before(&rowids, None, PAGE);
 
         self.open_chat = Some(chat_rowid);
         match page {
@@ -1550,14 +1577,15 @@ impl App {
     /// Returns how many rows were added, so the caller can stop asking once the
     /// top of the conversation is reached.
     pub fn load_older_messages(&mut self) -> usize {
-        let Some(db) = self.db.as_ref() else {
-            return 0;
-        };
         let Some(oldest) = self.message_rows.first() else {
             return 0;
         };
-        let (chat_rowid, before) = (oldest.chat_rowid, oldest.rowid);
-        match db.messages_before(chat_rowid, Some(before), PAGE) {
+        let (chat_rowid, before) = (oldest.chat_rowid, (oldest.date, oldest.rowid));
+        let rowids = self.chat_rowid_set(chat_rowid);
+        let Some(db) = self.db.as_ref() else {
+            return 0;
+        };
+        match db.messages_before(&rowids, Some(before), PAGE) {
             Ok(older) => {
                 let added = older.len();
                 self.message_rows.splice(0..0, older);
@@ -1835,14 +1863,19 @@ impl App {
 
         let loaded = self.message_rows.len();
         let window = loaded.min(PAGE);
-        let after = self
-            .message_rows
-            .get(loaded - window)
-            .map_or(0, |message| message.rowid - 1);
+        // The window is in date order and a merged conversation's rowids are
+        // not, so the watermark is the lowest rowid in it rather than the
+        // first one.
+        let after = self.message_rows[loaded - window..]
+            .iter()
+            .map(|message| message.rowid)
+            .min()
+            .map_or(0, |rowid| rowid - 1);
         let limit = (window + PAGE).min(MAX_PAGE);
 
+        let rowids = self.chat_rowid_set(chat_rowid);
         let db = self.db.as_ref()?;
-        let fresh = match db.messages_after(chat_rowid, after, limit) {
+        let fresh = match db.messages_after(&rowids, after, limit) {
             Ok(fresh) => fresh,
             Err(err) => {
                 self.status.error(format!("messages: {}", err.summary()));
@@ -1889,6 +1922,8 @@ impl App {
         self.pending
             .retain(|pending| !claimed.contains(&pending.id));
 
+        // Rowid order is arrival order, but a page is drawn in date order.
+        appended.sort_by_key(|message| (message.date, message.rowid));
         refreshed.appended = appended.len();
         refreshed.claimed = claimed.len();
         self.message_rows.extend(appended);
@@ -4141,6 +4176,7 @@ mod tests {
         app.outbox = Outbox::inert();
         app.chat_rows = vec![Chat {
             rowid: 1,
+            rowids: vec![1],
             guid: "iMessage;-;+15550000000".to_string(),
             identifier: Some("+15550000000".to_string()),
             group_id: None,

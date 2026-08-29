@@ -492,3 +492,38 @@ fn retrying_picks_up_a_database_that_was_not_there_at_launch() {
     assert_eq!(app.key_focus(), Focus::ChatList);
     assert_ne!(app.status.watcher, WatcherStatus::Off);
 }
+
+#[test]
+fn a_message_on_the_other_service_lands_in_the_same_thread() {
+    let store = Store::new("merged");
+    let mut app = app_on(&store);
+    let before = app.message_rows.len();
+    let unread_before = app.status.unread_total;
+
+    // It arrives on the address's other `chat` row, which Messages.app would
+    // draw in the very same conversation.
+    store.arrives(
+        400,
+        fixtures::CHAT_DIRECT_SMS,
+        fixtures::HANDLE_ALEX,
+        "arrived on the other service",
+        fixtures::BASE + 900 * fixtures::SECOND,
+    );
+    assert!(app.on_db_change());
+
+    assert_eq!(app.message_rows.len(), before + 1);
+    assert_eq!(
+        app.message_rows.last().map(|message| message.rowid),
+        Some(400)
+    );
+    // And the one entry for the address is the one that moves to the top. The
+    // conversation now answers to the other service's row, because that is
+    // where its newest message is; the reader stays in it either way.
+    let top = app.chat_rows.first().expect("a chat list");
+    assert!(top.owns(fixtures::CHAT_DIRECT));
+    assert!(top.owns(fixtures::CHAT_DIRECT_SMS));
+    assert_eq!(app.chat_rows.len(), 3);
+    assert_eq!(app.open_chat, Some(top.rowid));
+    assert_eq!(app.selected_chat().map(|chat| chat.rowid), Some(top.rowid));
+    assert_eq!(app.status.unread_total, unread_before + 1);
+}

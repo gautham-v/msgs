@@ -430,6 +430,7 @@ fn chat(rowid: i64, name: &str, minutes_ago: i64, preview: &str) -> Chat {
     let raw = (when.timestamp() - 978_307_200) * 1_000_000_000;
     Chat {
         rowid,
+        rowids: vec![rowid],
         guid: format!("iMessage;-;chat{rowid}"),
         identifier: Some(format!("chat{rowid}")),
         group_id: None,
