@@ -807,8 +807,65 @@ impl Images {
         }
         let entry = self.measure(attachment, room);
         let size = entry.size();
+        // A resize that does not change the picture keeps the picture. The
+        // pixels are filed under the pane width they were measured at, so a
+        // drag of the window edge would otherwise throw every still and every
+        // GIF away at each width it passes through and have them encoded — and
+        // on a kitty terminal sent — all over again, which is the flicker. If
+        // the new measurement is the size something already encoded, that
+        // entry is carried over to the new width instead.
+        if let Some(size) = size
+            && self.carry_over(attachment.rowid, size, key)
+        {
+            return Some((size.width, size.height));
+        }
+        self.forget_stale_widths(attachment.rowid, room);
         self.entries.borrow_mut().insert(key, entry);
         size.map(|size| (size.width, size.height))
+    }
+
+    /// Move an already-encoded picture of exactly `size` onto `key`, if this
+    /// attachment has one filed under some other pane width. `true` when one
+    /// was carried over, which means nothing has to be encoded or sent again.
+    fn carry_over(&self, rowid: i64, size: Size, key: Key) -> bool {
+        let mut entries = self.entries.borrow_mut();
+        let Some(from) = entries.iter().find_map(|(held, entry)| {
+            (held.0 == rowid
+                && *held != key
+                && matches!(entry, Entry::Ready(..) | Entry::Playing(..))
+                && entry.size() == Some(size))
+            .then_some(*held)
+        }) else {
+            return false;
+        };
+        let Some(entry) = entries.remove(&from) else {
+            return false;
+        };
+        entries.insert(key, entry);
+        drop(entries);
+        for list in [&self.encoded, &self.playing, &self.asked, &self.visible] {
+            let mut list = list.borrow_mut();
+            for held in list.iter_mut() {
+                if *held == from {
+                    *held = key;
+                }
+            }
+        }
+        true
+    }
+
+    /// Drop what this attachment measured at other pane widths, as long as
+    /// nothing is holding pixels there.
+    ///
+    /// A drag through fifty widths would otherwise leave fifty measurements
+    /// behind. Entries that did encode are left to [`Images::evict`] and
+    /// [`Images::retire`], which is what bounds those.
+    fn forget_stale_widths(&self, rowid: i64, room: u16) {
+        self.entries.borrow_mut().retain(|held, entry| {
+            held.0 != rowid
+                || held.1 == room
+                || matches!(entry, Entry::Ready(..) | Entry::Playing(..))
+        });
     }
 
     /// Work out an attachment's size, converting or queueing a conversion first
@@ -1356,20 +1413,55 @@ mod tests {
 
     #[test]
     fn only_so_many_pictures_stay_encoded_and_the_rest_keep_their_size() {
-        let (dir, attachment) = png("evict", 60, 40);
+        let (dir, attachment) = png("evict", 400, 100);
         let images = Images::halfblocks();
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 4));
-        // Every width is its own cache entry, which is the cheapest way to
-        // make more encoded pictures than the cap allows.
-        for room in 20..20 + u16::try_from(MAX_ENCODED).unwrap_or(0) + 8 {
+        // A picture wider than the pane is brought down to it, so every width
+        // here is a different size — which is what a new encode costs.
+        let widths = 6..6 + u16::try_from(MAX_ENCODED).unwrap_or(0) + 8;
+        for room in widths.clone() {
             assert!(images.cells(&attachment, room).is_some());
             images.render(&mut buffer, Rect::new(0, 0, 20, 4), 0, &attachment, room);
         }
         assert_eq!(images.encoded_count(), MAX_ENCODED);
         // The sizes survive eviction, so no block changes height.
-        for room in 20..20 + u16::try_from(MAX_ENCODED).unwrap_or(0) + 8 {
+        for room in widths {
             assert!(images.cells(&attachment, room).is_some());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_resize_that_does_not_change_a_picture_keeps_the_pixels_it_already_sent() {
+        let (dir, attachment) = png("resize", 100, 100);
+        let images = Images::halfblocks();
+        let area = Rect::new(0, 0, 60, 8);
+        let mut buffer = Buffer::empty(area);
+        assert_eq!(images.cells(&attachment, 40), Some((10, 5)));
+        images.render(&mut buffer, area, 0, &attachment, 40);
+        assert_eq!(images.encoded_count(), 1);
+
+        // A drag of the window edge walks the body through every width in
+        // between. None of them changes this picture's ten-by-five block, so
+        // the encoded picture is carried across rather than built — and, on a
+        // kitty terminal, sent — again.
+        for room in 41..60 {
+            assert_eq!(images.cells(&attachment, room), Some((10, 5)));
+            images.render(&mut buffer, area, 0, &attachment, room);
+            assert_eq!(images.encoded_count(), 1, "at {room} columns");
+            // And the widths the drag passed through are not kept.
+            assert_eq!(images.entries.borrow().len(), 1, "at {room} columns");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_resize_that_does_change_a_picture_measures_it_again() {
+        let (dir, attachment) = png("remeasure", 400, 100);
+        let images = Images::halfblocks();
+        let narrow = images.cells(&attachment, 10).expect("a size");
+        let wide = images.cells(&attachment, 30).expect("a size");
+        assert_ne!(narrow, wide, "the pane decides how wide it is drawn");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1561,6 +1653,21 @@ mod tests {
         images.begin_frame();
         assert_eq!(images.next_due(Instant::now()), None);
         assert!(!images.advance(Instant::now() + Duration::from_secs(1)));
+
+        // A resize that leaves the picture the same size keeps it playing:
+        // the frames are carried over to the new width rather than decoded and
+        // sent again, which is what a drag of the window edge used to cost.
+        for room in 41..48 {
+            assert_eq!(images.cells(&attachment, room), Some((columns, rows)));
+            images.begin_frame();
+            images.render(&mut buffer, area, 0, &attachment, room);
+            assert!(
+                images.next_due(Instant::now()).is_some(),
+                "still playing at {room} columns"
+            );
+            assert_eq!(images.playing.borrow().len(), 1, "at {room} columns");
+            assert!(!images.absorb(), "nothing was asked for again");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

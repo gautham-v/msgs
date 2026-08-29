@@ -4436,6 +4436,9 @@ mod tests {
             .checked_sub(NOTICE_TTL)
             .expect("an instant past the deadline");
         app.notice = Some(("copied 27 chars to clipboard".to_string(), past));
+        // An expired notice still asks for a wait: a zero here would spin the
+        // event loop until the next frame took the row down.
+        assert!(app.next_wake(tick) > Duration::ZERO, "never a busy wait");
         assert_eq!(app.notice(), None, "expired");
         assert!(app.tick(), "and the expiry is worth a frame");
         assert!(app.notice.is_none());

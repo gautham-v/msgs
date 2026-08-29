@@ -172,6 +172,26 @@ fn main() -> Result<()> {
     result
 }
 
+/// How long the drain keeps waiting once a resize has been seen. A drag of the
+/// window edge sends events faster than this, so the loop stays in the drain
+/// until the drag stops and one frame is drawn for the size it stopped at.
+const RESIZE_SETTLE: Duration = Duration::from_millis(12);
+
+/// How long the drain waits for the next event.
+///
+/// Nothing yet: the loop's own wait. Something already drained: no wait at all.
+/// A resize in the burst: long enough to catch the rest of the burst, so a
+/// drag costs one frame and not one per window width.
+const fn wait_for(waited: bool, resized: bool, timeout: Duration) -> Duration {
+    if resized {
+        RESIZE_SETTLE
+    } else if waited {
+        Duration::ZERO
+    } else {
+        timeout
+    }
+}
+
 /// The event loop: draw, wait for input, apply, repeat.
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     loop {
@@ -194,11 +214,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Resu
         // A live copy notice wants its row back on time, so the first wait is
         // the sooner of the tick and its expiry.
         let mut waited = false;
-        while event::poll(if waited {
-            Duration::ZERO
-        } else {
-            timeout.min(app.next_wake(TICK))
-        })? {
+        let mut resized = false;
+        while event::poll(wait_for(waited, resized, timeout.min(app.next_wake(TICK))))? {
             waited = true;
             match event::read()? {
                 // Terminals with the kitty keyboard protocol also report key
@@ -213,13 +230,22 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Resu
                 // is also how a file dragged from Finder lands: the terminal
                 // pastes its path.
                 Event::Paste(text) => app.on_paste(&text),
+                // A drag of the window edge is a burst of these. The one that
+                // matters is the last, so seeing one puts the drain into its
+                // settle wait rather than letting a frame out between two of
+                // them.
+                Event::Resize(..) => resized = true,
                 _ => {}
             }
             if app.should_quit {
                 break;
             }
         }
-        app.tick_animations(Instant::now());
+        // Not while the window is still moving: a GIF stepped between two
+        // widths would be encoded again at a size nothing ends up asking for.
+        if !resized {
+            app.tick_animations(Instant::now());
+        }
         app.tick();
 
         if app.should_quit {
@@ -584,6 +610,21 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn a_resize_burst_is_waited_out_rather_than_drawn_through() {
+        let tick = Duration::from_millis(250);
+        // Nothing drained yet: the loop's own wait.
+        assert_eq!(wait_for(false, false, tick), tick);
+        // Something drained, no resize: take whatever else is queued and draw.
+        assert_eq!(wait_for(true, false, tick), Duration::ZERO);
+        // A resize in the burst: wait out the rest of the drag, both before
+        // and after anything else has been drained.
+        assert_eq!(wait_for(false, true, tick), RESIZE_SETTLE);
+        assert_eq!(wait_for(true, true, tick), RESIZE_SETTLE);
+        // And never a busy wait, whatever the animation asked for.
+        assert!(wait_for(false, true, Duration::ZERO) > Duration::ZERO);
     }
 
     #[test]
