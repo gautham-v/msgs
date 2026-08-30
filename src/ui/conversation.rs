@@ -571,6 +571,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) -> Hits {
         pending: &app.pending,
         now,
         images: &app.images,
+        cursor: app.attachment_cursor(),
         contacts: &app.contacts,
     };
     let heights = &app.measured.heights;

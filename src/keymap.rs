@@ -131,6 +131,16 @@ pub const BINDINGS: &[Binding] = &[
         scope: "conversation",
     },
     Binding {
+        keys: "h / l",
+        description: "previous / next attachment on the selected message",
+        scope: "conversation",
+    },
+    Binding {
+        keys: "O",
+        description: "open every attachment on the selected message",
+        scope: "conversation",
+    },
+    Binding {
         keys: "r",
         description: "quote the selected message in a reply",
         scope: "conversation",
@@ -367,6 +377,9 @@ fn navigation_keys(
         KeyCode::Char('/') => Some(Action::OpenPalette),
         KeyCode::Char('o') if focus == Focus::Conversation => Some(Action::OpenAttachment),
         KeyCode::Char('s') if focus == Focus::Conversation => Some(Action::SaveAttachment),
+        KeyCode::Char('O') if focus == Focus::Conversation => Some(Action::OpenAllAttachments),
+        KeyCode::Char('h') if focus == Focus::Conversation => Some(Action::AttachmentPrev),
+        KeyCode::Char('l') if focus == Focus::Conversation => Some(Action::AttachmentNext),
         KeyCode::Char('r') if focus == Focus::Conversation => Some(Action::QuoteReply),
         KeyCode::Char('y') if focus == Focus::Conversation => Some(Action::CopySelection),
         KeyCode::Char('i') if focus == Focus::Conversation => Some(Action::FocusComposer),
@@ -600,8 +613,8 @@ mod tests {
     fn an_unbound_letter_in_a_pane_starts_a_message() {
         for focus in [Focus::ChatList, Focus::Conversation] {
             assert_eq!(
-                resolve(key(KeyCode::Char('h')), focus),
-                Some(Action::ComposeChar('h')),
+                resolve(key(KeyCode::Char('m')), focus),
+                Some(Action::ComposeChar('m')),
                 "focus {focus:?}"
             );
             // Shift is still typing; a space starts a draft with a space.
@@ -615,7 +628,7 @@ mod tests {
             );
             // A modifier means it was meant as a command, not as text.
             assert_eq!(
-                resolve(with(KeyCode::Char('h'), KeyModifiers::ALT), focus),
+                resolve(with(KeyCode::Char('m'), KeyModifiers::ALT), focus),
                 None
             );
             assert_eq!(

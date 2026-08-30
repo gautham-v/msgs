@@ -9,7 +9,7 @@
 //! else.
 
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Why a hand-off to the system failed. The message never carries the text.
@@ -189,6 +189,38 @@ pub fn open_path(path: &Path) -> Result<(), Error> {
     Command::new("open")
         .arg("--")
         .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| Error::NotAvailable)
+}
+
+/// Open several files at once: one Quick Look window that the arrow keys
+/// flip through, or — on a Mac without `qlmanage` — each with `open`.
+///
+/// # Errors
+///
+/// Returns [`Error::NotAFile`] when any path is not a file, and
+/// [`Error::NotAvailable`] when neither program can be run.
+pub fn open_paths(paths: &[PathBuf]) -> Result<(), Error> {
+    if paths.iter().any(|path| !path.is_file()) {
+        return Err(Error::NotAFile);
+    }
+    if paths.iter().all(|path| path.is_absolute()) {
+        let spawned = Command::new("qlmanage")
+            .arg("-p")
+            .args(paths)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        if spawned.is_ok() {
+            return Ok(());
+        }
+    }
+    Command::new("open")
+        .arg("--")
+        .args(paths)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

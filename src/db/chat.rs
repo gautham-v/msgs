@@ -517,17 +517,31 @@ fn absorb(into: &mut Chat, other: Chat) {
         (a, b) => a.or(b),
     };
     keep.display_name = keep.display_name.take().or(other.display_name);
+    // The iMessage and SMS rows for one number are two `handle` rows, so a
+    // participant is the same person by address, not by rowid — otherwise the
+    // merged conversation would be titled `Sam, Sam`.
     for handle in other.participants {
         if !keep
             .participants
             .iter()
-            .any(|had| had.rowid == handle.rowid)
+            .any(|had| had.rowid == handle.rowid || same_address(had, &handle))
         {
             keep.participants.push(handle);
         }
     }
     keep.participants.sort_by_key(|handle| handle.rowid);
     *into = keep;
+}
+
+/// Whether two handles are one address on different services.
+fn same_address(a: &Handle, b: &Handle) -> bool {
+    match (
+        crate::contacts::normalize(&a.id),
+        crate::contacts::normalize(&b.id),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Whether `a` holds a newer message than `b`; ties go to the higher rowid so
@@ -585,9 +599,10 @@ mod tests {
         newer.last_message_date = 200;
         newer.message_count = 2;
         newer.unread_count = 2;
+        // Its own `handle` row: the SMS side of one number is a second rowid.
         newer.participants = vec![Handle::new(
-            7,
-            "+15550000000".to_string(),
+            8,
+            "+1 (555) 000-0000".to_string(),
             "SMS".to_string(),
         )];
 
@@ -603,8 +618,10 @@ mod tests {
         assert_eq!(one.message_count, 5);
         assert_eq!(one.unread_count, 3);
         assert_eq!(one.unread, 3);
-        // One person, however many rows they were spread over.
+        // One person, however many rows they were spread over, so the title
+        // is that person once rather than `Sam, Sam`.
         assert_eq!(one.participants.len(), 1);
+        assert!(!one.title().contains(','), "{}", one.title());
     }
 
     #[test]

@@ -53,6 +53,8 @@ relaunch it, and run `msgs`. `msgs --check` tells you what is missing.
 | `→` / `i` | start typing in the composer | conversation |
 | `o` | open the selected attachment | conversation |
 | `s` | save the selected attachment | conversation |
+| `h` / `l` | previous / next attachment on the selected message | conversation |
+| `O` | open every attachment on the selected message | conversation |
 | `r` | quote the selected message in a reply | conversation |
 | `y` | copy the selected message | conversation |
 | `Ctrl+L` | open the first link in the selected message | conversation |

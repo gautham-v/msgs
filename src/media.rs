@@ -47,6 +47,10 @@ use crate::db::AttachmentRef;
 
 /// The tallest an inline picture is ever drawn, in rows.
 pub const MAX_ROWS: u16 = 10;
+/// The tallest a picture is drawn when it is one of several on a message:
+/// a set is a contact sheet, flowed left to right, rather than a column of
+/// full-size pictures.
+pub const SET_ROWS: u16 = 6;
 /// The widest an inline picture is ever drawn, in columns. Wide terminals would
 /// otherwise blow a photo up to the whole pane.
 pub const MAX_COLS: u16 = 48;
@@ -797,15 +801,39 @@ impl Images {
     /// conversion has not finished yet.
     #[must_use]
     pub fn cells(&self, attachment: &AttachmentRef, room: u16) -> Option<(u16, u16)> {
-        let route = prep(attachment);
-        if !self.backend.is_on() || route == Prep::Skip || attachment.hide_attachment {
+        self.cells_capped(attachment, room, MAX_ROWS)
+    }
+
+    /// Whether `attachment` is the sort of thing that is drawn rather than
+    /// chipped, before anything is measured: a picture or a video the backend
+    /// can show. The count a block uses to decide whether a message is a set.
+    #[must_use]
+    pub fn could_draw(&self, attachment: &AttachmentRef) -> bool {
+        self.backend.is_on() && prep(attachment) != Prep::Skip && !attachment.hide_attachment
+    }
+
+    /// [`Images::cells`] with the picture held to `max_rows` rather than
+    /// [`MAX_ROWS`]: the cap a photo gets when it is one of several
+    /// ([`SET_ROWS`]).
+    ///
+    /// An attachment belongs to one message, and whether that message is a
+    /// set never changes, so the cap is stable per attachment and the cache
+    /// is keyed without it.
+    #[must_use]
+    pub fn cells_capped(
+        &self,
+        attachment: &AttachmentRef,
+        room: u16,
+        max_rows: u16,
+    ) -> Option<(u16, u16)> {
+        if !self.could_draw(attachment) {
             return None;
         }
         let key = (attachment.rowid, room);
         if let Some(entry) = self.entries.borrow().get(&key) {
             return entry.size().map(|size| (size.width, size.height));
         }
-        let entry = self.measure(attachment, room);
+        let entry = self.measure(attachment, room, max_rows);
         let size = entry.size();
         // A resize that does not change the picture keeps the picture. The
         // pixels are filed under the pane width they were measured at, so a
@@ -870,7 +898,7 @@ impl Images {
 
     /// Work out an attachment's size, converting or queueing a conversion first
     /// where one is needed.
-    fn measure(&self, attachment: &AttachmentRef, room: u16) -> Entry {
+    fn measure(&self, attachment: &AttachmentRef, room: u16, max_rows: u16) -> Entry {
         let Some(picker) = self.picker.as_ref() else {
             return Entry::Unusable;
         };
@@ -900,7 +928,7 @@ impl Images {
             return Entry::Unusable;
         };
         let columns = room.min(MAX_COLS);
-        match fit(dimensions, picker.font_size(), columns, MAX_ROWS) {
+        match fit(dimensions, picker.font_size(), columns, max_rows) {
             Some((width, height)) => Entry::Sized(Size::new(width, height)),
             None => Entry::Unusable,
         }

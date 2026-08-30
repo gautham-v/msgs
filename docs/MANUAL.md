@@ -147,6 +147,8 @@ binding applies.
 | `→` / `i` | start typing in the composer |
 | `o` | open the selected attachment |
 | `s` | save the selected attachment |
+| `h` / `l` | previous / next attachment on the selected message |
+| `O` | open every attachment on the selected message |
 | `r` | quote the selected message in a reply |
 | `y` | copy the selected message |
 | `Ctrl+L` | open the first link in the selected message |
@@ -326,8 +328,16 @@ Anything that is not a picture or a video is a dashed chip: `┄ 📄 draft-orde
 An attachment whose bytes never reached this Mac says
 `(not downloaded on this Mac)` rather than pretending to be there.
 
+Several pictures on one message are a set: each is held to six rows and they
+flow left to right in the name column, wrapping like words, so four photos
+cost one sheet of rows rather than four full-size pictures down the pane. A
+lone picture keeps its full ten rows. `h` and `l` move along the set — the
+meta line says where you are, `4 photos · 2 of 4 · IMG_6403.HEIC · 3.4 MB` —
+and `o` and `s` act on that one; `O` hands the whole set to one Quick Look
+window, which the arrow keys flip through.
+
 `o` opens the selected message's attachment with `open` — clicking a picture
-opens that one the same way — except a GIF, which goes to Quick Look instead:
+opens that one the same way, and moves the cursor to it — except a GIF, which goes to Quick Look instead:
 `open` hands one to Preview.app, which lays its frames out as a list of pages
 and never plays it, and Quick Look is the same preview the Finder gives a file
 on the spacebar. A Mac without `qlmanage` falls back to `open`. `s` copies it

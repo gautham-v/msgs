@@ -155,6 +155,12 @@ pub enum Action {
     OpenAttachment,
     /// Save the attachment on the selected message.
     SaveAttachment,
+    /// Move to the previous attachment of the selected message.
+    AttachmentPrev,
+    /// Move to the next attachment of the selected message.
+    AttachmentNext,
+    /// Open every attachment on the selected message at once.
+    OpenAllAttachments,
     /// Quote the selected message in the composer.
     QuoteReply,
     /// Copy the selected message to the clipboard.
@@ -493,13 +499,6 @@ impl TextField {
         self.cursor = self.text.len();
     }
 
-    /// Number of newline-separated lines, at least one.
-    #[must_use]
-    pub fn line_count(&self) -> u16 {
-        let lines = self.text.split('\n').count();
-        u16::try_from(lines).unwrap_or(u16::MAX).max(1)
-    }
-
     fn prev_boundary(&self) -> Option<usize> {
         self.text[..self.cursor]
             .char_indices()
@@ -659,6 +658,10 @@ pub struct App {
     pub measured: Measured,
     /// What the conversation put where on the last frame, for mouse clicks.
     pub hits: Hits,
+    /// Which attachment of a message `o` and `s` act on, as the message's
+    /// rowid and the attachment's position in it. Belongs to that one
+    /// message: on any other the cursor is the first attachment again.
+    attachment_at: Option<(i64, usize)>,
     /// The mouse's drag over the conversation, while one is up. It is drawn as
     /// a tint and copied on release; nothing else reads it.
     pub selection: Option<Selection>,
@@ -813,6 +816,7 @@ impl App {
             convo: Scroll::default(),
             measured: Measured::default(),
             hits: Hits::default(),
+            attachment_at: None,
             selection: None,
             copy_selection_pending: false,
             pending_bottom: false,
@@ -1551,6 +1555,7 @@ impl App {
                 now,
                 images: &self.images,
                 contacts: &self.contacts,
+                cursor: self.attachment_cursor(),
             };
             let one = |index: usize| message::block(&ctx, index, width).height();
             if prepended {
@@ -2147,6 +2152,9 @@ impl App {
             Action::Attach => self.start_attach(),
             Action::OpenAttachment => self.open_attachment(),
             Action::SaveAttachment => self.save_attachment(),
+            Action::AttachmentPrev => self.step_attachment(-1),
+            Action::AttachmentNext => self.step_attachment(1),
+            Action::OpenAllAttachments => self.open_all_attachments(),
             Action::QuoteReply => self.quote_reply(),
             Action::CopySelection => self.copy_selection(),
             Action::OpenLink => self.open_selected_link(),
@@ -2748,10 +2756,82 @@ impl App {
     /// message that Messages is not hiding.
     #[must_use]
     pub fn selected_attachment(&self) -> Option<&AttachmentRef> {
-        self.selected_message()?
+        let message = self.selected_message()?;
+        let index = self.attachment_cursor()?.1;
+        message.attachments.get(index)
+    }
+
+    /// The attachment the cursor is on, as the selected message's index and
+    /// the attachment's position in it — the first one that is not hidden
+    /// unless `h` / `l` or a click moved it. `None` when the message has no
+    /// attachment to be on.
+    #[must_use]
+    pub fn attachment_cursor(&self) -> Option<(usize, usize)> {
+        let index = self.messages.selected;
+        let message = self.message_rows.get(index)?;
+        let shown = |at: usize| {
+            message
+                .attachments
+                .get(at)
+                .is_some_and(|attachment| !attachment.hide_attachment)
+        };
+        let held = self
+            .attachment_at
+            .filter(|(rowid, at)| *rowid == message.rowid && shown(*at))
+            .map(|(_, at)| at);
+        let at = held.or_else(|| (0..message.attachments.len()).find(|&at| shown(at)))?;
+        Some((index, at))
+    }
+
+    /// `h` / `l`: move the attachment cursor along the selected message's
+    /// files, stopping at either end.
+    fn step_attachment(&mut self, by: isize) {
+        let Some((index, at)) = self.attachment_cursor() else {
+            return;
+        };
+        let Some(message) = self.message_rows.get(index) else {
+            return;
+        };
+        let shown: Vec<usize> = (0..message.attachments.len())
+            .filter(|&at| !message.attachments[at].hide_attachment)
+            .collect();
+        let Some(place) = shown.iter().position(|&held| held == at) else {
+            return;
+        };
+        let next = place.saturating_add_signed(by).min(shown.len() - 1);
+        self.attachment_at = Some((message.rowid, shown[next]));
+    }
+
+    /// `O`: hand every file on the selected message to one Quick Look, which
+    /// is how a set of photos is flipped through.
+    fn open_all_attachments(&mut self) {
+        let Some(message) = self.selected_message() else {
+            return;
+        };
+        let paths: Vec<PathBuf> = message
             .attachments
             .iter()
-            .find(|attachment| !attachment.hide_attachment)
+            .filter(|attachment| !attachment.hide_attachment)
+            .filter_map(AttachmentRef::path)
+            .filter(|path| path.is_file())
+            .collect();
+        if paths.is_empty() {
+            // The same words `o` would say, for the same reasons.
+            self.open_attachment_at(None);
+            return;
+        }
+        if paths.len() == 1 {
+            self.open_attachment_at(None);
+            return;
+        }
+        match crate::shell::open_paths(&paths) {
+            Ok(()) => self
+                .status
+                .toast(format!("opening {} attachments", paths.len())),
+            Err(err) => self
+                .status
+                .error(format!("could not open the attachments: {err}")),
+        }
     }
 
     /// The selected attachment's path, once it is known to be on this Mac.
@@ -2761,6 +2841,13 @@ impl App {
     /// `which` is `None` for the first non-hidden attachment (what `o` and `s`
     /// act on) or `Some(index)` for one the pointer landed on.
     fn openable_attachment(&mut self, which: Option<usize>) -> Option<PathBuf> {
+        if let Some(index) = which
+            && let Some(message) = self.selected_message()
+        {
+            // The picture that was clicked is now the one `s` and `h` / `l`
+            // start from.
+            self.attachment_at = Some((message.rowid, index));
+        }
         let found = match which {
             None => self.selected_attachment(),
             Some(index) => self.selected_message().and_then(|message| {
@@ -3057,10 +3144,12 @@ impl App {
         });
     }
 
-    /// Height the composer wants, borders included.
+    /// Height the composer wants in a pane `pane_width` wide, borders
+    /// included. A line longer than the box wraps, and each wrapped row
+    /// counts.
     #[must_use]
-    pub fn composer_height(&self) -> u16 {
-        self.composer_lines().clamp(1, COMPOSER_MAX_LINES) + 2
+    pub fn composer_height(&self, pane_width: u16) -> u16 {
+        self.composer_lines(pane_width).clamp(1, COMPOSER_MAX_LINES) + 2
     }
 
     /// Route a mouse event to the pane under the pointer.
@@ -3353,11 +3442,11 @@ impl App {
 
     /// Height the composer's contents want, borders excluded.
     #[must_use]
-    fn composer_lines(&self) -> u16 {
-        let field = self
-            .attach_prompt
-            .as_ref()
-            .map_or_else(|| self.composer.line_count(), TextField::line_count);
+    fn composer_lines(&self, pane_width: u16) -> u16 {
+        let field = self.attach_prompt.as_ref().unwrap_or(&self.composer);
+        let rows =
+            crate::ui::composer::rows(field.text(), crate::ui::composer::columns(pane_width));
+        let field = u16::try_from(rows.len()).unwrap_or(u16::MAX).max(1);
         let chips = u16::try_from(self.attached.len()).unwrap_or(u16::MAX);
         field.saturating_add(chips)
     }
@@ -3671,15 +3760,15 @@ mod tests {
     fn composer_grows_to_a_ceiling() {
         let mut app = app();
         app.update(Action::FocusPane(Focus::Composer));
-        assert_eq!(app.composer_height(), 3);
+        assert_eq!(app.composer_height(120), 3);
         for _ in 0..3 {
             app.update(Action::Newline);
         }
-        assert_eq!(app.composer_height(), 6);
+        assert_eq!(app.composer_height(120), 6);
         for _ in 0..20 {
             app.update(Action::Newline);
         }
-        assert_eq!(app.composer_height(), COMPOSER_MAX_LINES + 2);
+        assert_eq!(app.composer_height(120), COMPOSER_MAX_LINES + 2);
     }
 
     #[test]
@@ -3939,12 +4028,12 @@ mod tests {
         let mut thread = app();
         thread.panes.screen = Rect::new(0, 0, 120, 40);
         thread.focus = Focus::Conversation;
-        press(&mut thread, KeyCode::Char('h'));
+        press(&mut thread, KeyCode::Char('m'));
         press(&mut thread, KeyCode::Char('i'));
         assert_eq!(thread.focus, Focus::Composer);
         assert_eq!(
             thread.composer.text(),
-            "hi",
+            "mi",
             "the `i` typed, it did not focus"
         );
 
@@ -4006,6 +4095,46 @@ mod tests {
         // And Right — Activate — goes back to the thread.
         narrow.update(Action::Activate);
         assert_eq!(narrow.focus, Focus::Conversation);
+    }
+
+    #[test]
+    fn h_and_l_walk_the_attachments_of_the_selected_message() {
+        let mut app = with_measured_conversation(2);
+        let file = |rowid: i64| AttachmentRef {
+            rowid,
+            guid: format!("ATT-{rowid}"),
+            message_rowid: 5,
+            filename: Some(format!("~/Library/Messages/Attachments/{rowid}.heic")),
+            mime_type: Some("image/heic".to_string()),
+            uti: Some("public.heic".to_string()),
+            transfer_name: Some(format!("{rowid}.heic")),
+            total_bytes: 0,
+            transfer_state: 5,
+            is_sticker: false,
+            hide_attachment: rowid == 2,
+        };
+        let mut row = message_row("IMG-0001");
+        row.attachments = (1..=4).map(file).collect();
+        app.message_rows = vec![message_row("TXT-0001"), row];
+        app.messages.selected = 1;
+
+        // The first shown attachment, then on past the hidden one, then it
+        // stops at the end.
+        assert_eq!(app.attachment_cursor(), Some((1, 0)));
+        app.update(Action::AttachmentNext);
+        assert_eq!(app.attachment_cursor(), Some((1, 2)));
+        app.update(Action::AttachmentNext);
+        app.update(Action::AttachmentNext);
+        assert_eq!(app.attachment_cursor(), Some((1, 3)));
+        app.update(Action::AttachmentPrev);
+        assert_eq!(app.attachment_cursor(), Some((1, 2)));
+        assert_eq!(app.selected_attachment().map(|a| a.rowid), Some(3));
+
+        // Another message has no cursor of its own to remember.
+        app.messages.selected = 0;
+        assert_eq!(app.attachment_cursor(), None);
+        app.update(Action::AttachmentNext);
+        assert_eq!(app.attachment_cursor(), None);
     }
 
     #[test]
@@ -4659,7 +4788,7 @@ mod tests {
             "look at this",
             "the draft is untouched"
         );
-        assert!(app.composer_height() > 3, "the chip takes a row");
+        assert!(app.composer_height(120) > 3, "the chip takes a row");
         let (toast, is_error) = app.status.active_toast().expect("a toast");
         assert!(toast.contains("Enter sends"), "{toast}");
         assert!(!is_error);

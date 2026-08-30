@@ -145,7 +145,7 @@ fn split_conversation(area: Rect, app: &App) -> (Rect, Option<Rect>, Rect, Optio
     let header = take_top(&mut rest, header_height, true).unwrap_or(empty_at(area));
 
     // The composer grows with the draft but always leaves one message row.
-    let wanted = app.composer_height();
+    let wanted = app.composer_height(area.width);
     let composer_height = wanted.min(rest.height.saturating_sub(1)).max(1);
     let composer = take_bottom(&mut rest, composer_height, true).unwrap_or(empty_at(area));
 

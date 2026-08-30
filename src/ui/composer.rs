@@ -50,7 +50,8 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, boxed);
 
     let text = field.text();
-    let (text_row, cursor_column) = cursor_cell(text, field.cursor());
+    let rows = rows(text, columns(area.width));
+    let (text_row, cursor_column) = cursor_cell(text, &rows, field.cursor());
     // The dropped files sit above the draft, so the cursor is that many rows
     // further down than the text alone would put it.
     let cursor_row = text_row + app.attached.len();
@@ -90,11 +91,14 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]));
     } else {
-        for (index, raw) in text.split('\n').enumerate() {
+        for (index, row) in rows.iter().enumerate() {
             let marker = if index == 0 { PROMPT } else { "   " };
             lines.push(Line::from(vec![
                 Span::styled(marker, prompt),
-                Span::styled(raw.to_string(), Style::new().fg(theme.text_primary)),
+                Span::styled(
+                    text[row.start..row.end].to_string(),
+                    Style::new().fg(theme.text_primary),
+                ),
             ]));
         }
     }
@@ -162,28 +166,110 @@ pub fn offset_at(
     if !inner.contains(position) {
         return None;
     }
-    let (cursor_row, _) = cursor_cell(text, cursor);
+    let rows = rows(text, columns(area.width));
+    let (cursor_row, _) = cursor_cell(text, &rows, cursor);
     let scroll = (cursor_row + chips).saturating_sub(usize::from(inner.height).saturating_sub(1));
     let Some(row) = (usize::from(position.y - inner.y) + scroll).checked_sub(chips) else {
         return Some(0);
     };
 
-    let lines: Vec<&str> = text.split('\n').collect();
-    let Some(line) = lines.get(row) else {
+    let Some(row) = rows.get(row) else {
         return Some(text.len());
     };
-    // Every line is set in past the prompt column, so a click left of it is
-    // the start of that line.
-    let start: usize = lines[..row].iter().map(|line| line.len() + 1).sum();
+    // Every row is set in past the prompt column, so a click left of it is
+    // the start of that row.
     let text_x = inner.x + PROMPT_WIDTH;
     if position.x < text_x {
-        return Some(start);
+        return Some(row.start);
     }
     let column = usize::from(position.x - text_x);
-    match line.char_indices().nth(column) {
-        Some((index, _)) => Some(start + index),
-        None => Some(text.len()),
+    // Walk the row's cells, so a click on the right half of an emoji is still
+    // that emoji; past the last character is the end of the row.
+    let mut used = 0;
+    for (index, c) in text[row.start..row.end].char_indices() {
+        let cells = super::format::width(c.encode_utf8(&mut [0; 4]));
+        if used + cells > column {
+            return Some(row.start + index);
+        }
+        used += cells;
     }
+    Some(row.end)
+}
+
+/// One drawn row of the draft: the bytes of `text` on it. The newline or
+/// the space a break landed on belongs to no row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Row {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Cells across the box a row of the draft has, in a pane `pane_width` wide:
+/// the air and the border either side, then the prompt column.
+#[must_use]
+pub fn columns(pane_width: u16) -> usize {
+    usize::from(pane_width.saturating_sub(4).saturating_sub(PROMPT_WIDTH)).max(1)
+}
+
+/// Lay the draft out in `columns` cells: a hard break at every newline, and
+/// a soft one wherever a line runs past the box — at the last space, or
+/// through a word that is itself wider than the box. The space a soft
+/// break lands on is drawn on neither row.
+///
+/// Always at least one row, so an empty draft still stands a line tall. The
+/// height of the box, the drawing, the cursor, and a click all come from
+/// this one answer.
+#[must_use]
+pub fn rows(text: &str, columns: usize) -> Vec<Row> {
+    let columns = columns.max(1);
+    let mut out = Vec::new();
+    let mut line_start = 0;
+    for line in text.split('\n') {
+        wrap_line(line, line_start, columns, &mut out);
+        line_start += line.len() + 1;
+    }
+    out
+}
+
+fn wrap_line(line: &str, base: usize, columns: usize, out: &mut Vec<Row>) {
+    let mut row_start = 0;
+    let mut used = 0;
+    let mut last_space = None;
+    for (index, c) in line.char_indices() {
+        let cells = super::format::width(c.encode_utf8(&mut [0; 4]));
+        if used + cells > columns {
+            if c == ' ' {
+                // A space landing on the edge is the break itself.
+                out.push(Row {
+                    start: base + row_start,
+                    end: base + index,
+                });
+                row_start = index + c.len_utf8();
+                used = 0;
+                last_space = None;
+                continue;
+            }
+            let (end, next) = match last_space {
+                Some(space) => (space, space + 1),
+                None => (index, index),
+            };
+            out.push(Row {
+                start: base + row_start,
+                end: base + end,
+            });
+            row_start = next;
+            used = super::format::width(&line[row_start..index]);
+            last_space = None;
+        }
+        if c == ' ' {
+            last_space = Some(index);
+        }
+        used += cells;
+    }
+    out.push(Row {
+        start: base + row_start,
+        end: base + line.len(),
+    });
 }
 
 /// The dim line shown in an empty box: `Message Priya`, or what the path
@@ -201,12 +287,18 @@ fn placeholder(app: &App, attaching: bool, width: u16) -> String {
     format!("Message {}", super::format::truncate(&chat.title(), room))
 }
 
-/// Translate a byte offset into `(line, column)` in characters.
-fn cursor_cell(text: &str, cursor: usize) -> (usize, usize) {
-    let head = &text[..cursor.min(text.len())];
-    let row = head.matches('\n').count();
-    let column = head.rsplit('\n').next().unwrap_or("").chars().count();
-    (row, column)
+/// Translate a byte offset into `(row, column)` in cells over `rows`. A
+/// cursor on the space a soft break consumed, or at the end of a full row,
+/// sits one cell past the row's last character.
+fn cursor_cell(text: &str, rows: &[Row], cursor: usize) -> (usize, usize) {
+    let cursor = cursor.min(text.len());
+    let index = rows
+        .iter()
+        .rposition(|row| row.start <= cursor)
+        .unwrap_or(0);
+    let row = rows[index];
+    let column = super::format::width(&text[row.start..cursor.min(row.end).max(row.start)]);
+    (index, column)
 }
 
 /// `key label   key label` with the keys picked out, fitted to `columns`.
@@ -241,8 +333,19 @@ pub(crate) fn hint_line<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{PROMPT_WIDTH, cursor_cell, offset_at, text_area};
+    use super::{PROMPT_WIDTH, Row, columns, offset_at, rows, text_area};
     use ratatui::layout::{Position, Rect};
+
+    fn cursor_cell(text: &str, cursor: usize) -> (usize, usize) {
+        super::cursor_cell(text, &rows(text, 40), cursor)
+    }
+
+    fn spans(text: &str, columns: usize) -> Vec<&str> {
+        rows(text, columns)
+            .iter()
+            .map(|row| &text[row.start..row.end])
+            .collect()
+    }
 
     #[test]
     fn cursor_cell_counts_lines_and_characters() {
@@ -253,9 +356,65 @@ mod tests {
     }
 
     #[test]
-    fn cursor_cell_counts_characters_not_bytes() {
+    fn cursor_cell_counts_cells_not_bytes() {
         let text = "héllo";
         assert_eq!(cursor_cell(text, text.len()), (0, 5));
+        let wide = "🌊x";
+        assert_eq!(cursor_cell(wide, wide.len()), (0, 3));
+    }
+
+    #[test]
+    fn a_long_line_wraps_at_the_last_space() {
+        assert_eq!(spans("one two three", 8), vec!["one two", "three"]);
+        assert_eq!(spans("one two three", 7), vec!["one two", "three"]);
+        assert_eq!(spans("one two three", 6), vec!["one", "two", "three"]);
+        // Newlines are still hard breaks, and an empty draft is one row.
+        assert_eq!(spans("a\nb", 40), vec!["a", "b"]);
+        assert_eq!(spans("", 40), vec![""]);
+        assert_eq!(spans("a\n", 40), vec!["a", ""]);
+    }
+
+    #[test]
+    fn a_word_wider_than_the_box_is_cut_through() {
+        assert_eq!(spans("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        assert_eq!(spans("ab cdefghij", 4), vec!["ab", "cdef", "ghij"]);
+        // An emoji is two cells and is never split.
+        assert_eq!(spans("🌊🌊🌊", 5), vec!["🌊🌊", "🌊"]);
+    }
+
+    #[test]
+    fn the_cursor_follows_the_wrap() {
+        let text = "one two three";
+        let at = |cursor| super::cursor_cell(text, &rows(text, 8), cursor);
+        assert_eq!(at(3), (0, 3));
+        // On the consumed space: one past the end of the first row.
+        assert_eq!(at(7), (0, 7));
+        assert_eq!(at(8), (1, 0));
+        assert_eq!(at(text.len()), (1, 5));
+    }
+
+    #[test]
+    fn columns_come_off_the_pane_width() {
+        let pane = Rect::new(0, 0, 50, 3);
+        let inner = text_area(pane).expect("room for the box");
+        assert_eq!(columns(pane.width), usize::from(inner.width - PROMPT_WIDTH));
+        assert_eq!(columns(0), 1);
+        assert_eq!(rows("", 0), vec![Row { start: 0, end: 0 }]);
+    }
+
+    #[test]
+    fn a_click_on_a_soft_wrapped_row_lands_on_its_own_characters() {
+        // 50 wide is 43 columns; a run past that wraps.
+        let pane = Rect::new(0, 0, 50, 4);
+        let inner = text_area(pane).expect("room for the box");
+        let text_x = inner.x + PROMPT_WIDTH;
+        let text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbb cccc";
+        assert_eq!(spans(text, 43).len(), 2);
+        let at = |x, y| offset_at(text, 0, 0, pane, Position::new(x, y));
+        assert_eq!(at(text_x + 1, inner.y + 1), Some(42));
+        assert_eq!(at(text_x + 30, inner.y + 1), Some(text.len()));
+        // Past the end of the first row is that row's end, not the draft's.
+        assert_eq!(at(text_x + 42, inner.y), Some(40));
     }
 
     #[test]

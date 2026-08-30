@@ -192,6 +192,9 @@ pub struct Ctx<'a> {
     /// Names for handles, for the senders and reactors who are not in the
     /// participant list of the open chat.
     pub contacts: &'a Contacts,
+    /// Which attachment `o` would open: the selected message's index and the
+    /// attachment's position in it. Only a set's meta line reads it.
+    pub cursor: Option<(usize, usize)>,
 }
 
 impl Ctx<'_> {
@@ -392,33 +395,53 @@ pub fn block(ctx: &Ctx<'_>, index: usize, columns: u16) -> Block {
     let mut images: Vec<ImageSpot> = Vec::new();
     let mut first_inline: Option<&AttachmentRef> = None;
 
+    // Several pictures on one message are a set: each held to `SET_ROWS` and
+    // flowed left to right in the name column, wrapping like words, so four
+    // photos cost one sheet of rows rather than four full-size pictures down
+    // the pane. One picture keeps its full size.
+    let pictures = message
+        .attachments
+        .iter()
+        .filter(|attachment| ctx.images.could_draw(attachment))
+        .count();
+    let cap = if pictures > 1 {
+        crate::media::SET_ROWS
+    } else {
+        crate::media::MAX_ROWS
+    };
+    let mut sheet = Sheet::default();
+
     for (index, attachment) in message.attachments.iter().enumerate() {
         if attachment.hide_attachment {
             continue;
         }
         // A picture the terminal can draw takes rows of its own; the name and
         // the size then ride on the meta line, the way the mockup has them.
-        if let Some((columns, rows)) = ctx.images.cells(attachment, words_columns) {
+        if let Some((columns, rows)) = ctx.images.cells_capped(attachment, words_columns, cap) {
+            if sheet.x > 0 && sheet.x + columns > words_columns {
+                sheet.flush(&mut lines, &lead);
+            }
             images.push(ImageSpot {
                 row: u16::try_from(lines.len()).unwrap_or(u16::MAX),
-                column: u16::try_from(column).unwrap_or(u16::MAX),
+                column: u16::try_from(column).unwrap_or(u16::MAX) + sheet.x,
                 room: words_columns,
                 columns,
                 rows,
                 picture: Picture::Attachment(index),
             });
-            for _ in 0..rows {
-                lines.push(Line::from(lead()));
-            }
+            sheet.x += columns + 1;
+            sheet.rows = sheet.rows.max(rows);
             if first_inline.is_none() {
                 first_inline = Some(attachment);
             }
             continue;
         }
+        sheet.flush(&mut lines, &lead);
         let mut spans = chip_spans(attachment, theme, words);
         spans.insert(0, lead());
         lines.push(Line::from(spans));
     }
+    sheet.flush(&mut lines, &lead);
     let attachment_pictures = images.len();
 
     // The card for a link, under the line that holds the link itself. The
@@ -448,7 +471,20 @@ pub fn block(ctx: &Ctx<'_>, index: usize, columns: u16) -> Block {
         }
     }
 
-    let note = first_inline.map(|attachment| inline_note(attachment, attachment_pictures));
+    let note = first_inline.map(|first| {
+        // In a set the meta line says which picture `o` will open, because
+        // the pictures themselves cannot.
+        let cursor = ctx
+            .cursor
+            .filter(|(at, _)| *at == index)
+            .and_then(|(_, attachment)| {
+                let ordinal = images
+                    .iter()
+                    .position(|spot| spot.picture == Picture::Attachment(attachment))?;
+                Some((ordinal, message.attachments.get(attachment)?))
+            });
+        inline_note(first, attachment_pictures, cursor)
+    });
     for mut line in meta_lines(
         ctx,
         message,
@@ -493,14 +529,45 @@ fn add_clock(line: &mut Line<'static>, message: &Message, room: usize, theme: &T
     ));
 }
 
+/// The row of a contact sheet being laid out: how far along it the next
+/// picture goes, and how tall the row has grown.
+#[derive(Default)]
+struct Sheet {
+    x: u16,
+    rows: u16,
+}
+
+impl Sheet {
+    /// Close the row: reserve its rows in `lines` and start the next one.
+    fn flush(&mut self, lines: &mut Vec<Line<'static>>, lead: &dyn Fn() -> Span<'static>) {
+        for _ in 0..self.rows {
+            lines.push(Line::from(lead()));
+        }
+        *self = Self::default();
+    }
+}
+
 /// What the meta line says about the pictures drawn above it:
-/// `IMG_4412.jpg · 2.1 MB`, or `3 photos` when a message carried several.
+/// `IMG_4412.jpg · 2.1 MB`, or `3 photos` when a message carried several —
+/// and, on the selected message, `3 photos · 2 of 3 · IMG_4413.jpg · 1.8 MB`,
+/// which is the one `o` opens.
 ///
 /// A video's still is marked with the video glyph, so a poster frame is not
 /// read as a photo.
-fn inline_note(attachment: &AttachmentRef, drawn: usize) -> String {
+fn inline_note(
+    attachment: &AttachmentRef,
+    drawn: usize,
+    cursor: Option<(usize, &AttachmentRef)>,
+) -> String {
     if drawn > 1 {
-        return format!("{drawn} photos");
+        return match cursor {
+            Some((ordinal, at)) => format!(
+                "{drawn} photos · {} of {drawn} · {}",
+                ordinal + 1,
+                inline_note(at, 1, None)
+            ),
+            None => format!("{drawn} photos"),
+        };
     }
     let kind = attachment.kind();
     let name = attachment
@@ -997,6 +1064,7 @@ mod tests {
                 now: now(),
                 images: &self.images,
                 contacts: &self.contacts,
+                cursor: None,
             }
         }
     }
@@ -1619,6 +1687,88 @@ mod tests {
         let meta = text_of(block.lines.last().expect("a row"));
         assert!(meta.contains("IMG_0001.jpg"), "{meta}");
         assert!(!meta.contains("photos"), "{meta}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn several_photos_are_a_sheet_flowed_left_to_right_at_a_lower_cap() {
+        let dir = std::env::temp_dir().join(format!("msgs-photo-set-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp directory");
+        let mut paths = Vec::new();
+        for n in 0..4 {
+            let path = dir.join(format!("IMG_000{n}.jpg"));
+            // Portrait, the way a phone shoots: tall enough to hit any cap.
+            let pixels =
+                image::ImageBuffer::from_pixel(300, 400, image::Rgba::<u8>([7, 7, 7, 255]));
+            image::DynamicImage::from(pixels)
+                .save(&path)
+                .expect("a written jpeg");
+            paths.push(path);
+        }
+        let file = |rowid: i64, path: &std::path::Path| AttachmentRef {
+            rowid,
+            guid: format!("A{rowid}"),
+            message_rowid: 1,
+            filename: Some(path.display().to_string()),
+            mime_type: Some("image/jpeg".to_string()),
+            uti: None,
+            transfer_name: Some(format!("IMG_000{rowid}.jpg")),
+            total_bytes: 2_202_009,
+            transfer_state: 5,
+            is_sticker: false,
+            hide_attachment: false,
+        };
+
+        let mut set = message(1, false, "hike");
+        set.attachments = paths
+            .iter()
+            .enumerate()
+            .map(|(n, path)| file(i64::try_from(n).unwrap(), path))
+            .collect();
+        let mut fixture = Fixture::new(false, vec![set]);
+        fixture.images = crate::media::Images::halfblocks();
+        let ctx = fixture.ctx();
+        let block = block(&ctx, 0, 80);
+
+        assert_eq!(block.images.len(), 4);
+        let rows = block.images[0].rows;
+        assert_eq!(rows, crate::media::SET_ROWS, "held to the set cap");
+        // One row of pictures, each set to the right of the one before.
+        assert!(
+            block
+                .images
+                .iter()
+                .all(|spot| spot.row == block.images[0].row)
+        );
+        for pair in block.images.windows(2) {
+            assert_eq!(pair[1].column, pair[0].column + pair[0].columns + 1);
+        }
+        // The body, one sheet, the meta line.
+        assert_eq!(block.lines.len(), 1 + usize::from(rows) + 1);
+        let meta = text_of(block.lines.last().expect("a row"));
+        assert_eq!(meta.trim(), "4 photos");
+
+        // Too narrow for four across: the sheet wraps to a second row.
+        let narrow = super::block(&ctx, 0, 30);
+        assert_eq!(narrow.images.len(), 4);
+        assert!(narrow.images[3].row > narrow.images[0].row);
+        assert_eq!(narrow.images[3].column, narrow.images[0].column);
+
+        // On the selected message the meta line says which one `o` opens.
+        let mut selected = fixture.ctx();
+        selected.cursor = Some((0, 2));
+        let block = super::block(&selected, 0, 80);
+        let meta = text_of(block.lines.last().expect("a row"));
+        assert_eq!(meta.trim(), "4 photos · 3 of 4 · IMG_0002.jpg · 2.1 MB");
+
+        // One photo on its own is not a set and keeps its full height.
+        let mut single = message(1, false, "one");
+        single.attachments = vec![file(9, &paths[0])];
+        let mut fixture = Fixture::new(false, vec![single]);
+        fixture.images = crate::media::Images::halfblocks();
+        let block = super::block(&fixture.ctx(), 0, 80);
+        assert_eq!(block.images[0].rows, crate::media::MAX_ROWS);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
