@@ -38,6 +38,98 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Put `text` and `files` on the system clipboard together: the files as
+/// file references, so an app that takes files (Notes, Finder, Mail) pastes
+/// the pictures and videos themselves, and the text after them.
+///
+/// The pasteboard is written through `osascript` running a few lines of
+/// JavaScript against `NSPasteboard`, the one way to put file references on
+/// it from a shell. The script goes in on stdin, so neither a path nor a body
+/// is ever on a command line. With no files this is [`copy`]; when
+/// `osascript` cannot be run, the text still goes by [`copy`] on its own.
+///
+/// # Errors
+///
+/// As [`copy`], and [`Error::Failed`] when the pasteboard refused the files.
+pub fn copy_with_files(text: &str, files: &[PathBuf]) -> Result<(), Error> {
+    let files: Vec<&Path> = files
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|path| path.is_file())
+        .collect();
+    if files.is_empty() {
+        return copy(text);
+    }
+    let script = pasteboard_script(text, &files);
+    let mut child = match Command::new("osascript")
+        .args(["-l", "JavaScript", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return copy(text),
+    };
+    {
+        let stdin = child.stdin.as_mut().ok_or(Error::Failed)?;
+        stdin
+            .write_all(script.as_bytes())
+            .map_err(|_| Error::Failed)?;
+    }
+    match child.wait() {
+        Ok(status) if status.success() => Ok(()),
+        _ => Err(Error::Failed),
+    }
+}
+
+/// The JavaScript for Automation that puts `files` and then `text` on the
+/// general pasteboard as separate items.
+#[must_use]
+pub fn pasteboard_script(text: &str, files: &[&Path]) -> String {
+    let mut items: Vec<String> = files
+        .iter()
+        .map(|path| {
+            format!(
+                "$.NSURL.fileURLWithPath({})",
+                js_string(&path.to_string_lossy())
+            )
+        })
+        .collect();
+    if !text.is_empty() {
+        items.push(format!("$({})", js_string(text)));
+    }
+    format!(
+        "ObjC.import('AppKit');\n\
+         const pb = $.NSPasteboard.generalPasteboard;\n\
+         pb.clearContents;\n\
+         if (!pb.writeObjects($([{}]))) throw new Error('refused');\n",
+        items.join(", ")
+    )
+}
+
+/// `text` as a JavaScript string literal, every character that could end or
+/// break the literal escaped and every control character dropped.
+fn js_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Put `text` on the system clipboard.
 ///
 /// `pbcopy` is the reliable path on macOS. When it is missing — over SSH, say —
@@ -249,6 +341,17 @@ fn quick_look(path: &Path) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pasteboard_script_lists_the_files_then_the_text_escaped() {
+        let files = [Path::new("/tmp/a b.heic"), Path::new("/tmp/c.mov")];
+        let script = pasteboard_script("say \"hi\"\nnow", &files);
+        assert!(script.contains("$.NSURL.fileURLWithPath(\"/tmp/a b.heic\"), $.NSURL.fileURLWithPath(\"/tmp/c.mov\"), $(\"say \\\"hi\\\"\\nnow\")"));
+        assert!(script.contains("writeObjects"));
+        let none = pasteboard_script("", &files);
+        assert!(!none.contains("$(\""), "no empty text item");
+        assert_eq!(js_string("a\u{7}b\u{2028}"), "\"ab\\u2028\"");
+    }
 
     #[test]
     fn base64_pads_the_way_the_standard_says() {

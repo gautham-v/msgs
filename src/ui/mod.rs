@@ -456,7 +456,7 @@ mod tests {
         let quiet = compute(area, &app);
         assert!(quiet.notice.is_none(), "no notice, no row");
 
-        app.notify_copied(27);
+        app.notify_copied(27, 0);
         let loud = compute(area, &app);
         let notice = loud.notice.expect("a row for the notice");
         assert_eq!(notice.height, 1);

@@ -729,9 +729,9 @@ pub struct App {
     /// was put there. Cleared by the next keystroke, the next copy, or
     /// [`NOTICE_TTL`], whichever comes first.
     notice: Option<(String, Instant)>,
-    /// How text reaches the clipboard. A field so a test can drive `y`
-    /// without touching the real pasteboard.
-    clipboard: fn(&str) -> Result<(), crate::shell::Error>,
+    /// How text, and the files that go with it, reach the clipboard. A field
+    /// so a test can drive `y` without touching the real pasteboard.
+    clipboard: fn(&str, &[PathBuf]) -> Result<(), crate::shell::Error>,
     /// How a link reaches the browser. A field for the same reason: a test
     /// that opens a link must not open a browser tab.
     pub browser: fn(&str) -> Result<(), crate::shell::Error>,
@@ -841,7 +841,7 @@ impl App {
             help_scroll: 0,
             status,
             notice: None,
-            clipboard: crate::shell::copy,
+            clipboard: crate::shell::copy_with_files,
             browser: crate::shell::open_url,
             panes: Panes::default(),
             hover: None,
@@ -2991,38 +2991,48 @@ impl App {
         // that; `refresh_file_picker` notices on the way out of `update`.
     }
 
-    /// `y`: put the selected message on the clipboard.
+    /// `y`: put the selected message on the clipboard — its body, and the
+    /// pictures, videos, and files on it as files.
     ///
     /// The body goes to the pasteboard and nowhere else — not to the status
     /// line, not to a log.
     fn copy_selection(&mut self) {
-        let Some(text) = self.selected_message().map(copyable) else {
+        let Some(message) = self.selected_message() else {
             self.status.error("no message selected");
             return;
         };
-        if text.is_empty() {
+        let text = copyable(message);
+        let files = files_of(message);
+        if text.is_empty() && files.is_empty() {
             self.status.toast("nothing to copy in that message");
             return;
         }
-        self.copy_text(&text);
+        self.copy_text(&text, &files);
     }
 
-    /// Put `text` on the clipboard and say how much of it went, above the
-    /// composer. Only the count is ever shown — never the text.
-    pub fn copy_text(&mut self, text: &str) {
-        match (self.clipboard)(text) {
-            Ok(()) => self.notify_copied(text.chars().count()),
+    /// Put `text` and `files` on the clipboard and say how much went, above
+    /// the composer. Only the counts are ever shown — never the text.
+    pub fn copy_text(&mut self, text: &str, files: &[PathBuf]) {
+        match (self.clipboard)(text, files) {
+            Ok(()) => self.notify_copied(text.chars().count(), files.len()),
             // A failure is chrome's business, not the composer's: it stays a
             // status-line error.
             Err(err) => self.status.error(format!("could not copy: {err}")),
         }
     }
 
-    /// Say that `len` characters went to the clipboard, on the one line above
-    /// the composer.
-    pub fn notify_copied(&mut self, len: usize) {
-        let unit = if len == 1 { "char" } else { "chars" };
-        self.notice = Some((format!("copied {len} {unit} to clipboard"), Instant::now()));
+    /// Say that `len` characters and `files` files went to the clipboard, on
+    /// the one line above the composer.
+    pub fn notify_copied(&mut self, len: usize, files: usize) {
+        let chars = format!("{len} {}", if len == 1 { "char" } else { "chars" });
+        let what = match files {
+            0 => chars,
+            1 if len == 0 => "1 file".to_string(),
+            1 => format!("{chars} and 1 file"),
+            n if len == 0 => format!("{n} files"),
+            n => format!("{chars} and {n} files"),
+        };
+        self.notice = Some((format!("copied {what} to clipboard"), Instant::now()));
     }
 
     /// The copy notice, while one is alive. `None` gives its row back to the
@@ -3274,16 +3284,28 @@ impl App {
     pub fn copy_dragged(&mut self, text: &str, indices: &[usize]) {
         self.copy_selection_pending = false;
         let transcript = self.transcript(indices);
+        let files = self.files_in(indices);
         let text = if transcript.is_empty() {
             text
         } else {
             transcript.as_str()
         };
-        if text.trim().is_empty() {
+        if text.trim().is_empty() && files.is_empty() {
             self.status.toast("nothing to copy there");
             return;
         }
-        self.copy_text(text);
+        self.copy_text(text, &files);
+    }
+
+    /// The files on the loaded messages at `indices`, in order: what goes on
+    /// the clipboard beside a transcript so the pictures come across too.
+    #[must_use]
+    pub fn files_in(&self, indices: &[usize]) -> Vec<PathBuf> {
+        indices
+            .iter()
+            .filter_map(|index| self.message_rows.get(*index))
+            .flat_map(files_of)
+            .collect()
     }
 
     /// The loaded messages at `indices` as a transcript: `Name: body` per
@@ -3621,6 +3643,17 @@ fn attachment_label(path: &std::path::Path) -> String {
 
 /// What `y` puts on the clipboard: the body, or the names of what was sent when
 /// there is no body.
+/// The attachments of a message that are on this Mac, as paths.
+fn files_of(message: &Message) -> Vec<PathBuf> {
+    message
+        .attachments
+        .iter()
+        .filter(|attachment| !attachment.hide_attachment)
+        .filter_map(crate::db::AttachmentRef::path)
+        .filter(|path| path.is_file())
+        .collect()
+}
+
 fn copyable(message: &Message) -> String {
     if let Some(text) = message.text.as_deref().filter(|text| !text.is_empty()) {
         return text.to_string();
@@ -4697,7 +4730,7 @@ mod tests {
     fn copying_a_message_says_how_much_went_above_the_composer() {
         let mut app = app_with_message();
         // Nothing in a test reaches the real pasteboard.
-        app.clipboard = |_| Ok(());
+        app.clipboard = |_, _| Ok(());
 
         app.update(Action::CopySelection);
         // Eight characters of invented text, and the count is the only thing
@@ -4716,10 +4749,17 @@ mod tests {
     #[test]
     fn the_copy_notice_counts_one_character_in_the_singular() {
         let mut app = app();
-        app.notify_copied(1);
+        app.notify_copied(1, 0);
         assert_eq!(app.notice(), Some("copied 1 char to clipboard"));
-        app.notify_copied(27);
+        app.notify_copied(27, 0);
         assert_eq!(app.notice(), Some("copied 27 chars to clipboard"));
+        app.notify_copied(27, 1);
+        assert_eq!(
+            app.notice(),
+            Some("copied 27 chars and 1 file to clipboard")
+        );
+        app.notify_copied(0, 3);
+        assert_eq!(app.notice(), Some("copied 3 files to clipboard"));
     }
 
     #[test]
@@ -4728,7 +4768,7 @@ mod tests {
         let mut app = app();
         assert_eq!(app.next_wake(tick), tick, "nothing to wake up for");
 
-        app.notify_copied(27);
+        app.notify_copied(27, 0);
         assert_eq!(app.next_wake(tick), tick, "a fresh notice outlasts a tick");
 
         // Wind it back to just before the deadline: the loop must wake sooner
@@ -4755,7 +4795,7 @@ mod tests {
     #[test]
     fn a_copy_that_fails_stays_on_the_status_line() {
         let mut app = app_with_message();
-        app.clipboard = |_| Err(crate::shell::Error::NotAvailable);
+        app.clipboard = |_, _| Err(crate::shell::Error::NotAvailable);
         app.update(Action::CopySelection);
         assert!(app.notice().is_none(), "no notice for a copy that did not");
         let (_, is_error) = app.status.active_toast().expect("a toast");
