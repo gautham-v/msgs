@@ -26,9 +26,14 @@ pub struct Theme {
     pub bg_highlight: Color,
     /// Mouse hover tint.
     pub bg_hover: Color,
+    /// Behind text dragged over with the mouse: a blue like a terminal's own
+    /// selection, so what is about to be copied is unmistakable, and the one
+    /// background that is not a gray.
+    pub bg_selection: Color,
 
     /// The one accent: your own name, an unread chat's time, and links.
-    /// Never chrome — focus and selection are grays.
+    /// Never chrome — focus and the selected chat are grays; the mouse
+    /// selection is [`Theme::bg_selection`].
     pub accent_me: Color,
 
     /// Message bodies, chat names.
@@ -62,6 +67,7 @@ impl Default for Theme {
             bg_dark: rgb(0x0c, 0x0c, 0x0e),
             bg_highlight: rgb(0x23, 0x23, 0x29),
             bg_hover: rgb(0x1f, 0x1f, 0x25),
+            bg_selection: rgb(0x26, 0x4f, 0x78),
 
             accent_me: rgb(0x5e, 0xa8, 0xff),
 
@@ -401,6 +407,7 @@ impl Theme {
             bg_dark: rgb(0xec, 0xec, 0xec),
             bg_highlight: rgb(0xde, 0xde, 0xde),
             bg_hover: rgb(0xe4, 0xe4, 0xe4),
+            bg_selection: rgb(0xb4, 0xd5, 0xfe),
 
             accent_me: rgb(0x1f, 0x6f, 0xe5),
 
@@ -435,6 +442,7 @@ impl Theme {
             "bg_dark" => self.bg_dark = color,
             "bg_highlight" => self.bg_highlight = color,
             "bg_hover" => self.bg_hover = color,
+            "bg_selection" => self.bg_selection = color,
             "accent_me" => self.accent_me = color,
             "text_primary" => self.text_primary = color,
             "text_secondary" => self.text_secondary = color,
@@ -654,6 +662,11 @@ mod tests {
         );
         assert_ne!(theme.bg_highlight, theme.bg_base);
         assert_eq!(theme.accent_me, Theme::default().accent_me, "dark accents");
+        assert_eq!(
+            theme.bg_selection,
+            Theme::default().bg_selection,
+            "the drag tint is the dark palette's blue"
+        );
         assert!(Base::Terminal.is_dark(None, Some(&brown)));
 
         let paper = TerminalColors {

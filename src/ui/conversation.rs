@@ -72,6 +72,17 @@ pub struct Visible {
 }
 
 impl Scroll {
+    /// How many rows of the page are above the top of the viewport.
+    #[must_use]
+    pub fn row(&self, heights: &[u16]) -> i64 {
+        let above: i64 = heights
+            .iter()
+            .take(self.top)
+            .map(|height| i64::from(*height))
+            .sum();
+        above + i64::from(self.skip)
+    }
+
     /// Whether the very first loaded message is fully in view, which is the
     /// moment to ask the database for an older page.
     #[must_use]
@@ -287,7 +298,8 @@ impl Hits {
 /// It is a linear selection, the way a terminal's own is: everything between
 /// the two ends in reading order, not the rectangle they corner. The scroll
 /// and the pane it was made against are kept with it so a view that has moved
-/// underneath drops it rather than tinting cells that now say something else.
+/// underneath can carry it along ([`Selection::follow`]) rather than tint
+/// cells that now say something else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
     /// The cell the drag started on.
@@ -327,6 +339,45 @@ impl Selection {
     #[must_use]
     pub fn is_click(&self) -> bool {
         self.anchor == self.cursor
+    }
+
+    /// Move with the words: the view is now `scroll`, `rows_up` rows further
+    /// down the page than when the drag was made, and the pane is `area`.
+    /// The ends keep their columns and slide up by that many rows, clamped at
+    /// the pane's edges, so a selection that is part way off the top or the
+    /// bottom is still the words that are left. `None` once nothing of it is
+    /// on screen, or once the pane has moved or changed width — the lines
+    /// wrap differently and the cells no longer say what they did.
+    #[must_use]
+    pub fn follow(mut self, scroll: Scroll, rows_up: i64, area: Rect) -> Option<Self> {
+        if (self.area.x, self.area.y, self.area.width) != (area.x, area.y, area.width) {
+            return None;
+        }
+        let (mut start, mut end) = self.span();
+        let top = i64::from(area.y);
+        let bottom = top + i64::from(area.height) - 1;
+        let start_y = i64::from(start.y) - rows_up;
+        let end_y = i64::from(end.y) - rows_up;
+        if area.height == 0 || end_y < top || start_y > bottom {
+            return None;
+        }
+        // An end that went over the edge stands at the edge, taking the
+        // whole of that row like the rows between the two ends already do.
+        if start_y < top {
+            start = Position::new(area.x, area.y);
+        } else {
+            start.y = start_y as u16;
+        }
+        if end_y > bottom {
+            end = Position::new(area.x + area.width, bottom as u16);
+        } else {
+            end.y = end_y as u16;
+        }
+        self.anchor = start;
+        self.cursor = end;
+        self.scroll = scroll;
+        self.area = area;
+        Some(self)
     }
 }
 
@@ -415,7 +466,7 @@ fn printable(symbol: &str) -> &str {
     }
 }
 
-/// Tint the selected cells with `bg_highlight`, leaving the pictures alone.
+/// Tint the selected cells with `bg_selection`, leaving the pictures alone.
 ///
 /// The rows are already drawn; only the background under them changes, which
 /// is why this is done to the buffer rather than by a widget over the top —
@@ -424,10 +475,12 @@ fn printable(symbol: &str) -> &str {
 /// keeps half of every pixel pair in the cell's own background, so a tint over
 /// one would repaint the photo rather than highlight it.
 fn render_selection(frame: &mut Frame, app: &App, area: Rect, covered: &[Rect]) {
-    let Some(selection) = app.selection else {
+    // A press that has not moved yet is a click, not a selection: nothing
+    // is tinted until the pointer leaves the cell it started on.
+    let Some(selection) = app.selection.filter(|drag| !drag.is_click()) else {
         return;
     };
-    let highlight = app.theme.bg_highlight;
+    let highlight = app.theme.bg_selection;
     let buffer = frame.buffer_mut();
     for row in area.y..area.y.saturating_add(area.height) {
         let Some((first, last)) = selected_columns(&selection, area, row) else {

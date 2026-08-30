@@ -1189,6 +1189,49 @@ fn the_selected_block_is_highlighted_and_a_click_moves_the_selection() {
 }
 
 #[test]
+fn a_mouse_drag_is_tinted_blue_not_the_selected_block_gray() {
+    let messages = (1..=10)
+        .map(|index| message(index, false, 1, &format!("line {index}"), 60 - index))
+        .collect();
+    let mut app = with_conversation(false, 1, messages);
+    frame(&mut app, 120, 34);
+    let area = app.panes.conversation;
+
+    // Drag over the first two rows of the pane.
+    let (x, y) = (area.x + 2, area.y);
+    click(&mut app, x, y);
+    let pressed = frame(&mut app, 120, 34);
+    assert_ne!(
+        pressed[(x, y)].bg,
+        app.theme.bg_selection,
+        "a press alone tints nothing"
+    );
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: x + 6,
+        row: y + 1,
+        modifiers: KeyModifiers::NONE,
+    });
+    let buffer = frame(&mut app, 120, 34);
+
+    assert_eq!(
+        buffer[(x + 3, y)].bg,
+        app.theme.bg_selection,
+        "dragged cell"
+    );
+    assert_eq!(buffer[(x, y + 1)].bg, app.theme.bg_selection, "next row");
+    assert_ne!(
+        app.theme.bg_selection, app.theme.bg_highlight,
+        "a drag does not look like the selected block"
+    );
+    assert_ne!(
+        buffer[(x + 7, y + 1)].bg,
+        app.theme.bg_selection,
+        "past the cursor"
+    );
+}
+
+#[test]
 fn the_wheel_scrolls_the_conversation_without_moving_the_selection() {
     let messages = (1..=60)
         .map(|index| message(index, false, 1, &format!("line {index}"), 120 - index))

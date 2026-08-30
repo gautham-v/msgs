@@ -1468,6 +1468,10 @@ impl App {
         self.messages.set_len(self.message_rows.len());
         self.messages.selected += added;
         self.convo.top += added;
+        // The drag's own scroll is a message index too, so it moves with it.
+        if let Some(selection) = self.selection.as_mut() {
+            selection.scroll.top += added;
+        }
         // The heights the scroll arithmetic works from must describe the page
         // it is about to move through.
         self.measure(self.panes.conversation.width);
@@ -1489,14 +1493,19 @@ impl App {
         if self.new_below > 0 && self.at_bottom() {
             self.new_below = 0;
         }
-        // A view that has moved — or a pane that has changed shape — is no
-        // longer the one the drag was made over, so the selection goes rather
-        // than tint cells that now say something else.
-        if self
-            .selection
-            .is_some_and(|selection| selection.scroll != self.convo || selection.area != area)
+        // The words a drag was made over may have moved — a scroll, a message
+        // that arrived below, the copy notice taking the bottom row — so the
+        // selection slides with them, and goes only once none of it is left
+        // on screen or the lines wrap differently.
+        if let Some(selection) = self.selection
+            && (selection.scroll != self.convo || selection.area != area)
         {
-            self.clear_selection();
+            let heights = &self.measured.heights;
+            let rows_up = self.convo.row(heights) - selection.scroll.row(heights);
+            match selection.follow(self.convo, rows_up, area) {
+                Some(moved) => self.selection = Some(moved),
+                None => self.clear_selection(),
+            }
         }
     }
 
@@ -3215,14 +3224,8 @@ impl App {
                 }
                 self.end_selection();
             }
-            MouseEventKind::ScrollUp => {
-                self.clear_selection();
-                self.wheel(target, -WHEEL_ROWS);
-            }
-            MouseEventKind::ScrollDown => {
-                self.clear_selection();
-                self.wheel(target, WHEEL_ROWS);
-            }
+            MouseEventKind::ScrollUp => self.wheel(target, -WHEEL_ROWS),
+            MouseEventKind::ScrollDown => self.wheel(target, WHEEL_ROWS),
             _ => {}
         }
     }
@@ -3251,7 +3254,7 @@ impl App {
         }
     }
 
-    /// Drop the selection — a scroll, an `Esc`, or the next click.
+    /// Drop the selection — an `Esc`, a new conversation, or the next click.
     pub fn clear_selection(&mut self) {
         self.selection = None;
         self.copy_selection_pending = false;
@@ -3919,27 +3922,75 @@ mod tests {
     }
 
     #[test]
-    fn a_scroll_or_an_escape_drops_the_selection() {
+    fn an_escape_drops_the_selection_and_a_scroll_carries_it_along() {
         let mut app = with_measured_conversation(100);
-        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 5));
-        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 9));
-        assert!(app.selection.is_some());
-
-        app.on_mouse(mouse(MouseEventKind::ScrollDown, 40, 5));
-        assert!(app.selection.is_none(), "the words moved out from under it");
-
         app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 5));
         app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 9));
         app.update(Action::Cancel);
         assert!(app.selection.is_none());
         assert_eq!(app.focus, Focus::Conversation, "and Esc does nothing else");
 
-        // A scrolled view drops it as the next frame settles, too.
-        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 5));
-        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 9));
+        // Scrolled down three rows, the words are three rows higher and so
+        // is the tint on them. The page is given rows of its own so the
+        // frame keeps the fixture's heights instead of measuring afresh.
+        app.message_rows = (1..=100)
+            .map(|rowid| Message {
+                rowid,
+                ..message_row(&format!("TXT-{rowid}"))
+            })
+            .collect();
+        app.measured.first = 1;
+        app.measured.last = 100;
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 9));
+        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 13));
         app.update(Action::Scroll(3));
         let area = app.panes.conversation;
         app.prepare_conversation(area);
+        let (start, end) = app.selection.expect("it follows the words").span();
+        assert_eq!((start.x, start.y), (40, 6));
+        assert_eq!((end.x, end.y), (50, 10));
+
+        // The wheel is a scroll like any other.
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 40, 5));
+        app.prepare_conversation(area);
+        let (start, _) = app.selection.expect("still there").span();
+        assert_eq!(start.y, 6 - WHEEL_ROWS as u16);
+
+        // Far enough that none of it is on screen, it is gone.
+        app.update(Action::Scroll(40));
+        app.prepare_conversation(area);
+        assert!(app.selection.is_none(), "nothing of it is left to tint");
+    }
+
+    #[test]
+    fn a_selection_survives_the_copy_notice_taking_the_bottom_row() {
+        let mut app = with_measured_conversation(100);
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 5));
+        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 9));
+        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 50, 9));
+        let before = app.selection.expect("released");
+
+        // The notice takes the last row of the pane; the words stay put.
+        let mut area = app.panes.conversation;
+        area.height -= 1;
+        app.prepare_conversation(area);
+        let after = app.selection.expect("the tint stays");
+        assert_eq!(after.span(), before.span());
+        assert_eq!(after.area, area);
+
+        // A drag down to the bottom row is clipped when that row goes.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 5));
+        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 20));
+        let mut shorter = area;
+        shorter.height -= 2;
+        app.prepare_conversation(shorter);
+        let (_, end) = app.selection.expect("still there").span();
+        assert_eq!(end.y, shorter.y + shorter.height - 1);
+
+        // A pane that has changed width is a different set of lines.
+        let mut narrower = area;
+        narrower.width -= 5;
+        app.prepare_conversation(narrower);
         assert!(app.selection.is_none());
     }
 

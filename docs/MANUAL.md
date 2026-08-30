@@ -678,7 +678,7 @@ Every key, what it does, and what overrides it:
 | `[theme] base` | `terminal` | `dark`, `light`, `system`, `terminal` | the palette to start from; `--theme` overrides it and `Ctrl+T` cycles it at runtime |
 | `[theme]` | — | color per slot | any slot below, as `"#rrggbb"`, `"#rgb"`, or an ANSI index `0`–`255`, applied on top of `base` |
 
-Slots: `bg_base`, `bg_light`, `bg_dark`, `bg_highlight`, `bg_hover`, `accent_me`,
+Slots: `bg_base`, `bg_light`, `bg_dark`, `bg_highlight`, `bg_hover`, `bg_selection`, `accent_me`,
 `text_primary`, `text_secondary`, `gray`, `gray_dim`, `system`, `fuzzy`, `border`,
 `border_active`, `error`.
 
