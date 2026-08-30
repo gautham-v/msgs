@@ -38,29 +38,61 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Put `text` and `files` on the system clipboard together: the files as
-/// file references, so an app that takes files (Notes, Finder, Mail) pastes
-/// the pictures and videos themselves, and the text after them.
+/// One line of what a copy puts on the clipboard: a line of text, or a file
+/// that stands where a picture, a GIF, or a video was in the transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Piece {
+    /// A line of text, without its newline.
+    Text(String),
+    /// A file, pasted inline where it stands.
+    File(PathBuf),
+}
+
+/// What `pieces` say as plain text: a line per piece, a file giving its name.
+#[must_use]
+pub fn plain_text(pieces: &[Piece]) -> String {
+    pieces
+        .iter()
+        .map(|piece| match piece {
+            Piece::Text(text) => text.as_str(),
+            Piece::File(path) => path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Put `pieces` on the system clipboard, in order.
 ///
-/// The pasteboard is written through `osascript` running a few lines of
-/// JavaScript against `NSPasteboard`, the one way to put file references on
-/// it from a shell. The script goes in on stdin, so neither a path nor a body
-/// is ever on a command line. With no files this is [`copy`]; when
-/// `osascript` cannot be run, the text still goes by [`copy`] on its own.
+/// With files among them the pasteboard gets one rich-text item (`RTFD`, the
+/// files as inline attachments where they stand in the text) and the plain
+/// text beside it, so Notes, Mail, or TextEdit paste the pictures in their
+/// places and a plain-text field gets the words. That is written through
+/// `osascript` running a few lines of JavaScript against `NSAttributedString`
+/// and `NSPasteboard`, the one way to build such an item from a shell; the
+/// script goes in on stdin, so neither a path nor a body is ever on a command
+/// line. A file that is not there is left out. With no files this is
+/// [`copy`], and when `osascript` cannot be run the words still go by it.
 ///
 /// # Errors
 ///
-/// As [`copy`], and [`Error::Failed`] when the pasteboard refused the files.
-pub fn copy_with_files(text: &str, files: &[PathBuf]) -> Result<(), Error> {
-    let files: Vec<&Path> = files
+/// As [`copy`], and [`Error::Failed`] when the pasteboard refused the item.
+pub fn copy_pieces(pieces: &[Piece]) -> Result<(), Error> {
+    let present: Vec<Piece> = pieces
         .iter()
-        .map(PathBuf::as_path)
-        .filter(|path| path.is_file())
+        .filter(|piece| match piece {
+            Piece::Text(_) => true,
+            Piece::File(path) => path.is_file(),
+        })
+        .cloned()
         .collect();
-    if files.is_empty() {
-        return copy(text);
+    let text = plain_text(&present);
+    if !present.iter().any(|piece| matches!(piece, Piece::File(_))) {
+        return copy(&text);
     }
-    let script = pasteboard_script(text, &files);
+    let script = pasteboard_script(&present);
     let mut child = match Command::new("osascript")
         .args(["-l", "JavaScript", "-"])
         .stdin(Stdio::piped())
@@ -69,7 +101,7 @@ pub fn copy_with_files(text: &str, files: &[PathBuf]) -> Result<(), Error> {
         .spawn()
     {
         Ok(child) => child,
-        Err(_) => return copy(text),
+        Err(_) => return copy(&text),
     };
     {
         let stdin = child.stdin.as_mut().ok_or(Error::Failed)?;
@@ -83,28 +115,37 @@ pub fn copy_with_files(text: &str, files: &[PathBuf]) -> Result<(), Error> {
     }
 }
 
-/// The JavaScript for Automation that puts `files` and then `text` on the
-/// general pasteboard as separate items.
+/// The JavaScript for Automation that builds `pieces` into one attributed
+/// string — a line per piece, the files as attachments — and puts it on the
+/// general pasteboard as `RTFD` with the plain text beside it.
 #[must_use]
-pub fn pasteboard_script(text: &str, files: &[&Path]) -> String {
-    let mut items: Vec<String> = files
+pub fn pasteboard_script(pieces: &[Piece]) -> String {
+    let lines: String = pieces
         .iter()
-        .map(|path| {
-            format!(
-                "$.NSURL.fileURLWithPath({})",
-                js_string(&path.to_string_lossy())
-            )
+        .map(|piece| match piece {
+            Piece::Text(text) => format!("text({});\n", js_string(text)),
+            Piece::File(path) => format!("file({});\n", js_string(&path.to_string_lossy())),
         })
         .collect();
-    if !text.is_empty() {
-        items.push(format!("$({})", js_string(text)));
-    }
     format!(
-        "ObjC.import('AppKit');\n\
+        "ObjC.import('Cocoa');\n\
+         const out = $.NSMutableAttributedString.alloc.init;\n\
+         function text(t) {{ out.mutableString.appendString($(t + '\\n')); }}\n\
+         function file(p) {{\n\
+           const url = $.NSURL.fileURLWithPath($(p));\n\
+           const wrapper = $.NSFileWrapper.alloc.initWithURLOptionsError(url, 0, null);\n\
+           if (wrapper.isNil()) return;\n\
+           const attachment = $.NSTextAttachment.alloc.initWithFileWrapper(wrapper);\n\
+           out.appendAttributedString($.NSAttributedString.attributedStringWithAttachment(attachment));\n\
+           out.mutableString.appendString($('\\n'));\n\
+         }}\n\
+         {lines}\
+         const rtfd = out.RTFDFromRangeDocumentAttributes($.NSMakeRange(0, out.length), $({{}}));\n\
          const pb = $.NSPasteboard.generalPasteboard;\n\
          pb.clearContents;\n\
-         if (!pb.writeObjects($([{}]))) throw new Error('refused');\n",
-        items.join(", ")
+         if (!pb.setDataForType(rtfd, 'com.apple.flat-rtfd')) throw new Error('refused');\n\
+         if (!pb.setStringForType({plain}, 'public.utf8-plain-text')) throw new Error('refused');\n",
+        plain = js_string(&plain_text(pieces)),
     )
 }
 
@@ -343,13 +384,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_pasteboard_script_lists_the_files_then_the_text_escaped() {
-        let files = [Path::new("/tmp/a b.heic"), Path::new("/tmp/c.mov")];
-        let script = pasteboard_script("say \"hi\"\nnow", &files);
-        assert!(script.contains("$.NSURL.fileURLWithPath(\"/tmp/a b.heic\"), $.NSURL.fileURLWithPath(\"/tmp/c.mov\"), $(\"say \\\"hi\\\"\\nnow\")"));
-        assert!(script.contains("writeObjects"));
-        let none = pasteboard_script("", &files);
-        assert!(!none.contains("$(\""), "no empty text item");
+    fn the_pasteboard_script_lays_the_pieces_out_in_order_escaped() {
+        let pieces = [
+            Piece::Text("A: say \"hi\"".to_string()),
+            Piece::File(PathBuf::from("/tmp/a b.heic")),
+            Piece::Text("B: next".to_string()),
+        ];
+        let script = pasteboard_script(&pieces);
+        assert!(script.contains(
+            "text(\"A: say \\\"hi\\\"\");\nfile(\"/tmp/a b.heic\");\ntext(\"B: next\");\n"
+        ));
+        assert!(script.contains("com.apple.flat-rtfd"));
+        assert!(script.contains("setStringForType(\"A: say \\\"hi\\\"\\na b.heic\\nB: next\""));
+        assert_eq!(plain_text(&pieces), "A: say \"hi\"\na b.heic\nB: next");
         assert_eq!(js_string("a\u{7}b\u{2028}"), "\"ab\\u2028\"");
     }
 

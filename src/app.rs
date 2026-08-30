@@ -25,6 +25,7 @@ use crate::seen::Seen;
 use crate::send::{
     self, Delivery, Outbox, Outgoing, Pending, Presence, SendError, Service, Target,
 };
+use crate::shell::Piece;
 use crate::theme::{self, Base, TerminalColors, Theme};
 use crate::ui::Panes;
 use crate::ui::conversation::{Hits, Measured, Scroll, Selection};
@@ -729,9 +730,10 @@ pub struct App {
     /// was put there. Cleared by the next keystroke, the next copy, or
     /// [`NOTICE_TTL`], whichever comes first.
     notice: Option<(String, Instant)>,
-    /// How text, and the files that go with it, reach the clipboard. A field
-    /// so a test can drive `y` without touching the real pasteboard.
-    clipboard: fn(&str, &[PathBuf]) -> Result<(), crate::shell::Error>,
+    /// How a copy — lines of text and the files among them — reaches the
+    /// clipboard. A field so a test can drive `y` without touching the real
+    /// pasteboard.
+    clipboard: fn(&[Piece]) -> Result<(), crate::shell::Error>,
     /// How a link reaches the browser. A field for the same reason: a test
     /// that opens a link must not open a browser tab.
     pub browser: fn(&str) -> Result<(), crate::shell::Error>,
@@ -841,7 +843,7 @@ impl App {
             help_scroll: 0,
             status,
             notice: None,
-            clipboard: crate::shell::copy_with_files,
+            clipboard: crate::shell::copy_pieces,
             browser: crate::shell::open_url,
             panes: Panes::default(),
             hover: None,
@@ -3001,20 +3003,47 @@ impl App {
             self.status.error("no message selected");
             return;
         };
-        let text = copyable(message);
         let files = files_of(message);
-        if text.is_empty() && files.is_empty() {
+        let mut pieces: Vec<Piece> = Vec::new();
+        // The body; or, for a message that is only files none of which are
+        // here, their names, so the copy still says what was sent.
+        let body = if files.is_empty() {
+            copyable(message)
+        } else {
+            message.text.clone().unwrap_or_default()
+        };
+        if !body.is_empty() {
+            pieces.push(Piece::Text(body));
+        }
+        pieces.extend(files.into_iter().map(Piece::File));
+        if pieces.is_empty() {
             self.status.toast("nothing to copy in that message");
             return;
         }
-        self.copy_text(&text, &files);
+        self.copy_pieces(&pieces);
     }
 
-    /// Put `text` and `files` on the clipboard and say how much went, above
-    /// the composer. Only the counts are ever shown — never the text.
-    pub fn copy_text(&mut self, text: &str, files: &[PathBuf]) {
-        match (self.clipboard)(text, files) {
-            Ok(()) => self.notify_copied(text.chars().count(), files.len()),
+    /// Put `text` on the clipboard and say how much went, above the composer.
+    pub fn copy_text(&mut self, text: &str) {
+        self.copy_pieces(&[Piece::Text(text.to_string())]);
+    }
+
+    /// Put `pieces` on the clipboard and say how much went, above the
+    /// composer. Only the counts are ever shown — never the text.
+    pub fn copy_pieces(&mut self, pieces: &[Piece]) {
+        let chars: usize = pieces
+            .iter()
+            .filter_map(|piece| match piece {
+                Piece::Text(text) => Some(text.chars().count()),
+                Piece::File(_) => None,
+            })
+            .sum();
+        let files = pieces
+            .iter()
+            .filter(|piece| matches!(piece, Piece::File(_)))
+            .count();
+        match (self.clipboard)(pieces) {
+            Ok(()) => self.notify_copied(chars, files),
             // A failure is chrome's business, not the composer's: it stays a
             // status-line error.
             Err(err) => self.status.error(format!("could not copy: {err}")),
@@ -3277,52 +3306,54 @@ impl App {
     /// copies — a phrase, exactly as picked. A drag over several rows is
     /// after the messages rather than the screen, so `indices` (the messages
     /// under those rows, from [`conversation::selected_messages`]) is copied
-    /// as a transcript instead, one `Name: body` line per message and none
-    /// of the layout around them. Like `y`, the text goes to the pasteboard
+    /// as a transcript instead — one `Name: body` line per message, its
+    /// pictures inline under it — and none of the layout around them. Like `y`, the text goes to the pasteboard
     /// and nowhere else — not to the status line, not to a log. The tint
     /// stays until the next click, so what was copied is still visible.
     pub fn copy_dragged(&mut self, text: &str, indices: &[usize]) {
         self.copy_selection_pending = false;
-        let transcript = self.transcript(indices);
-        let files = self.files_in(indices);
-        let text = if transcript.is_empty() {
-            text
-        } else {
-            transcript.as_str()
-        };
-        if text.trim().is_empty() && files.is_empty() {
-            self.status.toast("nothing to copy there");
-            return;
+        let mut pieces = self.transcript(indices);
+        if pieces.is_empty() {
+            if text.trim().is_empty() {
+                self.status.toast("nothing to copy there");
+                return;
+            }
+            pieces.push(Piece::Text(text.to_string()));
         }
-        self.copy_text(text, &files);
+        self.copy_pieces(&pieces);
     }
 
-    /// The files on the loaded messages at `indices`, in order: what goes on
-    /// the clipboard beside a transcript so the pictures come across too.
-    #[must_use]
-    pub fn files_in(&self, indices: &[usize]) -> Vec<PathBuf> {
-        indices
-            .iter()
-            .filter_map(|index| self.message_rows.get(*index))
-            .flat_map(files_of)
-            .collect()
-    }
-
-    /// The loaded messages at `indices` as a transcript: `Name: body` per
-    /// message, a message of pictures giving their filenames, and nothing for
-    /// a message that says nothing. Times are left out — a transcript pasted
+    /// The loaded messages at `indices` as a transcript: a `Name: body` line
+    /// per message, then each of its pictures, videos, and files that are on
+    /// this Mac, so they paste inline under the words. A message of files
+    /// none of which are here names them instead; a message that says
+    /// nothing is left out. Times are left out too — a transcript pasted
     /// somewhere reads better without them.
     #[must_use]
-    pub fn transcript(&self, indices: &[usize]) -> String {
-        indices
+    pub fn transcript(&self, indices: &[usize]) -> Vec<Piece> {
+        let mut pieces = Vec::new();
+        for message in indices
             .iter()
             .filter_map(|index| self.message_rows.get(*index))
-            .filter_map(|message| {
-                let body = copyable(message);
-                (!body.is_empty()).then(|| format!("{}: {body}", self.sender_name(message)))
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        {
+            let files = files_of(message);
+            let body = if files.is_empty() {
+                copyable(message)
+            } else {
+                message.text.clone().unwrap_or_default()
+            };
+            if body.is_empty() && files.is_empty() {
+                continue;
+            }
+            let name = self.sender_name(message);
+            pieces.push(Piece::Text(if body.is_empty() {
+                format!("{name}:")
+            } else {
+                format!("{name}: {body}")
+            }));
+            pieces.extend(files.into_iter().map(Piece::File));
+        }
+        pieces
     }
 
     /// The name the conversation shows for a message's sender.
@@ -4071,11 +4102,12 @@ mod tests {
             pictures,
         ];
 
+        // The picture is not on this Mac, so its name stands in for it.
         assert_eq!(
-            app.transcript(&[0, 1, 2, 3, 4]),
+            crate::shell::plain_text(&app.transcript(&[0, 1, 2, 3, 4])),
             "someone: Food is ready\nYou: Just finished popping\nYou: Coming back\nsomeone: IMG_0001.heic"
         );
-        assert_eq!(app.transcript(&[]), "");
+        assert!(app.transcript(&[]).is_empty());
 
         // A drag over one row keeps the cells' text; over more, the
         // transcript stands in for it.
@@ -4730,7 +4762,7 @@ mod tests {
     fn copying_a_message_says_how_much_went_above_the_composer() {
         let mut app = app_with_message();
         // Nothing in a test reaches the real pasteboard.
-        app.clipboard = |_, _| Ok(());
+        app.clipboard = |_| Ok(());
 
         app.update(Action::CopySelection);
         // Eight characters of invented text, and the count is the only thing
@@ -4795,7 +4827,7 @@ mod tests {
     #[test]
     fn a_copy_that_fails_stays_on_the_status_line() {
         let mut app = app_with_message();
-        app.clipboard = |_, _| Err(crate::shell::Error::NotAvailable);
+        app.clipboard = |_| Err(crate::shell::Error::NotAvailable);
         app.update(Action::CopySelection);
         assert!(app.notice().is_none(), "no notice for a copy that did not");
         let (_, is_error) = app.status.active_toast().expect("a toast");

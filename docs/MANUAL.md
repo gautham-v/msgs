@@ -216,7 +216,7 @@ along one row copies a phrase, exactly as the cells said it, trimmed of its
 trailing blanks. A drag over more than one row is after the messages rather
 than the screen, so it copies a transcript of every message under those rows —
 one `Name: body` line per message, in order, a message of pictures giving their
-filenames and the pictures themselves going along as files — and none of the
+filenames and the pictures themselves inline under its line — and none of the
 layout around them: no name column, no clocks, no
 blank rows, no tapbacks. The selection is tinted in `bg_selection`, a blue like
 a terminal's own, and stays after the button comes up, sliding with the words
@@ -279,12 +279,14 @@ on screen: `--check` reports them, and a problem with any of them lands under
 
 `y` puts the selected message on the pasteboard — `pbcopy`, or the OSC 52
 escape over SSH. A message with pictures, a GIF, a video, or any other file on
-it puts those on the pasteboard as files too, ahead of the words, so pasting
-into Notes, Mail, or a Finder window lands the pictures themselves and not
-their names; that goes through `osascript` and `NSPasteboard`, the one way to
-put a file reference on the pasteboard from a shell, and where `osascript`
-cannot run the words still go by `pbcopy`. A transcript copied by dragging
-brings the files of every message in it the same way. The receipt is the one
+it goes across as rich text with those files inline under the words, so
+pasting into Notes, Mail, or TextEdit lands the pictures themselves in their
+places, and a plain-text field gets the words with each file's name in its
+place. That is built through `osascript`, `NSAttributedString`, and
+`NSPasteboard`, the one way to make such an item from a shell; where
+`osascript` cannot run the words still go by `pbcopy`. A transcript copied by
+dragging brings the files of every message in it the same way, each under its
+own line. The receipt is the one
 piece of chrome that is not in the corner: a single right-aligned line in the
 secondary gray, directly above the composer's box, reading `copied 27 chars to
 clipboard` (`1 char`, in the singular; `copied 27 chars and 2 files`, or
