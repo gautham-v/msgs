@@ -248,7 +248,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         && let Some(selection) = app.selection
     {
         let text = conversation::selection_text(frame.buffer_mut(), panes.conversation, &selection);
-        app.copy_dragged(&text);
+        let (start, end) = selection.span();
+        // One row is a phrase and comes across as the cells said it; more
+        // than one is a transcript of the messages under them.
+        let indices = if start.y == end.y {
+            Vec::new()
+        } else {
+            conversation::selected_messages(&selection, panes.conversation, &app.hits)
+        };
+        app.copy_dragged(&text, &indices);
     }
     if let Some(row) = panes.notice {
         notice::render(frame, app, row);

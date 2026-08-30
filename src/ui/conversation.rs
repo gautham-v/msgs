@@ -445,6 +445,29 @@ pub fn selection_text(buffer: &Buffer, area: Rect, selection: &Selection) -> Str
     out
 }
 
+/// The messages a drag covers, in reading order, each once.
+///
+/// A drag over more than one row is copied as a transcript of these rather
+/// than as the cells, so the name column's padding, the clocks, and the blank
+/// rows between runs never reach the clipboard. Rows that carry no message —
+/// the gap above a run, a day label — contribute nothing.
+#[must_use]
+pub fn selected_messages(selection: &Selection, area: Rect, hits: &Hits) -> Vec<usize> {
+    let (start, end) = selection.span();
+    let mut indices: Vec<usize> = Vec::new();
+    for row in start.y..=end.y {
+        if selected_columns(selection, area, row).is_none() {
+            continue;
+        }
+        if let Some(index) = hits.message_at(area, row)
+            && indices.last() != Some(&index)
+        {
+            indices.push(index);
+        }
+    }
+    indices
+}
+
 /// A cell's symbol when it is text, and a blank when it is not.
 ///
 /// A picture drawn through the kitty, iTerm2, or sixel protocol lives in the
@@ -1113,6 +1136,25 @@ mod tests {
         // A drag that ends on the scrollbar still stops at the words.
         let selection = drag((0, 0), (9, 0), area);
         assert_eq!(selected_columns(&selection, area, 0), Some((0, 9)));
+    }
+
+    #[test]
+    fn a_drag_over_rows_names_each_message_once_and_skips_the_gaps() {
+        let area = Rect::new(0, 0, 10, 6);
+        let hits = Hits {
+            rows: vec![None, Some(3), Some(3), None, Some(4), Some(5)],
+            ..Hits::default()
+        };
+        assert_eq!(
+            selected_messages(&drag((4, 0), (2, 4), area), area, &hits),
+            vec![3, 4]
+        );
+        assert_eq!(
+            selected_messages(&drag((0, 5), (0, 1), area), area, &hits),
+            vec![3, 4, 5],
+            "backwards reads the same"
+        );
+        assert!(selected_messages(&drag((0, 0), (5, 0), area), area, &hits).is_empty());
     }
 
     #[test]

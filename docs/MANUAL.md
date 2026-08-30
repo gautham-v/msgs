@@ -211,14 +211,17 @@ they swallow clicks so a stray one cannot act on the screen behind them.
 
 Dragging across the conversation selects text, the way a terminal's own
 selection does: everything between the two ends in reading order, tinted as the
-pointer moves, and put on the clipboard the moment the button comes up. What is
-copied is what was on screen — the visible rows, joined with newlines, each
-trimmed of its trailing blanks, with neither the scrollbar's column nor the day
-band in it. A picture comes across as the blank cells it covers rather than as
-the sequence that drew it, and the tint stays off it. The next click, `Esc`, or
-any scroll takes the selection away. Nothing else reads it: like `y`, the text
-goes to the pasteboard and nowhere else, and `y` still copies the whole
-selected message whichever way it was picked.
+pointer moves, and put on the clipboard the moment the button comes up. A drag
+along one row copies a phrase, exactly as the cells said it, trimmed of its
+trailing blanks. A drag over more than one row is after the messages rather
+than the screen, so it copies a transcript of every message under those rows —
+one `Name: body` line per message, in order, a message of pictures giving their
+filenames — and none of the layout around them: no name column, no clocks, no
+blank rows, no tapbacks. The selection is tinted in `bg_selection`, a blue like
+a terminal's own, and stays after the button comes up, sliding with the words
+when the view scrolls, until the next click or `Esc`. Nothing else reads it:
+like `y`, the text goes to the pasteboard and nowhere else, and `y` still
+copies the whole selected message whichever way it was picked.
 
 Because a press is also how a drag begins, a link, a picture, and the pill open
 on the release rather than on the press — so a selection that starts on a link

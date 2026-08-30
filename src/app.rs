@@ -3263,16 +3263,61 @@ impl App {
     /// Put a released drag on the clipboard, once the frame that drew it has
     /// read the words back off its own buffer.
     ///
-    /// Like `y`, the text goes to the pasteboard and nowhere else — not to the
-    /// status line, not to a log. The tint stays until the next click, so what
-    /// was copied is still visible.
-    pub fn copy_dragged(&mut self, text: &str) {
+    /// `text` is what the cells said, which is what a drag along one row
+    /// copies — a phrase, exactly as picked. A drag over several rows is
+    /// after the messages rather than the screen, so `indices` (the messages
+    /// under those rows, from [`conversation::selected_messages`]) is copied
+    /// as a transcript instead, one `Name: body` line per message and none
+    /// of the layout around them. Like `y`, the text goes to the pasteboard
+    /// and nowhere else — not to the status line, not to a log. The tint
+    /// stays until the next click, so what was copied is still visible.
+    pub fn copy_dragged(&mut self, text: &str, indices: &[usize]) {
         self.copy_selection_pending = false;
+        let transcript = self.transcript(indices);
+        let text = if transcript.is_empty() {
+            text
+        } else {
+            transcript.as_str()
+        };
         if text.trim().is_empty() {
             self.status.toast("nothing to copy there");
             return;
         }
         self.copy_text(text);
+    }
+
+    /// The loaded messages at `indices` as a transcript: `Name: body` per
+    /// message, a message of pictures giving their filenames, and nothing for
+    /// a message that says nothing. Times are left out — a transcript pasted
+    /// somewhere reads better without them.
+    #[must_use]
+    pub fn transcript(&self, indices: &[usize]) -> String {
+        indices
+            .iter()
+            .filter_map(|index| self.message_rows.get(*index))
+            .filter_map(|message| {
+                let body = copyable(message);
+                (!body.is_empty()).then(|| format!("{}: {body}", self.sender_name(message)))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The name the conversation shows for a message's sender.
+    fn sender_name(&self, message: &Message) -> String {
+        if message.is_from_me {
+            return "You".to_string();
+        }
+        self.selected_chat()
+            .zip(message.handle_rowid)
+            .and_then(|(chat, rowid)| {
+                chat.participants
+                    .iter()
+                    .find(|handle| handle.rowid == rowid)
+                    .map(crate::db::Handle::short_name)
+            })
+            .or_else(|| message.handle.as_deref().map(|id| self.contacts.short(id)))
+            .unwrap_or_else(|| "Unknown".to_string())
     }
 
     /// Which pane covers `position`, per the last frame's layout.
@@ -3960,6 +4005,49 @@ mod tests {
         app.update(Action::Scroll(40));
         app.prepare_conversation(area);
         assert!(app.selection.is_none(), "nothing of it is left to tint");
+    }
+
+    #[test]
+    fn a_transcript_is_one_named_line_per_message_with_no_clocks() {
+        let mut app = app();
+        let from = |guid: &str, mine: bool, text: Option<&str>| Message {
+            is_from_me: mine,
+            handle: (!mine).then(|| "someone@example.invalid".to_string()),
+            text: text.map(str::to_string),
+            ..message_row(guid)
+        };
+        let mut pictures = from("PIC", false, None);
+        pictures.attachments = vec![AttachmentRef {
+            rowid: 1,
+            guid: "ATT-1".to_string(),
+            message_rowid: 5,
+            filename: Some("~/Library/Messages/Attachments/1.heic".to_string()),
+            mime_type: Some("image/heic".to_string()),
+            uti: Some("public.heic".to_string()),
+            transfer_name: Some("IMG_0001.heic".to_string()),
+            total_bytes: 0,
+            transfer_state: 5,
+            is_sticker: false,
+            hide_attachment: false,
+        }];
+        app.message_rows = vec![
+            from("A", false, Some("Food is ready")),
+            from("B", true, Some("Just finished popping")),
+            from("C", true, Some("Coming back")),
+            from("D", true, None),
+            pictures,
+        ];
+
+        assert_eq!(
+            app.transcript(&[0, 1, 2, 3, 4]),
+            "someone: Food is ready\nYou: Just finished popping\nYou: Coming back\nsomeone: IMG_0001.heic"
+        );
+        assert_eq!(app.transcript(&[]), "");
+
+        // A drag over one row keeps the cells' text; over more, the
+        // transcript stands in for it.
+        app.copy_dragged("Food is", &[]);
+        app.copy_dragged("ignored", &[0, 1]);
     }
 
     #[test]
