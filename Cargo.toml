@@ -41,6 +41,12 @@ image = { version = "0.25.8", default-features = false, features = ["jpeg", "png
 # keep unwinding on purpose: the hook installed in `main` restores the terminal
 # on the way out, so a crash lands on a usable screen rather than inside the
 # alternate one.
+# Dev builds skip debug info too — it was most of a multi-GB target/ and the
+# TUI is debugged with logs, not a debugger. Set `debug = true` here if you
+# ever need line numbers under lldb.
+[profile.dev]
+debug = 0
+
 [profile.release]
 lto = true
 codegen-units = 1
